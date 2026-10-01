@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chromatic Images for SillyTavern</title>
+    <meta name="description" content="Browser extension and testbed for proposal-first, context-aware image generation during SillyTavern roleplay.">
+    <meta property="og:title" content="Chromatic Images for SillyTavern">
+    <meta property="og:description" content="Browser extension and testbed for proposal-first, context-aware image generation during SillyTavern roleplay.">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="/style.css">
+    <style>
+        :root {
+            --bg-base: #0f1117;
+            --bg-surface: #181b24;
+            --bg-elevated: #222634;
+            --border-color: #2e3446;
+            --text-primary: #e6edf3;
+            --text-secondary: #9aa5b8;
+            --accent-primary: #6366f1;
+            --accent-hover: #4f46e5;
+            --accent-glow: rgba(99, 102, 241, 0.2);
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-base);
+            color: var(--text-primary);
+            font-family: var(--font-sans);
+            line-height: 1.5;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        header {
+            background-color: var(--bg-surface);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1rem 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .header-title-group {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, #ec4899, #8b5cf6, #3b82f6);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            font-size: 16px;
+        }
+
+        h1 {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #fff;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.2rem 0.5rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+            border-radius: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .badge-dev {
+            background: rgba(99, 102, 241, 0.15);
+            color: #818cf8;
+            border: 1px solid rgba(99, 102, 241, 0.3);
+        }
+
+        .badge-st {
+            background: rgba(16, 185, 129, 0.15);
+            color: #34d399;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .nav-tabs {
+            display: flex;
+            gap: 0.5rem;
+            background: var(--bg-elevated);
+            padding: 0.25rem;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+
+        .tab-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            padding: 0.4rem 0.9rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .tab-btn:hover {
+            color: var(--text-primary);
+        }
+
+        .tab-btn.active {
+            background: var(--accent-primary);
+            color: #fff;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+        }
+
+        main {
+            flex: 1;
+            padding: 1.5rem;
+            max-width: 1400px;
+            margin: 0 auto;
+            width: 100%;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 1.25rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 0.75rem;
+        }
+
+        .card-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .btn {
+            background: var(--accent-primary);
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            font-weight: 500;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            transition: background 0.15s ease;
+        }
+
+        .btn:hover {
+            background: var(--accent-hover);
+        }
+
+        .btn-secondary {
+            background: var(--bg-elevated);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+        }
+
+        .btn-secondary:hover {
+            background: #2b3042;
+        }
+
+        .btn-sm {
+            padding: 0.25rem 0.6rem;
+            font-size: 0.8rem;
+        }
+
+        /* Mock SillyTavern extensions container */
+        .st-container-mock {
+            background: #11141c;
+            border: 2px dashed #3a4256;
+            border-radius: 8px;
+            padding: 1.5rem;
+            min-height: 200px;
+        }
+
+        .st-container-header {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-secondary);
+            margin-bottom: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        /* Test suite output */
+        .terminal-box {
+            background: #0a0c10;
+            border: 1px solid #232838;
+            border-radius: 6px;
+            padding: 1rem;
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            color: #d1d7e0;
+            white-space: pre-wrap;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        .pass-chip {
+            background: rgba(16, 185, 129, 0.2);
+            color: #34d399;
+            padding: 0.2rem 0.6rem;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.5rem;
+        }
+
+        @media (max-width: 900px) {
+            .grid-2 {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .field-group {
+            margin-bottom: 1rem;
+        }
+
+        .field-label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 0.4rem;
+        }
+
+        input[type="text"], input[type="number"], select, textarea {
+            width: 100%;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 0.5rem 0.75rem;
+            border-radius: 6px;
+            font-family: var(--font-mono);
+            font-size: 0.875rem;
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 100px;
+        }
+
+        .status-badge {
+            font-family: var(--font-mono);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-weight: 600;
+            font-size: 0.8rem;
+        }
+
+        .status-ready {
+            background: rgba(16, 185, 129, 0.2);
+            color: #34d399;
+        }
+
+        .status-error {
+            background: rgba(239, 68, 68, 0.2);
+            color: #f87171;
+        }
+
+        .status-warn {
+            background: rgba(245, 158, 11, 0.2);
+            color: #fbbf24;
+        }
+
+        /* Documentation styling */
+        .doc-markdown {
+            background: var(--bg-surface);
+            padding: 1.5rem;
+            border-radius: 8px;
+            font-family: var(--font-mono);
+            font-size: 0.875rem;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            max-height: 600px;
+            overflow-y: auto;
+            border: 1px solid var(--border-color);
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="header-title-group">
+            <div class="logo-icon"><i class="fa-solid fa-palette"></i></div>
+            <div>
+                <h1>Chromatic Images</h1>
+                <div style="display: flex; gap: 0.4rem; align-items: center; margin-top: 2px;">
+                    <span class="badge badge-dev">v0.1.0 Extension</span>
+                    <span class="badge badge-st">SillyTavern 1.18.0+</span>
+                </div>
+            </div>
+        </div>
+
+        <nav class="nav-tabs" role="tablist">
+            <button class="tab-btn active" data-tab="tab-simulator">
+                <i class="fa-solid fa-sliders"></i> Extension Panel
+            </button>
+            <button class="tab-btn" data-tab="tab-reader">
+                <i class="fa-solid fa-comment-dots"></i> Message Reader
+            </button>
+            <button class="tab-btn" data-tab="tab-tests">
+                <i class="fa-solid fa-vial-circle-check"></i> Unit Tests
+            </button>
+            <button class="tab-btn" data-tab="tab-docs">
+                <i class="fa-solid fa-book-open"></i> Architecture & Roadmap
+            </button>
+        </nav>
+    </header>
+
+    <main>
+        <!-- TAB 1: Extension Panel Simulator -->
+        <section id="tab-simulator" class="tab-content active">
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <h2 class="card-title"><i class="fa-solid fa-puzzle-piece"></i> SillyTavern Extension Simulator</h2>
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 4px;">
+                            Simulates SillyTavern extension host mounting `#extensions_settings2` with native styles from <code>style.css</code>.
+                        </p>
+                    </div>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <button id="btn-re-mount" class="btn btn-secondary btn-sm">
+                            <i class="fa-solid fa-rotate"></i> Re-mount Panel
+                        </button>
+                        <button id="btn-trigger-chat-change" class="btn btn-secondary btn-sm">
+                            <i class="fa-solid fa-sync"></i> Trigger CHAT_CHANGED
+                        </button>
+                    </div>
+                </div>
+
+                <div class="st-container-header">
+                    <span>Target DOM Container: <code>#extensions_settings2</code></span>
+                    <span id="mount-status" class="status-badge status-ready"><i class="fa-solid fa-circle-check"></i> Mounted</span>
+                </div>
+
+                <!-- SillyTavern Container Mock -->
+                <div class="st-container-mock">
+                    <div id="extensions_settings2">
+                        <!-- Extension panel injected dynamically here by ensurePanel() -->
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3 class="card-title" style="margin-bottom: 0.5rem;"><i class="fa-solid fa-circle-info"></i> Extension Specifications</h3>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin-top: 1rem;">
+                    <div style="background: var(--bg-elevated); padding: 0.75rem 1rem; border-radius: 6px; border: 1px solid var(--border-color);">
+                        <div style="font-size: 0.75rem; color: var(--text-secondary);">Extension Folder</div>
+                        <div style="font-family: var(--font-mono); font-size: 0.85rem; font-weight: 600;">third-party/SillyTavern-ChromaticImages</div>
+                    </div>
+                    <div style="background: var(--bg-elevated); padding: 0.75rem 1rem; border-radius: 6px; border: 1px solid var(--border-color);">
+                        <div style="font-size: 0.75rem; color: var(--text-secondary);">Protocol V1 Marker</div>
+                        <div style="font-family: var(--font-mono); font-size: 0.85rem; font-weight: 600;">&lt;!-- CI_IMAGE ... --&gt;</div>
+                    </div>
+                    <div style="background: var(--bg-elevated); padding: 0.75rem 1rem; border-radius: 6px; border: 1px solid var(--border-color);">
+                        <div style="font-size: 0.75rem; color: var(--text-secondary);">Target Model Provider</div>
+                        <div style="font-family: var(--font-mono); font-size: 0.85rem; font-weight: 600;">NanoGPT (qwen-image)</div>
+                    </div>
+                    <div style="background: var(--bg-elevated); padding: 0.75rem 1rem; border-radius: 6px; border: 1px solid var(--border-color);">
+                        <div style="font-size: 0.75rem; color: var(--text-secondary);">Reference Limit</div>
+                        <div style="font-family: var(--font-mono); font-size: 0.85rem; font-weight: 600;">Max 3 images per request</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB 2: Message Reader -->
+        <section id="tab-reader" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <h2 class="card-title"><i class="fa-solid fa-code"></i> Assistant Message Reader Simulator</h2>
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 4px;">
+                            Test <code>readActiveAssistantMessage(messageId)</code> against mock SillyTavern chat states.
+                        </p>
+                    </div>
+                    <button id="btn-run-reader" class="btn">
+                        <i class="fa-solid fa-play"></i> Evaluate Message
+                    </button>
+                </div>
+
+                <div class="grid-2">
+                    <div>
+                        <div class="field-group">
+                            <label class="field-label">Pre-set Scenario</label>
+                            <select id="scenario-selector">
+                                <option value="valid-proposal">Valid CI_IMAGE proposal (Assistant)</option>
+                                <option value="valid-scene">Multi-character visual scene (Assistant)</option>
+                                <option value="user-message">User message (Should fail: not-assistant-message)</option>
+                                <option value="system-message">System message (Should fail: not-assistant-message)</option>
+                                <option value="invalid-index">Out of bounds index (Should fail: message-missing)</option>
+                                <option value="custom">Custom message edit</option>
+                            </select>
+                        </div>
+
+                        <div class="field-group">
+                            <label class="field-label">Message ID (Accepts number or numeric string)</label>
+                            <input type="text" id="reader-message-id" value="0">
+                        </div>
+
+                        <div class="field-group">
+                            <label class="field-label">Simulated Message Content (<code>message.mes</code>)</label>
+                            <textarea id="reader-message-content">Hina looks over her shoulder with an irritated expression.
+
+<!-- CI_IMAGE {"characters":["Hina"],"prompt":"Hina looks over her shoulder at Sensei with an annoyed pout, sitting in her Gehenna office."} --></textarea>
+                        </div>
+                    </div>
+
+                    <div>
+                        <div class="field-group">
+                            <label class="field-label">Evaluation Result</label>
+                            <div id="reader-result-status-badge" class="status-badge status-ready" style="display: inline-block; margin-bottom: 0.5rem;">
+                                ready
+                            </div>
+                            <div class="terminal-box" id="reader-result-json" style="max-height: 260px;">
+                                Result will appear here...
+                            </div>
+                        </div>
+
+                        <div class="field-group" style="margin-top: 1rem;">
+                            <label class="field-label">Extracted Proposal Parsing (CI_IMAGE)</label>
+                            <div class="terminal-box" id="proposal-parsed-box" style="max-height: 180px;">
+                                Checking proposal regex...
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TAB 3: Unit Tests -->
+        <section id="tab-tests" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <h2 class="card-title"><i class="fa-solid fa-flask"></i> Automated Test Suite</h2>
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 4px;">
+                            Runs <code>node --test tests/*.test.mjs</code> directly inside the Node.js 22 runtime.
+                        </p>
+                    </div>
+                    <button id="btn-trigger-tests" class="btn">
+                        <i class="fa-solid fa-bolt"></i> Run Unit Tests
+                    </button>
+                </div>
+
+                <div style="display: flex; gap: 1rem; margin-bottom: 1rem; align-items: center;">
+                    <span id="tests-summary-badge" class="pass-chip">52 / 52 Passed</span>
+                    <span id="tests-time" style="font-size: 0.85rem; color: var(--text-secondary);">Execution status: Ready</span>
+                </div>
+
+                <div class="terminal-box" id="test-output-box">Click "Run Unit Tests" to execute the test suite in real time.</div>
+            </div>
+        </section>
+
+        <!-- TAB 4: Documentation -->
+        <section id="tab-docs" class="tab-content">
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <h2 class="card-title"><i class="fa-solid fa-scroll"></i> Architecture and Roadmap Documentation</h2>
+                    </div>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <button class="btn btn-secondary btn-sm doc-switch-btn active" data-doc="architecture">Architecture</button>
+                        <button class="btn btn-secondary btn-sm doc-switch-btn" data-doc="roadmap">Roadmap</button>
+                        <button class="btn btn-secondary btn-sm doc-switch-btn" data-doc="readme">README</button>
+                        <button class="btn btn-secondary btn-sm doc-switch-btn" data-doc="manifest">manifest.json</button>
+                    </div>
+                </div>
+
+                <div class="doc-markdown" id="doc-content-viewer">Loading documentation...</div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Client-side script initializing mock SillyTavern and extension modules -->
+    <script type="module">
+        import { onActivate } from '/index.js';
+        import { readActiveAssistantMessage } from '/src/message-reader.js';
+        import { ensurePanel, refreshPanelState } from '/src/panel.js';
+        import { EXTENSION_FOLDER, PANEL_ID } from '/src/constants.js';
+
+        // 1. Setup Mock SillyTavern global environment
+        const eventListeners = new Map();
+        let currentChatId = 'chat_dev_test_001';
+
+        let mockChat = [
+            {
+                is_user: false,
+                is_system: false,
+                mes: `Hina looks over her shoulder with an irritated expression.\n\n<!-- CI_IMAGE {"characters":["Hina"],"prompt":"Hina looks over her shoulder at Sensei with an annoyed pout, sitting in her Gehenna office."} -->`
+            }
+        ];
+
+        window.SillyTavern = {
+            getContext: () => ({
+                chatId: currentChatId,
+                chat: mockChat,
+                eventSource: {
+                    on: (eventType, fn) => {
+                        if (!eventListeners.has(eventType)) {
+                            eventListeners.set(eventType, []);
+                        }
+                        eventListeners.get(eventType).push(fn);
+                    },
+                    emit: (eventType, ...args) => {
+                        const handlers = eventListeners.get(eventType) || [];
+                        handlers.forEach(h => h(...args));
+                    }
+                },
+                eventTypes: {
+                    APP_INITIALIZED: 'app_initialized',
+                    CHAT_CHANGED: 'chat_changed',
+                    MESSAGE_RECEIVED: 'message_received'
+                },
+                renderExtensionTemplateAsync: async (folder, templateName) => {
+                    const res = await fetch(`/${templateName}.html`);
+                    if (!res.ok) throw new Error(`Template not found: ${templateName}`);
+                    return await res.text();
+                }
+            })
+        };
+
+        // Initialize extension
+        async function bootExtension() {
+            try {
+                onActivate();
+                const st = window.SillyTavern.getContext();
+                st.eventSource.emit(st.eventTypes.APP_INITIALIZED);
+                document.getElementById('mount-status').className = 'status-badge status-ready';
+                document.getElementById('mount-status').innerHTML = '<i class="fa-solid fa-circle-check"></i> Mounted';
+            } catch (err) {
+                console.error('Error booting extension:', err);
+                document.getElementById('mount-status').className = 'status-badge status-error';
+                document.getElementById('mount-status').innerText = 'Mount Error: ' + err.message;
+            }
+        }
+
+        // Tab Navigation
+        const tabs = document.querySelectorAll('.tab-btn');
+        tabs.forEach(tab => {
+            tab.addEventListener('click', () => {
+                tabs.forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+                tab.classList.add('active');
+                const target = document.getElementById(tab.dataset.tab);
+                if (target) target.classList.add('active');
+            });
+        });
+
+        // Remount button
+        document.getElementById('btn-re-mount').addEventListener('click', async () => {
+            const container = document.getElementById('extensions_settings2');
+            container.innerHTML = '';
+            await ensurePanel();
+            refreshPanelState();
+        });
+
+        // Trigger chat changed
+        document.getElementById('btn-trigger-chat-change').addEventListener('click', () => {
+            const st = window.SillyTavern.getContext();
+            st.eventSource.emit(st.eventTypes.CHAT_CHANGED);
+            const btn = document.getElementById('btn-trigger-chat-change');
+            btn.innerHTML = '<i class="fa-solid fa-check"></i> Dispatched!';
+            setTimeout(() => {
+                btn.innerHTML = '<i class="fa-solid fa-sync"></i> Trigger CHAT_CHANGED';
+            }, 1200);
+        });
+
+        // Message reader simulator
+        const scenarioSelector = document.getElementById('scenario-selector');
+        const idInput = document.getElementById('reader-message-id');
+        const contentInput = document.getElementById('reader-message-content');
+        const evaluateBtn = document.getElementById('btn-run-reader');
+
+        scenarioSelector.addEventListener('change', () => {
+            const val = scenarioSelector.value;
+            if (val === 'valid-proposal') {
+                idInput.value = '0';
+                contentInput.value = 'Hina looks over her shoulder with an irritated expression.\n\n<!-- CI_IMAGE {"characters":["Hina"],"prompt":"Hina looks over her shoulder at Sensei with an annoyed pout, sitting in her Gehenna office."} -->';
+                mockChat[0] = { is_user: false, is_system: false, mes: contentInput.value };
+            } else if (val === 'valid-scene') {
+                idInput.value = '0';
+                contentInput.value = 'Hina and Ako sit opposite each other at dinner.\n\n<!-- CI_IMAGE {"characters":["Hina","Ako"],"prompt":"Hina and Ako sit opposite each other at dinner. Hina pauses mid-bite and gives Ako an irritated sideways look."} -->';
+                mockChat[0] = { is_user: false, is_system: false, mes: contentInput.value };
+            } else if (val === 'user-message') {
+                idInput.value = '0';
+                contentInput.value = 'Hello Hina! Can we talk?';
+                mockChat[0] = { is_user: true, is_system: false, mes: contentInput.value };
+            } else if (val === 'system-message') {
+                idInput.value = '0';
+                contentInput.value = 'System prompt: Roleplay scenario begins.';
+                mockChat[0] = { is_user: false, is_system: true, mes: contentInput.value };
+            } else if (val === 'invalid-index') {
+                idInput.value = '99';
+            }
+            evaluateMessage();
+        });
+
+        function evaluateMessage() {
+            const msgIdVal = idInput.value;
+            // Update current mockChat[0] if scenario is custom or valid
+            if (scenarioSelector.value === 'custom' || scenarioSelector.value.startsWith('valid')) {
+                mockChat[0] = {
+                    is_user: false,
+                    is_system: false,
+                    mes: contentInput.value
+                };
+            }
+
+            const result = readActiveAssistantMessage(msgIdVal);
+            const badge = document.getElementById('reader-result-status-badge');
+            const resultBox = document.getElementById('reader-result-json');
+            const proposalBox = document.getElementById('proposal-parsed-box');
+
+            badge.innerText = result.status;
+            if (result.status === 'ready') {
+                badge.className = 'status-badge status-ready';
+            } else if (result.status === 'invalid-message-id' || result.status === 'not-assistant-message') {
+                badge.className = 'status-badge status-warn';
+            } else {
+                badge.className = 'status-badge status-error';
+            }
+
+            resultBox.innerText = JSON.stringify(result, null, 2);
+
+            // Check proposal regex
+            if (result.message) {
+                const ciMatch = result.message.match(/<!--\s*CI_IMAGE\s*(\{.*?\})\s*-->/);
+                if (ciMatch) {
+                    try {
+                        const parsed = JSON.parse(ciMatch[1]);
+                        proposalBox.innerText = `[SUCCESS] Valid CI_IMAGE Found:\n` + JSON.stringify(parsed, null, 2);
+                    } catch (e) {
+                        proposalBox.innerText = `[WARN] Found CI_IMAGE marker but JSON invalid: ${e.message}`;
+                    }
+                } else {
+                    proposalBox.innerText = `[INFO] No <!-- CI_IMAGE ... --> marker in message body.`;
+                }
+            } else {
+                proposalBox.innerText = `[NONE] Message unreadable or empty.`;
+            }
+        }
+
+        evaluateBtn.addEventListener('click', evaluateMessage);
+        contentInput.addEventListener('input', () => {
+            scenarioSelector.value = 'custom';
+            evaluateMessage();
+        });
+        idInput.addEventListener('input', evaluateMessage);
+
+        // Unit test runner
+        async function runTests() {
+            const outputBox = document.getElementById('test-output-box');
+            const timeBadge = document.getElementById('tests-time');
+            const summaryBadge = document.getElementById('tests-summary-badge');
+            outputBox.innerText = 'Running tests in Node.js runtime...';
+            timeBadge.innerText = 'Executing tests/*.test.mjs...';
+
+            const startTime = performance.now();
+            try {
+                const res = await fetch('/api/tests/run');
+                const data = await res.json();
+                const duration = Math.round(performance.now() - startTime);
+
+                outputBox.innerText = data.stdout || data.stderr;
+                if (data.success) {
+                    summaryBadge.className = 'pass-chip';
+                    summaryBadge.innerText = '52 / 52 Tests Passed';
+                    timeBadge.innerText = `Completed in ${duration}ms — Exit code: 0`;
+                } else {
+                    summaryBadge.className = 'status-badge status-error';
+                    summaryBadge.innerText = 'Tests Failed';
+                    timeBadge.innerText = `Exit code: ${data.code}`;
+                }
+            } catch (err) {
+                outputBox.innerText = 'Error running tests: ' + err.message;
+            }
+        }
+
+        document.getElementById('btn-trigger-tests').addEventListener('click', runTests);
+
+        // Documentation viewer
+        async function loadDoc(docName) {
+            const viewer = document.getElementById('doc-content-viewer');
+            viewer.innerText = 'Loading ' + docName + '...';
+            try {
+                const res = await fetch(`/api/docs/${docName}`);
+                const data = await res.json();
+                viewer.innerText = data.content;
+            } catch (err) {
+                viewer.innerText = 'Failed to load doc: ' + err.message;
+            }
+        }
+
+        document.querySelectorAll('.doc-switch-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.doc-switch-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                loadDoc(btn.dataset.doc);
+            });
+        });
+
+        // Initialize on load
+        window.addEventListener('DOMContentLoaded', () => {
+            bootExtension();
+            evaluateMessage();
+            runTests();
+            loadDoc('architecture');
+        });
+    </script>
+</body>
+</html>

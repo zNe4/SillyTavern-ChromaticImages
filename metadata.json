@@ -1,0 +1,8 @@
+{
+  "name": "Chromatic Images for SillyTavern",
+  "description": "Browser extension and testbed for proposal-first, context-aware image generation during SillyTavern roleplay.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
