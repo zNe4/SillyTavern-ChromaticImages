@@ -167,6 +167,32 @@ export function refreshRenderedImageMessages() {
 }
 
 /**
+ * Resolves an event identifier from context, checking legacy event_types first,
+ * then modern eventTypes.
+ *
+ * @param {object} context - SillyTavern context.
+ * @param {string} eventName - Name of the event to resolve.
+ * @returns {string | symbol | null}
+ */
+function resolveEventIdentifier(context, eventName) {
+    if (!context || typeof context !== 'object') {
+        return null;
+    }
+
+    const legacy = context.event_types?.[eventName];
+    if (isValidEventIdentifier(legacy)) {
+        return legacy;
+    }
+
+    const modern = context.eventTypes?.[eventName];
+    if (isValidEventIdentifier(modern)) {
+        return modern;
+    }
+
+    return null;
+}
+
+/**
  * Register Chromatic Images message runtime handlers with SillyTavern.
  *
  * @returns {{ status: 'registered' | 'already-registered' | 'unavailable' }}
@@ -181,12 +207,7 @@ export function registerMessageRuntime() {
         return { status: 'unavailable' };
     }
 
-    const eventTypes = context.eventTypes || context.event_types;
-    if (!eventTypes || typeof eventTypes !== 'object') {
-        return { status: 'unavailable' };
-    }
-
-    const charRenderedEvent = eventTypes.CHARACTER_MESSAGE_RENDERED;
+    const charRenderedEvent = resolveEventIdentifier(context, 'CHARACTER_MESSAGE_RENDERED');
     if (!isValidEventIdentifier(charRenderedEvent)) {
         return { status: 'unavailable' };
     }
@@ -201,19 +222,31 @@ export function registerMessageRuntime() {
 
     const registeredEvents = new Set();
 
-    context.eventSource.on(charRenderedEvent, handler);
-    registeredEvents.add(charRenderedEvent);
-
-    const swipedEvent = eventTypes.MESSAGE_SWIPED;
-    if (isValidEventIdentifier(swipedEvent) && !registeredEvents.has(swipedEvent)) {
-        context.eventSource.on(swipedEvent, handler);
-        registeredEvents.add(swipedEvent);
+    try {
+        context.eventSource.on(charRenderedEvent, handler);
+        registeredEvents.add(charRenderedEvent);
+    } catch {
+        return { status: 'unavailable' };
     }
 
-    const updatedEvent = eventTypes.MESSAGE_UPDATED;
+    const swipedEvent = resolveEventIdentifier(context, 'MESSAGE_SWIPED');
+    if (isValidEventIdentifier(swipedEvent) && !registeredEvents.has(swipedEvent)) {
+        try {
+            context.eventSource.on(swipedEvent, handler);
+            registeredEvents.add(swipedEvent);
+        } catch {
+            // Optional registration failure is non-fatal
+        }
+    }
+
+    const updatedEvent = resolveEventIdentifier(context, 'MESSAGE_UPDATED');
     if (isValidEventIdentifier(updatedEvent) && !registeredEvents.has(updatedEvent)) {
-        context.eventSource.on(updatedEvent, handler);
-        registeredEvents.add(updatedEvent);
+        try {
+            context.eventSource.on(updatedEvent, handler);
+            registeredEvents.add(updatedEvent);
+        } catch {
+            // Optional registration failure is non-fatal
+        }
     }
 
     registered = true;

@@ -454,6 +454,232 @@ test('9. Duplicate event identifiers do not register duplicate handlers', async 
     assert.strictEqual(eventSource.getHandlers('shared_event').length, 1);
 });
 
+test('9a. Required event registration throws: returns unavailable, does not throw, remains retryable', async () => {
+    let shouldThrow = true;
+    const handlers = new Map();
+    const eventSource = {
+        on(event, handler) {
+            if (shouldThrow && event === 'cmr') {
+                throw new Error('registration failed');
+            }
+            if (!handlers.has(event)) {
+                handlers.set(event, []);
+            }
+            handlers.get(event).push(handler);
+        },
+        getHandlers(event) {
+            return handlers.get(event) ?? [];
+        },
+    };
+
+    globalThis.SillyTavern = {
+        getContext() {
+            return {
+                eventSource,
+                eventTypes: {
+                    CHARACTER_MESSAGE_RENDERED: 'cmr',
+                    MESSAGE_SWIPED: 'ms',
+                },
+            };
+        },
+    };
+
+    const { registerMessageRuntime } = await loadFreshMessageRuntime();
+
+    assert.doesNotThrow(() => {
+        const res = registerMessageRuntime();
+        assert.deepEqual(res, { status: 'unavailable' });
+    });
+
+    assert.strictEqual(eventSource.getHandlers('cmr').length, 0);
+    assert.strictEqual(eventSource.getHandlers('ms').length, 0);
+
+    // Subsequent call should retry, not return already-registered
+    shouldThrow = false;
+    const retryRes = registerMessageRuntime();
+    assert.deepEqual(retryRes, { status: 'registered' });
+    assert.strictEqual(eventSource.getHandlers('cmr').length, 1);
+    assert.strictEqual(eventSource.getHandlers('ms').length, 1);
+});
+
+test('9b. Optional event registration throws (MESSAGE_SWIPED throws): required remains registered, finishes registered and idempotent', async () => {
+    const handlers = new Map();
+    const eventSource = {
+        on(event, handler) {
+            if (event === 'ms') {
+                throw new Error('swipe listener error');
+            }
+            if (!handlers.has(event)) {
+                handlers.set(event, []);
+            }
+            handlers.get(event).push(handler);
+        },
+        getHandlers(event) {
+            return handlers.get(event) ?? [];
+        },
+    };
+
+    globalThis.SillyTavern = {
+        getContext() {
+            return {
+                eventSource,
+                eventTypes: {
+                    CHARACTER_MESSAGE_RENDERED: 'cmr',
+                    MESSAGE_SWIPED: 'ms',
+                    MESSAGE_UPDATED: 'mu',
+                },
+            };
+        },
+    };
+
+    const { registerMessageRuntime } = await loadFreshMessageRuntime();
+
+    assert.doesNotThrow(() => {
+        const res = registerMessageRuntime();
+        assert.deepEqual(res, { status: 'registered' });
+    });
+
+    assert.strictEqual(eventSource.getHandlers('cmr').length, 1);
+    assert.strictEqual(eventSource.getHandlers('ms').length, 0);
+    assert.strictEqual(eventSource.getHandlers('mu').length, 1);
+
+    // Second call returns already-registered and does not duplicate required handler
+    const secondRes = registerMessageRuntime();
+    assert.deepEqual(secondRes, { status: 'already-registered' });
+    assert.strictEqual(eventSource.getHandlers('cmr').length, 1);
+});
+
+test('9c. Optional event registration throws (MESSAGE_UPDATED throws): symmetric case', async () => {
+    const handlers = new Map();
+    const eventSource = {
+        on(event, handler) {
+            if (event === 'mu') {
+                throw new Error('update listener error');
+            }
+            if (!handlers.has(event)) {
+                handlers.set(event, []);
+            }
+            handlers.get(event).push(handler);
+        },
+        getHandlers(event) {
+            return handlers.get(event) ?? [];
+        },
+    };
+
+    globalThis.SillyTavern = {
+        getContext() {
+            return {
+                eventSource,
+                eventTypes: {
+                    CHARACTER_MESSAGE_RENDERED: 'cmr',
+                    MESSAGE_SWIPED: 'ms',
+                    MESSAGE_UPDATED: 'mu',
+                },
+            };
+        },
+    };
+
+    const { registerMessageRuntime } = await loadFreshMessageRuntime();
+
+    assert.doesNotThrow(() => {
+        const res = registerMessageRuntime();
+        assert.deepEqual(res, { status: 'registered' });
+    });
+
+    assert.strictEqual(eventSource.getHandlers('cmr').length, 1);
+    assert.strictEqual(eventSource.getHandlers('ms').length, 1);
+    assert.strictEqual(eventSource.getHandlers('mu').length, 0);
+
+    const secondRes = registerMessageRuntime();
+    assert.deepEqual(secondRes, { status: 'already-registered' });
+    assert.strictEqual(eventSource.getHandlers('cmr').length, 1);
+});
+
+test('9d. Mixed event tables: required in event_types and optionals in eventTypes', async () => {
+    const eventSource = createFakeEventSource();
+    globalThis.SillyTavern = {
+        getContext() {
+            return {
+                eventSource,
+                event_types: {
+                    CHARACTER_MESSAGE_RENDERED: 'cmr_legacy',
+                },
+                eventTypes: {
+                    MESSAGE_SWIPED: 'swiped_modern',
+                    MESSAGE_UPDATED: 'updated_modern',
+                },
+            };
+        },
+    };
+
+    const { registerMessageRuntime } = await loadFreshMessageRuntime();
+    assert.deepEqual(registerMessageRuntime(), { status: 'registered' });
+
+    assert.strictEqual(eventSource.getHandlers('cmr_legacy').length, 1);
+    assert.strictEqual(eventSource.getHandlers('swiped_modern').length, 1);
+    assert.strictEqual(eventSource.getHandlers('updated_modern').length, 1);
+});
+
+test('9e. Mixed event tables inverse: required in eventTypes and optionals in event_types', async () => {
+    const eventSource = createFakeEventSource();
+    globalThis.SillyTavern = {
+        getContext() {
+            return {
+                eventSource,
+                eventTypes: {
+                    CHARACTER_MESSAGE_RENDERED: 'cmr_modern',
+                },
+                event_types: {
+                    MESSAGE_SWIPED: 'swiped_legacy',
+                    MESSAGE_UPDATED: 'updated_legacy',
+                },
+            };
+        },
+    };
+
+    const { registerMessageRuntime } = await loadFreshMessageRuntime();
+    assert.deepEqual(registerMessageRuntime(), { status: 'registered' });
+
+    assert.strictEqual(eventSource.getHandlers('cmr_modern').length, 1);
+    assert.strictEqual(eventSource.getHandlers('swiped_legacy').length, 1);
+    assert.strictEqual(eventSource.getHandlers('updated_legacy').length, 1);
+});
+
+test('9f. Precedence when both tables contain the same event name: prefers event_types before eventTypes', async () => {
+    const eventSource = createFakeEventSource();
+    globalThis.SillyTavern = {
+        getContext() {
+            return {
+                eventSource,
+                event_types: {
+                    CHARACTER_MESSAGE_RENDERED: 'cmr_pref_legacy',
+                    MESSAGE_SWIPED: 'ms_pref_legacy',
+                    MESSAGE_UPDATED: 'mu_pref_legacy',
+                },
+                eventTypes: {
+                    CHARACTER_MESSAGE_RENDERED: 'cmr_pref_modern',
+                    MESSAGE_SWIPED: 'ms_pref_modern',
+                    MESSAGE_UPDATED: 'mu_pref_modern',
+                },
+            };
+        },
+    };
+
+    const { registerMessageRuntime } = await loadFreshMessageRuntime();
+    assert.deepEqual(registerMessageRuntime(), { status: 'registered' });
+
+    // Legacy event_types must be preferred
+    assert.strictEqual(eventSource.getHandlers('cmr_pref_legacy').length, 1);
+    assert.strictEqual(eventSource.getHandlers('cmr_pref_modern').length, 0);
+
+    assert.strictEqual(eventSource.getHandlers('ms_pref_legacy').length, 1);
+    assert.strictEqual(eventSource.getHandlers('ms_pref_modern').length, 0);
+
+    assert.strictEqual(eventSource.getHandlers('mu_pref_legacy').length, 1);
+    assert.strictEqual(eventSource.getHandlers('mu_pref_modern').length, 0);
+});
+
+
 // ---------------------------------------------------------------------------
 // 2. Per-message render event tests
 // ---------------------------------------------------------------------------
