@@ -4,13 +4,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
-    "build": "node --test tests/*.test.mjs",
-    "dev": "node server.js",
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "^5.2.1"
+    "test": "node --test tests/*.test.mjs"
   }
 }
-

@@ -60,11 +60,7 @@ export function validateImageProposalRecords(records) {
 
         const payload = record.payload;
 
-        if (
-            typeof payload !== 'object' ||
-            payload === null ||
-            Array.isArray(payload)
-        ) {
+        if (!isPlainObject(payload)) {
             recordError(errors, 'invalid-proposal-shape');
             continue;
         }
@@ -197,6 +193,23 @@ export function selectMvpImageProposal(proposals) {
     return {
         status: 'multiple-proposals-not-supported',
     };
+}
+
+function isPlainObject(value) {
+    if (
+        value === null ||
+        typeof value !== 'object' ||
+        Array.isArray(value)
+    ) {
+        return false;
+    }
+
+    const proto = Object.getPrototypeOf(value);
+
+    return (
+        proto === Object.prototype ||
+        proto === null
+    );
 }
 
 function recordError(errors, code) {

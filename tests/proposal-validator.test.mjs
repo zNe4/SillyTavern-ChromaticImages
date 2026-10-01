@@ -280,6 +280,97 @@ test('array, scalar, or null payload is rejected', () => {
     }
 });
 
+test('normal object-literal payload is accepted when otherwise valid', () => {
+    const record = {
+        raw: '<!-- CI_IMAGE ... -->',
+        start: 0,
+        end: 50,
+        payload: {
+            characters: ['Hina'],
+            prompt: 'Hina smiles.',
+        },
+    };
+
+    const result = validateImageProposalRecords([record]);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.proposals.length, 1);
+    assert.deepEqual(result.proposals[0].characters, ['Hina']);
+    assert.strictEqual(result.proposals[0].prompt, 'Hina smiles.');
+});
+
+test('Date payload is rejected as invalid-proposal-shape', () => {
+    const record = {
+        raw: '<!-- CI_IMAGE ... -->',
+        start: 0,
+        end: 50,
+        payload: new Date(),
+    };
+
+    const result = validateImageProposalRecords([record]);
+    assert.strictEqual(result.ok, false);
+    assert.deepEqual(result.proposals, []);
+    assert.deepEqual(result.errors, ['invalid-proposal-shape']);
+});
+
+test('class-instance payload is rejected as invalid-proposal-shape', () => {
+    class CustomPayload {
+        constructor() {
+            this.characters = ['Hina'];
+            this.prompt = 'Hina in class.';
+        }
+    }
+
+    const record = {
+        raw: '<!-- CI_IMAGE ... -->',
+        start: 0,
+        end: 50,
+        payload: new CustomPayload(),
+    };
+
+    const result = validateImageProposalRecords([record]);
+    assert.strictEqual(result.ok, false);
+    assert.deepEqual(result.proposals, []);
+    assert.deepEqual(result.errors, ['invalid-proposal-shape']);
+});
+
+test('object with a custom non-null prototype is rejected as invalid-proposal-shape', () => {
+    const customProto = { inherited: true };
+    const payload = Object.create(customProto);
+    payload.characters = ['Hina'];
+    payload.prompt = 'Hina with custom prototype.';
+
+    const record = {
+        raw: '<!-- CI_IMAGE ... -->',
+        start: 0,
+        end: 50,
+        payload,
+    };
+
+    const result = validateImageProposalRecords([record]);
+    assert.strictEqual(result.ok, false);
+    assert.deepEqual(result.proposals, []);
+    assert.deepEqual(result.errors, ['invalid-proposal-shape']);
+});
+
+test('null-prototype plain object with exactly characters and prompt is accepted', () => {
+    const payload = Object.create(null);
+    payload.characters = ['Hina'];
+    payload.prompt = 'Hina with null prototype.';
+
+    const record = {
+        raw: '<!-- CI_IMAGE ... -->',
+        start: 0,
+        end: 50,
+        payload,
+    };
+
+    const result = validateImageProposalRecords([record]);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.proposals.length, 1);
+    assert.deepEqual(result.proposals[0].characters, ['Hina']);
+    assert.strictEqual(result.proposals[0].prompt, 'Hina with null prototype.');
+});
+
 test('multiple valid records validate successfully in order', () => {
     const record1 = {
         raw: '<!-- CI_IMAGE {"characters":["Hina"],"prompt":"P1"} -->',
