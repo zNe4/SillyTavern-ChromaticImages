@@ -6,19 +6,14 @@
 
 Chromatic Images is a proposal-first SillyTavern image-generation extension.
 
-It is intentionally **not** a fork of SLAY Images and **not** a modified build
-of Chromatic Dialogue.
-
 It is a new extension that combines:
 
-- the modular runtime, message inspection, validation, safe user-approval, UI,
-  persistence discipline, and test style proven in Chromatic Dialogue;
-- selected image-specific implementation patterns from SLAY Images;
-- a purpose-built NanoGPT/Qwen path designed around the actual roleplay
-  workflow.
+- modular runtime/message-safety patterns proven in Chromatic Dialogue;
+- selected image upload/rewrite/mobile lessons from SLAY Images;
+- a purpose-built NanoGPT/Qwen path;
+- a trusted, character-bound reference library.
 
-The architecture should remain understandable without knowing SLAY's legacy
-feature set.
+The roleplay model proposes **what to illustrate**. The extension decides **how to generate it**.
 
 ---
 
@@ -26,519 +21,552 @@ feature set.
 
 ### Roleplay model
 
-The model may answer only these image questions:
+The model answers only:
 
 1. Is an illustration useful now?
 2. Which characters are visibly present?
 3. What does the current scene look like?
 
-It expresses that decision through one semantic record:
+It may emit:
 
-```text
+~~~text
 <!-- CI_IMAGE {"characters":["Hina","Ako"],"prompt":"..."} -->
-```
+~~~
 
-The model must not select:
-
-- provider;
-- image model;
-- API endpoint;
-- API key;
-- local/remote file;
-- reference slot;
-- base64 input;
-- resolution;
-- number of outputs;
-- inference steps;
-- guidance;
-- negative prompt;
-- seed.
+It must not select provider, model, endpoint, key, local file, reference slot, base64, resolution, steps, guidance, negative prompt, or seed.
 
 ### Extension
 
-Chromatic Images owns all provider and binary-image mechanics and requires an
-explicit user action before a paid request.
+Chromatic Images owns:
 
-This boundary is more important than any individual module layout.
+- protocol parsing/validation;
+- identity resolution;
+- trusted reference selection;
+- provider/auth/settings;
+- explicit paid-action approval;
+- local image I/O;
+- chat-message rewrite/persistence;
+- result/regeneration/finalization UI;
+- prompt hygiene;
+- image viewing.
 
 ---
 
-## 3. Why this architecture
+## 3. Core persistence model
+
+Chromatic Images does **not** use a separate durable proposal/result database.
+
+The chat message itself is authoritative.
+
+### State A — proposed
+
+~~~text
+Visible roleplay prose...
+
+<!-- CI_IMAGE {"characters":["Hina"],"prompt":"Hina looks over her shoulder..."} -->
+~~~
+
+Runtime UI: proposal card with Generate and related controls.
+
+### State B — generated/reviewable
+
+~~~text
+Visible roleplay prose...
+
+![ChromaticImages](/user/images/.../ci_123.png)
+
+<!-- CI_RESULT {"v":1,"characters":["Hina"],"prompt":"Hina looks over her shoulder...","path":"/user/images/.../ci_123.png"} -->
+~~~
+
+Runtime UI: generated image plus Regenerate / Edit & Regenerate / Keep.
+
+### State C — finalized
+
+~~~text
+Visible roleplay prose...
+
+![ChromaticImages](/user/images/.../ci_123.png)
+~~~
+
+Runtime UI: ordinary image, optionally enhanced by the ChromaticImages viewer.
+
+### Transition rules
+
+~~~text
+CI_IMAGE
+  |
+  | explicit Generate
+  | provider succeeds
+  | local upload succeeds
+  v
+Markdown image + CI_RESULT
+  |
+  | explicit Keep
+  v
+Markdown image
+~~~
+
+Failure before the rewrite leaves the original state untouched.
+
+No reload may automatically continue or repeat a paid request.
+
+---
+
+## 4. Why this architecture
 
 ### Why not fork SLAY Images
 
-SLAY already solves many difficult image problems, but its current architecture
-is centered on an immediate-generation tag:
+SLAY's trigger model is effectively:
 
-```text
-image-generation tag exists
-    ->
-generate
-```
+~~~text
+generation tag exists -> generate
+~~~
 
-Chromatic Images needs:
+Chromatic Images requires:
 
-```text
-semantic proposal exists
-    ->
-validate
-    ->
-show user
-    ->
-explicit approval
-    ->
-generate
-```
+~~~text
+semantic proposal -> validate -> show user -> explicit approval -> generate
+~~~
 
-Retrofitting proposal lifecycle state into SLAY would preserve a large amount
-of unrelated provider, wardrobe, compatibility, and legacy behavior.
+SLAY remains valuable as a donor for image mechanics, not as the product skeleton.
 
-### Why Chromatic Dialogue is the scaffold
+### Why Chromatic Dialogue is the structural donor
 
-Chromatic Dialogue already models:
+Chromatic Dialogue already demonstrates:
 
-```text
-MESSAGE_RECEIVED
-    ->
-read raw assistant message
-    ->
-parse/validate proposal
-    ->
-create user-facing review state
-    ->
-user acts
-    ->
-re-read source/current state
-    ->
-reject stale/conflicting state
-    ->
-perform side effect
-```
+- initialize-once lifecycle control;
+- safe raw message retrieval;
+- strict control-comment parsing;
+- re-reading source at approval time;
+- rejecting stale chat/message state;
+- managed Regex installation/repair;
+- modular UI and extensive tests.
 
-Chromatic Images replaces the final side effect with a paid image-generation
-pipeline. That is an architectural fit rather than a workaround.
+Those concerns map directly to Chromatic Images.
 
-### Why not literally gut Chromatic Dialogue
+### Why not copy Dialogue wholesale
 
-Chromatic Dialogue remains its own product. Chromatic Images should reuse
-concepts and carefully adapted modules, not turn one extension into another or
-couple their release cycles.
+Dialogue-specific color, tone, registration, automatic-review, migration, and registry systems are unrelated.
+
+Reuse should be allowlisted and pinned.
+
+Pinned donor commit:
+
+`00b1e9d56593d97f259f162fb3bb8a0848417f40`
 
 ---
 
-## 4. Repository model
+## 5. Repository workflow
 
-### Canonical repository
+### Canonical
 
 `zNe4/SillyTavern-ChromaticImages`
 
-Purpose:
-
-- reviewed source of truth;
-- installable public repository;
-- mission branches;
-- pull requests/releases.
+Reviewed source of truth.
 
 ### AI Studio sandbox
 
 `zNe4/SillyTavern-ChromaticImages-aistudio`
 
-Purpose:
-
-- disposable implementation workspace;
-- one AI Studio mission at a time;
-- may be force-reset from canonical;
-- its Git history is not trusted as project history.
+Disposable one-mission implementation workspace.
 
 ### Rules
 
-- Never force-push the canonical repository.
-- Force-reset/force-push is permitted only for the AI Studio sandbox when
-  synchronizing it to the approved canonical baseline.
-- AI Studio works only in the sandbox unless the user explicitly changes the
-  workflow.
-- ChatGPT reviews contents/diffs; it does not approve code merely because AI
-  Studio reports success.
-- Only reviewed paths are transferred into a canonical mission branch.
-- Final tests for a mission run against the canonical repo/branch, not only the
-  sandbox.
-- Do not advance to the next mission without explicit user direction.
-- Do not store credentials in either repository.
-
-### Normal mission flow
-
-```text
-canonical main
-    |
-    | synchronize/reset
-    v
-AI Studio sandbox main
-    |
-    | AI Studio implements MNN only
-    v
-sandbox candidate
-    |
-    | ChatGPT reviews actual diff
-    v
-approved paths only
-    |
-    v
-canonical branch mNN-...
-    |
-    | tests + SillyTavern validation
-    v
-PR / merge
-    |
-    v
-canonical main
-```
+- never force-push canonical;
+- force-reset sandbox only;
+- AI Studio works only in sandbox unless explicitly changed;
+- inspect actual content/diff, not AI claims;
+- transfer only reviewed paths;
+- final mission tests run against canonical branch;
+- do not advance missions without explicit user direction;
+- never commit credentials.
 
 ---
 
-## 5. Runtime architecture
+## 6. Runtime architecture
 
-The runtime should be event-driven.
-
-### Preferred high-level pipeline
-
-```text
-SillyTavern lifecycle/message event
+~~~text
+SillyTavern event/render
     |
     v
 message-reader
     |
     v
-proposal parser + validator
+CI parser/validator
+    |
+    +--> CI_IMAGE -> proposal UI
+    |
+    +--> Markdown + CI_RESULT -> reviewable result UI
+    |
+    +--> Markdown only -> finalized image/viewer
+~~~
+
+Generate path:
+
+~~~text
+Generate click
     |
     v
-proposal view model
+generation guard
     |
     v
-inline card renderer
-    |
-    | Generate click
-    v
-generation guard / stale-source validation
+identity resolver
     |
     v
-character resolver
-    |
-    v
-reference allocator
+reference allocator <= 3
     |
     v
 Qwen prompt builder
     |
     v
-NanoGPT provider
+NanoGPT
     |
     v
-generated-image localizer
+local image upload
     |
     v
-generation-state persistence
+message rewriter
     |
     v
-inline generated card
-```
+saveChat()
+~~~
 
-### Event rules
+Use SillyTavern events rather than permanent polling or broad whole-chat MutationObserver loops.
 
-Use SillyTavern events rather than continuous DOM scanning whenever possible.
-
-Expected relevant lifecycle categories include:
-
-- extension/application initialization;
-- chat change;
-- assistant message received;
-- assistant message rendered/re-rendered;
-- message update/edit if exposed and required.
-
-Exact event identifiers must be verified against the target SillyTavern
-version during implementation.
-
-Avoid:
-
-- permanent polling loops;
-- broad MutationObservers watching the whole chat indefinitely;
-- cached long-lived chat references that survive chat switching.
-
-A bounded DOM query during an event/render operation is acceptable.
+Bounded DOM queries during render/event handling are acceptable.
 
 ---
 
-## 6. Proposal protocol
+## 7. Control protocol
 
-### v1 wire record
+### CI_IMAGE
 
-```text
-<!-- CI_IMAGE {"characters":["Hina","Ako"],"prompt":"Hina and Ako sit opposite each other at dinner."} -->
-```
+Model-authored, one standalone one-line HTML comment:
 
-### Parsing rules
+~~~text
+<!-- CI_IMAGE {"characters":["Hina","Ako"],"prompt":"..."} -->
+~~~
 
-The parser should be pure and independently testable.
+v1 rules:
 
-For v1:
+- marker case-sensitive;
+- max one per assistant message;
+- JSON must be a plain object;
+- exact keys: characters, prompt;
+- characters is an array of normalized non-empty strings;
+- prompt is a normalized non-empty string with a documented ceiling;
+- unknown fields rejected;
+- malformed/unclosed/multiline lookalikes fail closed;
+- unrelated prose containing CI_IMAGE is not a proposal;
+- user/system messages do not qualify.
 
-- input must be a string;
-- control record must be a standalone one-line HTML comment;
-- marker is case-sensitive: `CI_IMAGE`;
-- maximum one valid record per assistant message;
-- JSON must parse;
-- JSON value must be a plain object;
-- allowed keys are exactly `characters` and `prompt`;
-- `characters` must be an array;
-- each character must normalize to a non-empty string;
-- normalized duplicate character names are rejected or deduplicated according
-  to one documented deterministic rule; prefer rejection initially because it
-  surfaces malformed model output;
-- `prompt` must normalize to a non-empty string;
-- enforce a reasonable maximum length to prevent pathological payloads;
-- malformed/unclosed/multiline lookalike records fail closed;
-- normal prose containing the words `CI_IMAGE` but not the exact record syntax
-  is not a proposal.
+### CI_RESULT
 
-### Multiple-extension compatibility
+Extension-authored only:
 
-Chromatic Images must not assume its record is the only auxiliary data in a
-message.
+~~~text
+<!-- CI_RESULT {"v":1,"characters":["Hina"],"prompt":"...","path":"/user/images/..."} -->
+~~~
 
-A typical response may eventually end as:
+Initial exact keys:
 
-```text
-Visible roleplay prose...
+- v
+- characters
+- prompt
+- path
 
-<!-- CD_NEW {"id":"c6","name":"Mara","color":"#B86FD4"} -->
-<!-- CI_IMAGE {"characters":["Mara"],"prompt":"Mara enters the candlelit room..."} -->
-```
+The result schema may later gain stable reference IDs, seed, or generation parameters only when needed for reproducible regeneration.
 
-The Chromatic Images parser should concern itself only with its own exact
-standalone record.
+### ChromaticImages Markdown marker
 
-### Prompt hygiene
+Use a deterministic alt marker:
 
-The raw record is valuable for durable reconstruction but should not become
-uncontrolled historical instruction text in later model prompts.
+~~~text
+![ChromaticImages](/user/images/.../ci_123.png)
+~~~
 
-Before stable release, Chromatic Images must provide a supported prompt-hygiene
-mechanism that removes only its control records from outgoing model context
-while leaving stored chat messages untouched.
-
-Chromatic Dialogue's managed SillyTavern Regex pattern is the preferred design
-reference.
+Do not put scene prose into the alt text.
 
 ---
 
-## 7. Proposal/card state model
+## 8. Prompt hygiene
 
-The source control record is authoritative for an ungenerated proposal.
+Stored control/image records must not pollute future roleplay prompts.
 
-Conceptual states:
+A managed SillyTavern Regex integration should remove from outgoing prompt context only:
 
-```text
-invalid
-pending
-generating
-generated
-failed/interrupted
-stale
-```
+- CI_IMAGE records;
+- CI_RESULT records;
+- ChromaticImages-owned Markdown image records.
 
-Rules:
+The stored chat remains unchanged.
 
-- `pending` can be reconstructed from raw source after reload.
-- `generating` is not permission to auto-restart after reload.
-- a reload during generation should return to a safe interrupted/retry state,
-  never silently issue another billable request.
-- `generated` requires a durable local output path.
-- `failed` must not loop automatically into a second paid request.
-- `stale` means the source/chat changed enough that the stored action no longer
-  matches; user must re-evaluate rather than the extension guessing.
+The implementation should adapt Chromatic Dialogue's managed Regex manager and tests rather than recreate installation/repair semantics.
 
-The UI may derive some state rather than persisting every transient flag.
+Prompt hygiene belongs early in development, not as a late cleanup feature.
 
 ---
 
-## 8. Paid-action guard
+## 9. Paid-action guard
 
-A generation click must pass a preflight guard.
+Before sending NanoGPT:
 
-At minimum:
+1. capture origin chat/message/proposal snapshot;
+2. prevent concurrent generation for the same proposal;
+3. re-read current SillyTavern context;
+4. verify origin chat still matches;
+5. re-read raw source message;
+6. reparse/revalidate current CI_IMAGE;
+7. compare current proposal with the user-approved snapshot;
+8. resolve current character identities;
+9. require user disambiguation if identity is ambiguous;
+10. resolve selected trusted references;
+11. only then construct/send provider request.
 
-1. capture origin `chatId`;
-2. capture/identify origin message and proposal;
-3. prevent concurrent generation for the same proposal;
-4. re-read current SillyTavern context;
-5. confirm the origin chat is still the active/valid target for the action;
-6. re-read the raw assistant source;
-7. reparse/revalidate the proposal;
-8. verify it matches the proposal the user approved;
-9. resolve current reference selections;
-10. only then construct/send the NanoGPT request.
+After request submission:
 
-If the user changes chat before the request begins, fail safely.
+- a chat switch must not redirect the result;
+- upload must complete before durable success rewrite;
+- aborting fetch does not prove the provider did not accept/bill the request.
 
-If the request has already been sent and the active chat changes, do not attach
-the result to whatever chat happens to be visible. Persist only against the
-validated origin if that can be done safely; otherwise surface a recoverable
-state.
-
-Use `AbortController` when it actually prevents unnecessary work, but do not
-assume aborting a browser fetch guarantees the remote provider did not already
-accept/bill the request.
+This is adapted from Chromatic Dialogue's stale-approval discipline.
 
 ---
 
-## 9. Character identity/reference architecture
+## 10. Stable character identity
 
-### Storage scope
+### Names are not storage identity
 
-The character identity library is extension-level, not copied into each chat.
+These are not globally safe keys:
 
-Reason: a Hina reference should be reusable across unrelated roleplay chats.
+- Hina;
+- Sorasaki Hina;
+- c1;
+- any chat-local CD ID;
+- display name alone.
 
-### MVP entity
+Multiple distinct cards may share the same visible name.
+
+### Preferred identity
+
+Where supported, Chromatic Images assigns/binds a stable extension-owned identity to the actual SillyTavern character card.
 
 Conceptually:
 
-```json
-{
-  "name": "Hina",
-  "aliases": ["Sorasaki Hina"],
-  "primaryReference": {
-    "path": "/user/images/...",
-    "label": "Primary"
-  }
-}
-```
+~~~text
+ChromaticImages stable ID
+    |
+    +-- linked ST card/avatar identity
+    +-- display name
+    +-- aliases
+    +-- reference sets
+~~~
 
-Actual schema should include a version and stable internal identity/reference
-IDs once CRUD exists.
+The exact supported character-card extension metadata mechanism must be verified against target SillyTavern before implementation is frozen.
 
-### Matching
+A local card/avatar identifier may serve as binding/fallback but should not replace the stable CI identity where a better supported identity can be persisted.
 
-Initial matching should be deterministic:
+### Duplicated card collision
 
-- canonical normalized name;
-- canonical normalized alias;
-- exact match after normalization;
-- no fuzzy similarity;
-- no substring guessing.
+If two installed cards carry the same ChromaticImages identity, do not silently merge.
 
-The proposal's explicit `characters[]` is the primary resolver input. Do not
-fall back to generic scene-prompt name scanning for the main proposal path.
+Offer an explicit choice:
 
-### Local image paths
+- keep shared visual identity;
+- assign this card a new identity.
 
-Persist local SillyTavern paths/metadata, not base64 blobs.
-
-At request time:
-
-```text
-local path
-    ->
-load bytes
-    ->
-data URL
-    ->
-NanoGPT imageDataUrls[]
-```
-
-After the request, release large transient data where practical.
+This lets duplicated cards intentionally share references when appropriate without forcing unrelated same-name cards together.
 
 ---
 
-## 10. Reference allocation
+## 11. Identity resolution
 
-Provider capability, not a global arbitrary constant, determines reference
-limits.
+The proposal provides names, not internal IDs.
 
-Initial capability:
+Resolution precedence:
 
-```text
+1. explicit/current card binding when applicable;
+2. exact known alias/full-name binding;
+3. optional current-chat Chromatic Dialogue name/registry context;
+4. unique short-name match;
+5. explicit user selection when ambiguity remains.
+
+No fuzzy similarity or substring guessing for automatic final resolution.
+
+Example:
+
+~~~text
+Installed visual identities:
+- Hina / ci_A
+- Hina / ci_B
+- Sorasaki Hina / ci_C
+
+Proposal:
+characters: ["Hina"]
+
+Result:
+ambiguous -> ask user
+~~~
+
+If the active card is Hina/ci_B and the proposal clearly refers to that card, current-card context may resolve it directly.
+
+Chromatic Dialogue is an optional signal source, not a dependency and not the permanent storage identity.
+
+---
+
+## 12. Trusted reference library
+
+Reference images are authoritative **user-imported inputs**.
+
+Generated RP images are outputs and must never automatically enter this library.
+
+### Reference-set model
+
+~~~text
+Character
+├── Standard uniform
+│   ├── front
+│   ├── three-quarter
+│   └── full-body
+├── Casual
+└── Swimsuit
+~~~
+
+Suggested entity:
+
+~~~json
+{
+  "stableId": "ci-character-...",
+  "displayName": "Hina",
+  "aliases": ["Sorasaki Hina"],
+  "cardBinding": "...",
+  "referenceSets": [
+    {
+      "id": "set-...",
+      "name": "Standard uniform",
+      "description": "...",
+      "references": [
+        {
+          "id": "ref-...",
+          "label": "Front",
+          "type": "identity",
+          "description": "...",
+          "path": "..."
+        }
+      ]
+    }
+  ]
+}
+~~~
+
+Recommend at least **three distinct trusted images per outfit/reference set** for fidelity, but do not make three a hard minimum.
+
+AI-assisted description may later suggest metadata, but the user must be able to review/edit it.
+
+---
+
+## 13. Per-character physical storage
+
+The preferred binary storage scope is per character identity/card, not per chat and not one global flat pool.
+
+Conceptual target:
+
+~~~text
+<character-scoped asset root>/
+└── chromatic-images/
+    ├── standard/
+    ├── casual/
+    └── swimsuit/
+~~~
+
+The exact supported SillyTavern mechanism for:
+
+- creating nested character-scoped folders;
+- listing;
+- uploading;
+- deleting;
+- surviving rename/export/import behavior
+
+must be proven in M04.
+
+If arbitrary metadata files beside these assets are unsupported, lightweight metadata may live in extension settings while binaries remain character-scoped.
+
+Do not invent unsupported filesystem APIs.
+
+---
+
+## 14. Reference allocation
+
+Provider capability:
+
+~~~text
 NanoGPT / qwen-image
 maxReferenceImages = 3
-```
+~~~
 
-### MVP with one primary reference
+The library may hold many refs. The request may contain at most three.
 
-- 0 characters -> 0 refs.
-- 1 resolvable character -> 1 ref.
-- 2 resolvable characters -> 2 refs.
-- 3 resolvable characters -> 3 refs.
-- 4+ characters -> at most first 3 resolvable character primaries.
+Baseline policy:
 
-No hidden truncation should surprise the user; the card/reference UI should
-show which identities are backed by images.
+- 0 visible characters -> 0 refs;
+- 1 character -> up to 3 refs from selected/relevant set;
+- 2 characters -> at least one each, then deterministic third slot;
+- 3 characters -> one each;
+- 4+ characters -> at most 3 backed identities, clearly disclosed.
 
-### Later multi-reference allocator
+Manual override may replace automatic picks.
 
-When characters own multiple refs:
+A future metadata-aware selector may use labels/descriptions, but the roleplay model never selects binary slots.
 
-1. assign one primary to each resolvable character in proposal order until
-   slots are exhausted;
-2. fill remaining slots with additional refs deterministically;
-3. manual override may replace automatic picks;
-4. total remains <= provider capability.
-
-The allocator should be a pure function with extensive tests.
+Generated chat images are never candidate references.
 
 ---
 
-## 11. Qwen prompt construction
-
-The prompt builder, not the roleplay model, maps binary inputs to identities.
+## 15. Prompt construction
 
 Input:
 
-```text
-proposal characters + scene prompt
-resolved references
-```
+- resolved character identities;
+- selected trusted refs;
+- scene prompt.
 
-Output conceptually:
+Output pattern:
 
-```text
+~~~text
 REFERENCE IDENTITIES
 
 Image 1 depicts Hina.
-Preserve Hina's identity, facial features, hair, body characteristics and
-distinctive design traits. The reference pose, background and clothing are not
-necessarily the current scene unless explicitly requested below.
+Preserve Hina's identity and distinctive design traits.
+Do not copy the reference pose/background unless requested by the current scene.
 
 Image 2 depicts Ako.
-Preserve Ako's identity and do not merge or transfer visual traits between
-characters.
+Preserve Ako's identity and do not merge traits between characters.
 
 CURRENT SCENE
 
 <proposal.prompt>
-```
+~~~
 
-Principles:
+If an outfit/reference set is intentionally selected, its trusted design evidence may be described accordingly.
 
-- mapping text is mechanical;
-- Image N must correspond exactly to `imageDataUrls[N-1]`;
-- identities must not be swapped;
-- reference clothing is not automatically current-scene clothing;
-- current scene wins for pose/action/environment/outfit when explicitly
-  described;
-- avoid inventing traits not present in proposal/reference configuration.
-
-A future reference semantic such as `outfit` may intentionally alter these
-instructions, but the MVP should treat primary refs principally as identity
-references.
+Image N must always map mechanically to imageDataUrls[N-1].
 
 ---
 
-## 12. NanoGPT/Qwen provider boundary
+## 16. NanoGPT/Qwen boundary
 
-Use a dedicated provider module rather than a generic OpenAI-compatible layer.
+Dedicated provider module; no generic provider abstraction in MVP.
 
-Target request:
+Target:
 
-```json
+~~~text
+POST https://nano-gpt.com/api/v1/images/generations
+x-api-key: <secret>
+~~~
+
+Body shape:
+
+~~~json
 {
   "model": "qwen-image",
   "prompt": "...",
@@ -550,398 +578,325 @@ Target request:
   "negative_prompt": "",
   "seed": 12345
 }
-```
+~~~
 
-Endpoint target:
+Implementation must follow the actually tested response contract.
 
-```text
-POST https://nano-gpt.com/api/v1/images/generations
-```
-
-Header:
-
-```text
-x-api-key: <secret>
-```
-
-Implementation details must be based on the actually tested NanoGPT response
-shape rather than assumptions from unrelated OpenAI image APIs.
-
-### Provider settings
-
-Keep the initial UI small:
-
-- API key / secret connection;
-- model fixed to `qwen-image` initially;
-- resolution;
-- steps;
-- guidance;
-- negative prompt;
-- seed behavior.
-
-Do not add generic endpoint/model/provider selectors during the MVP unless a
-real requirement appears.
+API-key persistence is an explicit M03 investigation against current SillyTavern-supported secret mechanisms.
 
 ---
 
-## 13. Image persistence
+## 17. Image I/O and message rewrite
 
-### References
+### Generated image localization
 
-References are uploaded/stored locally through SillyTavern.
-
-### Generated outputs
-
-Every successful provider output should be localized:
-
-```text
+~~~text
 provider result
-    ->
-obtain image bytes/base64
-    ->
-SillyTavern /api/images/upload or supported equivalent
-    ->
-/user/images/... local path
-```
+  -> bytes/base64
+  -> /api/images/upload or supported equivalent
+  -> local SillyTavern path
+~~~
 
-The generated card should ultimately render the local path.
+No durable dependency on temporary remote URLs.
 
-Do not rely on a temporary NanoGPT or other remote URL for durable chat state.
+### Message rewrite
 
-### Reuse from SLAY
+After local upload succeeds, replace the **exact originating CI_IMAGE record** with Markdown + CI_RESULT.
 
-SLAY is a useful implementation reference for:
+The rewriter must account for SillyTavern representations proven relevant by testing, including lessons from SLAY:
 
-- `/api/images/upload`;
-- path conventions;
-- local image -> data URL conversion;
-- handling base64 vs returned URL;
-- downscaling/compression when required;
-- network/browser error normalization;
-- lightbox/mobile image presentation;
-- interrupted-generation recovery patterns.
+- message.mes;
+- message.extra.display_text when applicable;
+- assistant swipes;
+- swipe_info display/extra fields when applicable.
 
-Port only what is needed, in modular form.
+Then call `context.saveChat()`.
 
----
+Do not blindly mutate every field; port only behavior proven necessary for target ST semantics.
 
-## 14. Generation-state persistence
+### Regeneration safety
 
-This is deliberately a **tested architecture gate**, because SillyTavern
-message/swipe semantics matter more than theoretical cleanliness.
+A failed regeneration must never trade a working local image for an error marker.
 
-Desired property:
-
-> Generated state belongs to the originating message/proposal and can be
-> reconstructed after reload without rewriting normal roleplay prose.
-
-Candidate locations may include message-associated `extra` data or a
-chat-metadata index keyed by a stable proposal fingerprint. The implementation
-must not settle this by guesswork.
-
-M05 must test:
-
-- reload;
-- switching away/back;
-- message edit;
-- deleting the message;
-- creating/selecting assistant swipes;
-- regenerating an assistant response.
-
-Whichever mechanism is chosen must include source validation so stale state
-cannot silently attach to changed content.
-
-Do not persist:
-
-- API key;
-- raw reference base64;
-- raw generated base64 if a local path exists;
-- entire provider response objects unless needed.
+Only replace old Markdown/result after the new provider result is locally stored successfully.
 
 ---
 
-## 15. Settings vs chat vs message scope
+## 18. Result lifecycle
 
-Use the narrowest correct scope.
+### Reviewable result
 
-### Extension/global settings
+Markdown + CI_RESULT enables:
 
-Appropriate for:
+- Regenerate;
+- Edit & Regenerate;
+- inspect/change refs for the attempt;
+- Keep.
 
-- provider configuration;
-- character identity/reference library;
-- default generation settings;
-- UI preferences.
+### Keep
 
-### Chat scope
+Remove the exact CI_RESULT control record and saveChat.
 
-Appropriate only for truly chat-level behavior if later needed.
+The Markdown remains.
 
-Do not copy the global character library into each chat.
+After reload, no regeneration UI should be reconstructed for a kept image.
 
-### Message/proposal scope
+### Viewer
 
-Appropriate for:
+Rendered images with alt="ChromaticImages" may be enhanced in the DOM with:
 
-- source proposal identity/fingerprint;
-- user prompt override;
-- manual ref override for that generation;
-- generated local output path;
-- seed/parameters needed for regeneration;
-- completed generation status.
+- expand/lightbox;
+- zoom;
+- pan;
+- reset;
+- close.
 
----
+Viewer state is transient.
 
-## 16. UI architecture
-
-### Settings panel
-
-Eventually contains:
-
-- provider/API configuration;
-- generation defaults;
-- character/reference library;
-- diagnostics;
-- prompt-hygiene status/setup.
-
-### Inline proposal card
-
-Attached to the source assistant message, not a separate global review list.
-
-Important mobile behavior:
-
-- touch targets large enough for phone use;
-- no hover-only controls;
-- prompt text can wrap/collapse;
-- reference thumbnails must not overflow;
-- dialogs/sheets must fit narrow viewport;
-- progress/error state remains understandable after scroll/re-render.
-
-### DOM ownership
-
-Use extension-specific IDs/classes/data attributes with a `ci-` or
-`chromatic-images-` namespace.
-
-Rendering must be idempotent: handling the same message render event twice must
-not create duplicate cards.
+If Chromatic Images is removed, standard Markdown image rendering remains the fallback.
 
 ---
 
-## 17. Failure handling
+## 19. Failure handling
 
-### Parser/validation failure
+### Parse/validation
 
 - fail closed;
-- no generation;
-- no crash;
-- optional debug log without dumping private story content unnecessarily.
+- no API request;
+- no crash.
 
-### Missing character reference
+### Missing reference
 
-Not equivalent to malformed proposal.
+- distinguish unresolved identity from no available reference;
+- never substitute another character;
+- allow prompt-only generation only if product/UI explicitly permits it.
 
-The UI should show that the character is unresolved/no reference assigned.
-Generation may later be allowed with prompt-only identity if the user chooses;
-the extension must never silently substitute another character's ref.
+### Ambiguous identity
 
-### Provider error
+- block automatic generation;
+- ask user to select the intended character identity.
 
+### Provider failure
+
+- keep CI_IMAGE unchanged for first generation;
+- keep existing working Markdown + CI_RESULT unchanged for regeneration;
 - show readable error;
-- preserve proposal;
-- permit explicit retry;
-- no automatic paid retry loop.
+- retry only by explicit user action.
 
-### Interrupted request
+### Upload failure
 
-On reload/tab kill:
+Same durability rule as provider failure: do not rewrite source state.
+
+### Interrupted browser/tab
 
 - never assume success;
-- never auto-repeat;
-- present safe retry/recovery semantics.
+- never auto-repeat paid request;
+- reconstruct from persisted message state on next render.
 
 ---
 
-## 18. Testing strategy
+## 20. Settings and storage scope
 
-Follow Chromatic Dialogue's preference for pure modules and Node tests.
+### Extension/global
+
+Appropriate for:
+
+- provider defaults/configuration;
+- lightweight reference metadata if it cannot live with character assets;
+- stable identity bindings/aliases;
+- UI preferences.
+
+### Character scope
+
+Preferred for trusted reference binaries and, where supported, visual-identity metadata.
+
+### Chat/message scope
+
+No separate ChromaticImages database.
+
+Message text itself stores proposal/result/final state.
+
+Do not copy the trusted library into each chat.
+
+---
+
+## 21. Testing strategy
+
+### Reuse from Chromatic Dialogue
+
+Strong candidates:
+
+- message-reader implementation/tests;
+- lifecycle initialize-once tests;
+- message-runtime event registration/race cases;
+- parser edge-case structure;
+- stale-approval tests adapted to generation guard;
+- Regex integration tests;
+- panel accessibility/idempotence patterns.
 
 ### Pure tests
 
-High-value targets:
-
-- proposal parser;
-- proposal validator;
-- normalization;
-- character/alias resolver;
+- CI_IMAGE parser;
+- CI_RESULT parser;
+- validator;
+- identity normalization/resolution;
+- ambiguity behavior;
 - reference allocator;
 - prompt builder;
 - provider request builder;
-- generation-state normalization/fingerprinting.
+- message rewrite transforms.
 
 ### Runtime tests with fakes
 
-Where feasible:
-
-- message reading;
-- chat-change stale protection;
-- duplicate render protection;
-- Generate lock;
-- persistence adapter behavior.
+- chat switching;
+- duplicate render prevention;
+- generation lock;
+- Regex installation/repair;
+- source revalidation;
+- Keep transition.
 
 ### Real SillyTavern tests
 
-Required for mission acceptance when relevant:
-
 - fresh install;
-- existing chat;
 - reload;
-- chat switching;
-- mobile width;
-- physical Android;
+- active-card rename;
+- three different Hina cards;
+- group/narrator scenario;
 - Chromatic Dialogue simultaneously active;
-- Nemo-generated real proposal;
-- local reference upload;
-- actual NanoGPT request;
-- assistant edit/swipe behavior.
-
-Automated tests do not replace the real SillyTavern gates.
-
----
-
-## 19. Security rules
-
-Hard rules:
-
-- API keys never enter Git.
-- API keys never enter assistant prompts/messages.
-- API keys never enter chat metadata.
-- API keys never appear in console logs/errors.
-- base64 reference/generated images are not logged.
-- large data URLs are not persisted when a local path can be stored.
-- the extension sends only user-selected/resolved refs needed for the current
-  generation.
-- no hidden external image-upload service.
-- never instruct users to paste secrets into issue reports or AI Studio prompts.
-
-If SillyTavern exposes a supported secret vault/API for third-party extensions,
-prefer it. If not, the fallback storage decision must be reviewed explicitly.
+- imported refs;
+- per-character asset storage;
+- real NanoGPT request;
+- assistant swipe/edit behavior;
+- Android/mobile.
 
 ---
 
-## 20. Licensing and attribution
+## 22. Security
 
-Chromatic Dialogue and the inspected SLAY Images fork both use GNU AGPL v3
-licensing.
-
-Chromatic Images should also use GNU AGPL v3.
-
-When implementation code is adapted:
-
-- distinguish conceptual inspiration from copied/adapted code;
-- preserve required copyright/license notices;
-- document substantial third-party source reuse;
-- prefer reimplementation of small generic concepts when that yields clearer
-  ownership and architecture;
-- do not copy SLAY's monolithic structure merely because a needed function
-  exists inside it.
+- API keys never enter Git;
+- never enter chat/control records;
+- never enter logs;
+- base64 images not logged;
+- persist local paths rather than base64;
+- send only selected trusted refs for current request;
+- no hidden third-party upload host;
+- never ask users to paste secrets into AI Studio prompts/issues.
 
 ---
 
-## 21. Planned module responsibilities
+## 23. Licensing and donor policy
 
-The exact file list may evolve, but responsibilities should remain separated.
+Chromatic Dialogue and inspected SLAY Images code are AGPLv3.
+
+Chromatic Images uses GNU AGPL v3.
+
+### Chromatic Dialogue donor
+
+Pinned initial donor commit:
+
+`00b1e9d56593d97f259f162fb3bb8a0848417f40`
+
+Copy/adapt only allowlisted generic infrastructure.
+
+### SLAY donor
+
+Use only narrow image primitives/patterns:
+
+- upload;
+- data URL conversion;
+- message rewrite;
+- saveChat/swipe durability;
+- mobile/lightbox/network lessons.
+
+Do not copy its monolithic architecture, provider zoo, wardrobe, video, or legacy compatibility surface.
+
+Preserve attribution/license requirements for copied/adapted code.
+
+---
+
+## 24. Planned module responsibilities
 
 | Area | Responsibility |
 | --- | --- |
-| `index.js` | bootstrap and lifecycle registration |
-| `constants.js` | identifiers, limits, metadata keys |
-| `message-reader.js` | safe raw assistant-message retrieval |
-| `message-runtime.js` | event registration/orchestration |
-| `proposal-parser.js` | exact CI_IMAGE syntax parsing |
-| `proposal-validator.js` | semantic schema validation |
-| `proposal-renderer.js` | idempotent inline card UI |
-| `settings-store.js` | extension-level settings normalization/persistence |
-| `reference-library.js` | character/ref CRUD domain |
-| `reference-resolver.js` | proposal names -> identities/refs |
-| `reference-allocator.js` | provider-capability slot selection |
-| `image-storage.js` | local upload/load/data-URL conversion |
-| `prompt-builder.js` | identity mapping + current scene |
-| `generation-guard.js` | stale/double-click/paid-action checks |
-| `generation-state-store.js` | durable message-associated result state |
-| `generation-service.js` | end-to-end approved generation orchestration |
-| `providers/nanogpt-qwen.js` | NanoGPT request/response boundary |
-| `panel.js` | settings panel composition |
-| `style.css` | settings + inline/mobile presentation |
+| `index.js` | bootstrap/lifecycle |
+| `constants.js` | identifiers/protocol/provider limits |
+| `message-reader.js` | safe raw assistant-message access |
+| `message-runtime.js` | event orchestration |
+| `proposal-parser.js` | CI_IMAGE parsing |
+| `result-parser.js` | Markdown + CI_RESULT parsing |
+| `proposal-validator.js` | semantic validation |
+| `prompt-hygiene.js` / Regex modules | managed outgoing-context stripping |
+| `reference-library.js` | stable identity/reference-set CRUD |
+| `reference-resolver.js` | proposal name -> trusted identity |
+| `reference-allocator.js` | <=3 provider refs |
+| `image-storage.js` | local image load/upload/data URL |
+| `prompt-builder.js` | identity mapping + scene |
+| `generation-guard.js` | stale/double-click/paid-action safety |
+| `message-rewriter.js` | CI_IMAGE/result/Keep source transitions |
+| `generation-service.js` | approved E2E generation |
+| `image-viewer.js` | DOM enhancement/lightbox |
+| `panel.js` | settings/reference UI |
+| `providers/nanogpt-qwen.js` | NanoGPT boundary |
 
-Avoid a large central file that owns provider logic, DOM, storage, parsing, and
-references at once.
+There is intentionally no `generation-state-store.js`.
 
 ---
 
-## 22. Explicit MVP non-goals
-
-Do not add these opportunistically:
+## 25. Explicit MVP non-goals
 
 - automatic no-click generation;
 - multiple providers;
+- global cN identity semantics;
+- hard dependency on Chromatic Dialogue;
+- fuzzy automatic identity matching;
+- generated image auto-promotion into references;
 - wardrobe management;
-- video generation;
-- gallery system;
+- video;
+- gallery/database;
 - cloud sync;
-- remote reference hosting;
-- AI-selected reference slots;
-- LLM-generated provider prompt translation layer;
-- automatic import of SLAY settings;
-- automatic import of Chromatic Dialogue state;
-- image generation triggered by generic name scanning alone;
-- background polling;
-- rewriting all assistant messages to embed permanent HTML.
+- external reference hosting;
+- automatic SLAY migration;
+- background polling.
 
 ---
 
-## 23. Decision gates
+## 26. Evidence gates
 
-Some decisions should be made only after the prerequisite is testable.
+### Gate A — API key storage
 
-### Gate A — API-key persistence
+Resolve in M03 against current SillyTavern capabilities.
 
-Resolve in M03 after inspecting the current SillyTavern extension secret API.
+### Gate B — per-character asset storage / stable card binding
 
-### Gate B — durable generated-state location
+Resolve in M04 by testing actual supported APIs and rename/duplicate behavior.
 
-Resolve in M05 after real tests with message reload/edit/swipe behavior.
+### Gate C — message/swipe rewrite semantics
 
-### Gate C — multi-reference semantics
+Resolve in M05 by testing reload/edit/swipe behavior before freezing the rewriter.
 
-Resolve in M07 after observing actual Qwen behavior with one/two/three
-references. Do not invent complex scoring before evidence exists.
+### Gate D — advanced reference selection
 
-### Gate D — managed prompt hygiene
+Resolve after real Qwen tests with richer outfit/reference sets.
 
-A supported solution is mandatory before stable release. Full managed Regex UI
-may be implemented earlier or during M08 depending on scope.
-
-These are deliberate evidence-based gates, not permission for AI Studio to make
-unreviewed architectural choices.
+Prompt hygiene is no longer a deferred gate: it is part of M02.
 
 ---
 
-## 24. Definition of first useful success
+## 27. Definition of first useful success
 
-Chromatic Images has reached its first meaningful MVP when all of the following
-work together in real SillyTavern:
+MVP is achieved when:
 
-1. Nemo emits a valid `CI_IMAGE` record after an RP response.
-2. Chromatic Images renders one inline proposal card.
-3. No API request occurs until the user presses Generate.
-4. Hina/Ako names resolve to configured local references.
-5. No more than three refs are sent.
-6. The Qwen prompt mechanically identifies which image belongs to which
-   character.
-7. NanoGPT returns a generated image.
-8. The image is saved into SillyTavern local storage.
-9. The generated card survives reload.
-10. Reload, chat switching, and double taps do not produce surprise paid
-    requests.
+1. model emits valid CI_IMAGE;
+2. one inline proposal UI appears;
+3. no request occurs before Generate;
+4. same-name character ambiguity is resolved safely;
+5. trusted local refs resolve from the intended character identity;
+6. <=3 refs are sent;
+7. Qwen prompt maps each ref to the correct character;
+8. NanoGPT returns an image;
+9. image is uploaded locally;
+10. CI_IMAGE becomes Markdown + CI_RESULT and survives reload;
+11. Keep removes CI_RESULT and leaves durable Markdown;
+12. reload/chat switch/double tap never triggers surprise paid requests.
 
 Everything beyond that is refinement.
