@@ -55,3 +55,121 @@
     margin: 0;
     min-width: 0;
 }
+
+/* --- Chromatic Images Inline UI (M02-E) --- */
+
+.chromatic-images-inline-ui {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    margin: 0.75rem 0 0.25rem;
+    padding: 0.75rem;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background: color-mix(
+        in srgb,
+        var(--SmartThemeBlurTintColor) 25%,
+        transparent
+    );
+    overflow-wrap: anywhere;
+    color: inherit;
+}
+
+.chromatic-images-inline-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+    min-width: 0;
+}
+
+.chromatic-images-inline-title {
+    font-size: 0.95em;
+    font-weight: 700;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-inline-badge {
+    font-size: 0.75em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.15rem 0.45rem;
+    border-radius: 4px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    background: color-mix(
+        in srgb,
+        var(--SmartThemeBlurTintColor) 40%,
+        transparent
+    );
+    flex-shrink: 0;
+}
+
+.chromatic-images-inline-characters {
+    margin: 0.35rem 0 0.5rem;
+    font-size: 0.88em;
+    opacity: 0.9;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-inline-prompt-container {
+    margin: 0.5rem 0;
+    min-width: 0;
+}
+
+.chromatic-images-inline-label {
+    font-size: 0.8em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.75;
+    margin-bottom: 0.25rem;
+    min-width: 0;
+}
+
+.chromatic-images-inline-prompt {
+    font-size: 0.9em;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    padding: 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    background: color-mix(
+        in srgb,
+        var(--SmartThemeBlurTintColor) 15%,
+        transparent
+    );
+    min-width: 0;
+}
+
+.chromatic-images-inline-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    min-width: 0;
+}
+
+.chromatic-images-action-button {
+    box-sizing: border-box;
+    max-width: 100%;
+    min-width: 0;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-action-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.chromatic-images-action-button:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+}
+
