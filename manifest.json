@@ -1,0 +1,14 @@
+{
+  "display_name": "Chromatic Images",
+  "loading_order": 10,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "zNe4",
+  "version": "0.1.0",
+  "homePage": "https://github.com/zNe4/SillyTavern-ChromaticImages",
+  "auto_update": true,
+  "minimum_client_version": "1.18.0",
+  "hooks": {
+    "activate": "onActivate"
+  }
+}
