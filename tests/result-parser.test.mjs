@@ -121,6 +121,33 @@ test('wrong-case alt text is not treated as owned marker', () => {
         finalized: [],
         errors: [],
     });
+
+    const msgUpper = '![CHROMATICIMAGES](/user/images/ci_123.png)';
+    const resUpper = parseImageResultStates(msgUpper);
+    assert.deepEqual(resUpper, {
+        ok: true,
+        reviewable: [],
+        finalized: [],
+        errors: [],
+    });
+});
+
+test('unrelated Markdown images with prefix-matching alt text are ignored', () => {
+    const testCases = [
+        '![ChromaticImagesBackup](/foo.png)',
+        '![ChromaticImagesFoo](/foo.png)',
+        '![ChromaticImages2](/foo.png)',
+    ];
+
+    for (const msg of testCases) {
+        const res = parseImageResultStates(msg);
+        assert.deepEqual(res, {
+            ok: true,
+            reviewable: [],
+            finalized: [],
+            errors: [],
+        }, `Expected ${msg} to be ignored as unrelated Markdown`);
+    }
 });
 
 test('valid finalized Markdown image is recognized', () => {

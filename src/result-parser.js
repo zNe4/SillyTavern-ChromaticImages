@@ -232,7 +232,7 @@ function scanMarkdownRecords(message, errors) {
         const leadingWsLength = leadingWsMatch ? leadingWsMatch[0].length : 0;
         const lineAfterWs = line.slice(leadingWsLength);
 
-        if (lineAfterWs.startsWith('![ChromaticImages')) {
+        if (lineAfterWs.startsWith('![ChromaticImages]')) {
             // Check for valid single-line record format: ![ChromaticImages](dest) [ \t]*
             const validMatch = lineAfterWs.match(/^(!\[ChromaticImages\]\(([^)\r\n]*)\))[ \t]*$/);
 
