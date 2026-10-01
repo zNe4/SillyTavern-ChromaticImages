@@ -7,6 +7,11 @@ import {
     LOG_PREFIX,
 } from './src/constants.js';
 
+import {
+    registerMessageRuntime,
+    refreshRenderedImageMessages,
+} from './src/message-runtime.js';
+
 let lifecycleRegistered = false;
 let initialized = false;
 let initializationPromise = null;
@@ -15,7 +20,17 @@ let initializationPromise = null;
  * Refresh extension state for the active chat.
  */
 function refreshActiveChat() {
-    refreshPanelState();
+    try {
+        refreshPanelState();
+    } catch {
+        // Independent failure safety: panel absence must not prevent runtime scan
+    }
+
+    try {
+        refreshRenderedImageMessages();
+    } catch {
+        // Independent failure safety: missing chat DOM must not prevent panel refresh
+    }
 }
 
 /**
@@ -25,6 +40,8 @@ export function onActivate() {
     if (lifecycleRegistered) {
         return;
     }
+
+    registerMessageRuntime();
 
     const { eventSource, eventTypes } = SillyTavern.getContext();
 

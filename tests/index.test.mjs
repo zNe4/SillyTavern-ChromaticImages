@@ -47,7 +47,7 @@ function createMockPanel() {
     };
 }
 
-test('A. Repeated activation registers lifecycle once and ignores message events', async () => {
+test('A. Repeated activation registers lifecycle once and wires runtime handlers', async () => {
     const origST = globalThis.SillyTavern;
 
     try {
@@ -55,6 +55,9 @@ test('A. Repeated activation registers lifecycle once and ignores message events
         const eventTypes = {
             APP_INITIALIZED: 'app_initialized',
             CHAT_CHANGED: 'chat_changed',
+            CHARACTER_MESSAGE_RENDERED: 'character_message_rendered',
+            MESSAGE_SWIPED: 'message_swiped',
+            MESSAGE_UPDATED: 'message_updated',
             MESSAGE_RECEIVED: 'message_received',
         };
 
@@ -74,10 +77,16 @@ test('A. Repeated activation registers lifecycle once and ignores message events
 
         const appInitHandlers = eventSource.getHandlers(eventTypes.APP_INITIALIZED);
         const chatChangedHandlers = eventSource.getHandlers(eventTypes.CHAT_CHANGED);
+        const cmrHandlers = eventSource.getHandlers(eventTypes.CHARACTER_MESSAGE_RENDERED);
+        const swipedHandlers = eventSource.getHandlers(eventTypes.MESSAGE_SWIPED);
+        const updatedHandlers = eventSource.getHandlers(eventTypes.MESSAGE_UPDATED);
         const messageReceivedHandlers = eventSource.getHandlers(eventTypes.MESSAGE_RECEIVED);
 
         assert.strictEqual(appInitHandlers.length, 1);
         assert.strictEqual(chatChangedHandlers.length, 1);
+        assert.strictEqual(cmrHandlers.length, 1);
+        assert.strictEqual(swipedHandlers.length, 1);
+        assert.strictEqual(updatedHandlers.length, 1);
         assert.strictEqual(messageReceivedHandlers.length, 0);
     } finally {
         globalThis.SillyTavern = origST;
@@ -93,6 +102,7 @@ test('B. CHAT_CHANGED refreshes safely before initialization without mounting pa
         const eventTypes = {
             APP_INITIALIZED: 'app_initialized',
             CHAT_CHANGED: 'chat_changed',
+            CHARACTER_MESSAGE_RENDERED: 'character_message_rendered',
         };
 
         let templateRenderCalls = 0;
@@ -104,6 +114,12 @@ test('B. CHAT_CHANGED refreshes safely before initialization without mounting pa
                     return panelMounted ? createMockPanel() : null;
                 }
                 return null;
+            },
+            querySelectorAll(sel) {
+                if (sel === '#chat .mes[mesid]') {
+                    return [];
+                }
+                return [];
             },
         };
 
@@ -147,6 +163,7 @@ test('C. Concurrent initialization mounts panel exactly once', async () => {
         const eventTypes = {
             APP_INITIALIZED: 'app_initialized',
             CHAT_CHANGED: 'chat_changed',
+            CHARACTER_MESSAGE_RENDERED: 'character_message_rendered',
         };
 
         let templateRenderCount = 0;
@@ -170,6 +187,9 @@ test('C. Concurrent initialization mounts panel exactly once', async () => {
                     return container;
                 }
                 return null;
+            },
+            querySelectorAll(sel) {
+                return [];
             },
         };
 
@@ -218,6 +238,7 @@ test('D. Repeated APP_INITIALIZED after success does nothing', async () => {
         const eventTypes = {
             APP_INITIALIZED: 'app_initialized',
             CHAT_CHANGED: 'chat_changed',
+            CHARACTER_MESSAGE_RENDERED: 'character_message_rendered',
         };
 
         let templateRenderCount = 0;
@@ -241,6 +262,9 @@ test('D. Repeated APP_INITIALIZED after success does nothing', async () => {
                     return container;
                 }
                 return null;
+            },
+            querySelectorAll(sel) {
+                return [];
             },
         };
 
@@ -290,6 +314,7 @@ test('E. Initialization failure can retry upon next APP_INITIALIZED', async () =
         const eventTypes = {
             APP_INITIALIZED: 'app_initialized',
             CHAT_CHANGED: 'chat_changed',
+            CHARACTER_MESSAGE_RENDERED: 'character_message_rendered',
         };
 
         let containerAvailable = false;
@@ -312,6 +337,9 @@ test('E. Initialization failure can retry upon next APP_INITIALIZED', async () =
                     return container;
                 }
                 return null;
+            },
+            querySelectorAll(sel) {
+                return [];
             },
         };
 
