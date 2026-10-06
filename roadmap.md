@@ -107,7 +107,7 @@ Every mission has one purpose, explicit acceptance gates, and a stop point. AI S
 
 ## M00 — Bootstrap documentation
 
-**Status:** current refresh.
+**Status: complete.**
 
 ### Deliverables
 
