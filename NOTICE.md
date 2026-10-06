@@ -19,11 +19,13 @@ Pinned donor commit used for the initial Chromatic Images scaffold:
 
 Chromatic Dialogue is licensed under GNU AGPL v3.
 
-Chromatic Images M01 contains code copied or adapted from this pinned
+Chromatic Images M01 and M02 contain code copied or adapted from this pinned
 Chromatic Dialogue revision, together with Chromatic Images-specific
 modifications.
 
-The initial reuse is intentionally limited to generic extension infrastructure,
+### M01 — Generic scaffold reuse
+
+The initial M01 reuse is intentionally limited to generic extension infrastructure,
 including:
 
 - SillyTavern extension manifest/package structure;
@@ -35,10 +37,28 @@ including:
 - Node test techniques for lifecycle idempotence, panel mounting, failure
   recovery, and lightweight SillyTavern/DOM fakes.
 
-Chromatic Dialogue-specific product systems were not imported as part of M01.
-In particular, Chromatic Images does not inherit Dialogue color assignments,
-operation modes, character registration, automatic review, prompt macros,
-Regex definitions, style runtime, or legacy migration behavior.
+### M02 — Managed Regex integration reuse
+
+Chromatic Images M02 adapts the generic managed SillyTavern Regex
+definition/integration infrastructure from this pinned donor revision,
+including:
+
+- canonical managed-field schema and script definitions;
+- pure inspection of SillyTavern extension settings by exact script name;
+- current, missing, outdated, and duplicate-name conflict states;
+- deterministic differing-fields detection;
+- disabled-extension detection;
+- safe explicit repair preserving unrelated global scripts, unmanaged fields,
+  and installed UUIDs;
+- atomic save with rollback on persistence failure.
+
+Chromatic Dialogue-specific product systems were not imported. In particular,
+Chromatic Images does not inherit Dialogue color assignments, operation modes,
+character registration, automatic review, prompt macros, dialogue-display
+regex patterns, tone styling runtime, or legacy migration behavior. Chromatic
+Images uses solely prompt-hygiene regex to hide its own image records from
+outgoing prompt context without altering stored messages or requiring chat
+reloads.
 
 ## SLAY Images
 
