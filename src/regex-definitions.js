@@ -17,7 +17,7 @@ const PROMPT_HYGIENE_SCRIPT = Object.freeze({
     key: 'prompt-hygiene',
     scriptName: 'Chromatic Images - Hide image records from prompt',
     findRegex:
-        '/^[ \\t]*(?:<!--[ \\t]*CI_(?:IMAGE|RESULT)\\b[^\\r\\n]*-->|!\\[ChromaticImages\\]\\([^\\r\\n)]*\\))[ \\t]*(?:\\r?\\n|$)/gm',
+        '/^[ \\t]*(?:<!--[ \\t]*CI_(?:IMAGE|RESULT)\\b(?:(?!-->)[^\\r\\n])*-->|!\\[ChromaticImages\\]\\([^\\r\\n)]*\\))[ \\t]*(?:\\r?\\n|$)/gm',
     replaceString: '',
     trimStrings: Object.freeze([]),
     placement: Object.freeze([2]),

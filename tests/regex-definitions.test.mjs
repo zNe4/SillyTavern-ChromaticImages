@@ -48,7 +48,7 @@ test('4. canonical script fields match exact expected configuration', () => {
     assert.equal(script.maxDepth, null);
     assert.equal(
         script.findRegex,
-        '/^[ \\t]*(?:<!--[ \\t]*CI_(?:IMAGE|RESULT)\\b[^\\r\\n]*-->|!\\[ChromaticImages\\]\\([^\\r\\n)]*\\))[ \\t]*(?:\\r?\\n|$)/gm',
+        '/^[ \\t]*(?:<!--[ \\t]*CI_(?:IMAGE|RESULT)\\b(?:(?!-->)[^\\r\\n])*-->|!\\[ChromaticImages\\]\\([^\\r\\n)]*\\))[ \\t]*(?:\\r?\\n|$)/gm',
     );
 });
 
@@ -307,4 +307,22 @@ test('25. regex preserves record markers followed by trailing prose on the same 
     assert.equal(applyScript(script, indentedTrailingImage), indentedTrailingImage);
     assert.equal(applyScript(script, noNewlineTrailing), noNewlineTrailing);
 });
+
+test('26. regex preserves lines with trailing prose ending in comment closers or multiple comments', () => {
+    const script = MANAGED_REGEX_SCRIPTS[0];
+    const imageWithTrailingClose = '<!-- CI_IMAGE {"characters":[],"prompt":"x"} --> trailing prose -->\n';
+    const resultWithTrailingClose = '<!-- CI_RESULT {"v":1} --> trailing prose -->\n';
+    const imageWithUnrelatedComment = '<!-- CI_IMAGE {"characters":[],"prompt":"x"} --> <!-- unrelated comment -->\n';
+    const imageWithSecondResult = '<!-- CI_IMAGE {"characters":[],"prompt":"x"} --> <!-- CI_RESULT {"v":1} -->\n';
+    const indentedImageWithUnrelated = '    <!-- CI_IMAGE {"characters":[],"prompt":"x"} --> <!-- unrelated comment -->\n';
+    const noNewlineWithTrailingClose = '<!-- CI_IMAGE {"characters":[],"prompt":"x"} --> trailing prose -->';
+
+    assert.equal(applyScript(script, imageWithTrailingClose), imageWithTrailingClose);
+    assert.equal(applyScript(script, resultWithTrailingClose), resultWithTrailingClose);
+    assert.equal(applyScript(script, imageWithUnrelatedComment), imageWithUnrelatedComment);
+    assert.equal(applyScript(script, imageWithSecondResult), imageWithSecondResult);
+    assert.equal(applyScript(script, indentedImageWithUnrelated), indentedImageWithUnrelated);
+    assert.equal(applyScript(script, noNewlineWithTrailingClose), noNewlineWithTrailingClose);
+});
+
 
