@@ -4,7 +4,7 @@
 
 It belongs to the planned **Chromatic** family of SillyTavern extensions alongside Chromatic Dialogue.
 
-> **Project status:** architecture/bootstrap stage. No runtime release exists yet.
+> **Project status:** M02 is complete and M03 image-engine work is in progress. Proposal parsing, inline proposal UI, durable result recognition, message lifecycle reconstruction, and managed prompt hygiene are implemented. Paid image generation is not enabled yet.
 
 ## Product goal
 
@@ -273,22 +273,24 @@ CURRENT SCENE
 
 The extension must keep Image N aligned with imageDataUrls[N-1].
 
+
 ## Initial image backend
 
-The first provider is deliberately narrow:
+The first provider remains deliberately narrow:
 
 - Provider: **NanoGPT**
-- Model: **qwen-image**
-- Endpoint target: POST https://nano-gpt.com/api/v1/images/generations
-- Authentication: x-api-key
-- Reference input: imageDataUrls
-- Maximum reference images: **3**
+- MVP model: **`qwen-image`**
+- New-integration target: NanoGPT's normalized Image API, `POST https://api.nano-gpt.com/api/v1/images`
+- Reference input: `input_references`
+- Project reference limit: **3**
 - Initial output count: **1**
-- Initial resolution: **auto**
+- Credentials: reuse SillyTavern's existing server-side NanoGPT secret; never persist a raw key in Chromatic Images settings
 
-Known target controls include num_inference_steps, guidance_scale, negative_prompt, and seed.
+M03-A found that current SillyTavern already has a NanoGPT image proxy and server-side secret, but the stock image proxy logs its complete request body at DEBUG and targets NanoGPT's older native image route. Chromatic Images therefore must not use that endpoint unchanged for reference-image generation.
 
-The MVP should prove the known-good NanoGPT/Qwen path before adding any generic provider abstraction.
+The preferred transport is a privacy-safe same-origin SillyTavern server proxy that retains the existing NanoGPT secret and forwards the normalized Image API without logging prompts or base64 references. See `docs/m03-contract.md` for the evidence and transport gate.
+
+Model-specific controls such as guidance, inference steps, negative prompt, seed, and exact resolution choices must be taken from NanoGPT's current model metadata rather than assumed globally.
 
 ## Persistence principles
 
@@ -421,16 +423,21 @@ SillyTavern-ChromaticImages/
 
 This is a responsibility map, not an instruction to create every module immediately.
 
+
 ## Development model
 
-Two repositories are used deliberately:
+Development now uses the canonical repository directly:
 
-- Canonical/source of truth: zNe4/SillyTavern-ChromaticImages
-- AI Studio sandbox: zNe4/SillyTavern-ChromaticImages-aistudio
+- Source of truth: `zNe4/SillyTavern-ChromaticImages`
+- Work is performed in the canonical local checkout.
+- One bounded mission is implemented at a time.
+- ChatGPT owns architecture/research/review and inspects the actual pushed diff.
+- Gemini may implement explicitly assigned coding missions.
+- Full automated validation and relevant real-SillyTavern smoke tests are required before a mission is accepted.
+- No credentials, generated user images, or temporary personal artifacts may be committed.
+- Future missions do not begin automatically after implementation.
 
-AI Studio works on one bounded mission in the sandbox. Reviewed/approved work is transferred to a canonical mission branch, validated against the canonical repository, then merged.
-
-See docs/architecture.md for the full workflow and roadmap.md for mission gates.
+See `docs/architecture.md` for the full architecture and `roadmap.md` for mission gates.
 
 ## License
 

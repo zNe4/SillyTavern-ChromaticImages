@@ -156,32 +156,23 @@ Pinned donor commit:
 
 ---
 
+
 ## 5. Repository workflow
 
-### Canonical
+### Canonical repository
 
-`zNe4/SillyTavern-ChromaticImages`
+`zNe4/SillyTavern-ChromaticImages` is the reviewed source of truth and the repository used for current development.
 
-Reviewed source of truth.
+### Working model
 
-### AI Studio sandbox
-
-`zNe4/SillyTavern-ChromaticImages-aistudio`
-
-Disposable one-mission implementation workspace.
-
-### Rules
-
-- never force-push canonical;
-- force-reset sandbox only;
-- AI Studio works only in sandbox unless explicitly changed;
-- inspect actual content/diff, not AI claims;
-- transfer only reviewed paths;
-- final mission tests run against canonical branch;
-- do not advance missions without explicit user direction;
-- never commit credentials.
-
----
+- Work directly in the canonical local checkout.
+- Keep one bounded mission active at a time.
+- Gemini implements explicitly assigned coding missions; ChatGPT owns architecture/research/review and may directly complete documentation-only evidence missions.
+- Review actual pushed content/diffs rather than implementation claims.
+- Run full relevant automated validation and real SillyTavern smoke tests before acceptance.
+- Do not advance missions without explicit user direction.
+- Never commit credentials, private generated assets, or transient local artifacts.
+- Avoid force-pushing canonical history.
 
 ## 6. Runtime architecture
 
@@ -553,38 +544,43 @@ Image N must always map mechanically to imageDataUrls[N-1].
 
 ---
 
+
 ## 16. NanoGPT/Qwen boundary
 
-Dedicated provider module; no generic provider abstraction in MVP.
+M03-A's current evidence contract lives in `docs/m03-contract.md`.
 
-Target:
+For new integration work:
 
 ~~~text
-POST https://nano-gpt.com/api/v1/images/generations
-x-api-key: <secret>
+NanoGPT normalized Image API
+POST https://api.nano-gpt.com/api/v1/images
 ~~~
 
-Body shape:
+Core request direction:
 
 ~~~json
 {
   "model": "qwen-image",
   "prompt": "...",
-  "imageDataUrls": ["data:image/png;base64,..."],
+  "input_references": ["data:image/png;base64,..."],
   "resolution": "auto",
-  "nImages": 1,
-  "num_inference_steps": 30,
-  "guidance_scale": 2.5,
-  "negative_prompt": "",
-  "seed": 12345
+  "n": 1
 }
 ~~~
 
-Implementation must follow the actually tested response contract.
+Rules:
 
-API-key persistence is an explicit M03 investigation against current SillyTavern-supported secret mechanisms.
+- `qwen-image` remains the MVP default until a deliberate quality/cost decision changes it;
+- Chromatic Images accepts at most three references and preserves their order;
+- model-specific guidance/steps/negative-prompt/seed fields must come from current NanoGPT `supported_parameters` metadata;
+- the browser extension must not own or expose the raw NanoGPT key;
+- reuse SillyTavern's existing server-side NanoGPT secret;
+- never log prompts or base64 references;
+- never automatically retry a potentially billable call.
 
----
+Current SillyTavern already provides `/api/sd/nanogpt/generate`, but M03-A found that it logs the complete request body at default DEBUG level and targets NanoGPT's older native image route. Chromatic Images must not use that endpoint unchanged for reference-image generation.
+
+The preferred production boundary is a privacy-safe same-origin SillyTavern server proxy that retains the existing secret and forwards the normalized Image API. A narrow upstream core update is preferred for public distribution; a server-plugin fallback requires an explicit product decision.
 
 ## 17. Image I/O and message rewrite
 
@@ -862,9 +858,13 @@ There is intentionally no `generation-state-store.js`.
 
 ## 26. Evidence gates
 
-### Gate A — API key storage
+### Gate A — NanoGPT credential storage
 
-Resolve in M03 against current SillyTavern capabilities.
+**Resolved in M03-A:** reuse SillyTavern's existing server-side `SECRET_KEYS.NANOGPT`. Chromatic Images must not persist a raw provider key in UI extension settings or browser storage.
+
+### Gate A2 — privacy-safe NanoGPT transport
+
+M03-A found the stock SillyTavern NanoGPT image proxy unsuitable as-is because it logs the complete image request body at default DEBUG level and uses NanoGPT's older native route. Production M03-D/G remains gated on a privacy-safe same-origin proxy decision.
 
 ### Gate B — per-character asset storage / stable card binding
 

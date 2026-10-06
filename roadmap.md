@@ -1,20 +1,20 @@
 # Chromatic Images roadmap
 
 > Living implementation plan for `zNe4/SillyTavern-ChromaticImages`.
->
-> AI Studio performs implementation work only in
-> `zNe4/SillyTavern-ChromaticImages-aistudio`. The canonical repository is the
-> reviewed source of truth.
 
 ## Current state
 
-**Phase:** Bootstrap architecture refresh.
+**Phase:** M03 — NanoGPT/Qwen transport and local image primitives.
 
-**Runtime code:** none.
+**Current mission:** M03-A evidence complete; M03-B request building is next.
+
+**Completed:** M01 scaffold and M02 message protocol / inline UI / managed prompt hygiene.
+
+**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, and managed prompt-hygiene Regex UI are implemented. Paid image generation is not enabled.
 
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
-**AI Studio sandbox:** `zNe4/SillyTavern-ChromaticImages-aistudio`
+**Workflow:** work directly in the canonical local checkout; no separate `-aistudio` sandbox is required.
 
 **Initial compatibility target:** SillyTavern 1.18.0+
 
@@ -129,6 +129,8 @@ Every mission has one purpose, explicit acceptance gates, and a stop point. AI S
 
 ## M01 — Clean extension scaffold
 
+**Status: complete.**
+
 ### Goal
 
 Create the smallest installable Chromatic Images extension using a deliberately trimmed Chromatic Dialogue scaffold, with no proposal parser and no image generation.
@@ -177,6 +179,8 @@ No CI_IMAGE parsing yet.
 
 ## M02 — Message protocol, inline UI, and managed prompt hygiene
 
+**Status: complete.**
+
 ### Goal
 
 Prove model output -> validated CI_IMAGE -> inline proposal card, plus durable reconstruction from raw chat text, with no provider.
@@ -220,48 +224,144 @@ No NanoGPT and no reference library yet.
 
 ---
 
+
 ## M03 — NanoGPT/Qwen transport and local image primitives
+
+**Status:** M03-A complete; M03-B next.
 
 ### Goal
 
-Prove provider transport and SillyTavern-local image I/O independently of proposal generation.
+Build and prove the image engine independently of proposal-card generation. M03 must not wire the inline Generate button, rewrite assistant messages, or create `CI_RESULT`.
 
-### Required work
+### Evidence contract
 
-- dedicated NanoGPT/Qwen module;
-- POST `https://nano-gpt.com/api/v1/images/generations`;
-- `x-api-key` authentication;
-- support model, prompt, imageDataUrls, resolution, nImages=1, steps, guidance, negative prompt, seed;
-- enforce max 3 refs before request;
-- investigate current SillyTavern-supported secret storage;
-- local image path -> data URL conversion;
-- provider result -> SillyTavern local image upload;
-- port/adapt SLAY data-URL parsing/upload helpers as modular code;
-- add a manual diagnostic path in settings.
+M03 implementation follows `docs/m03-contract.md`.
 
-### Validation matrix
+Key decisions from M03-A:
 
-1. zero references;
-2. one local reference;
-3. two local references;
-4. three local references;
-5. fourth rejected preflight;
-6. output saved locally and survives reload;
-7. no external temporary host.
+- keep `qwen-image` as the MVP default;
+- prefer NanoGPT's normalized `POST /api/v1/images` contract;
+- normalized reference images use `input_references`;
+- enforce the project maximum of three references;
+- reuse SillyTavern's existing server-side NanoGPT secret;
+- never persist a NanoGPT key in extension settings or browser storage;
+- do not use SillyTavern's current `/api/sd/nanogpt/generate` unchanged because it logs the entire request body at DEBUG and targets the older native NanoGPT image route;
+- no automatic retry of a potentially billable request.
 
-### Acceptance gates
+### M03-A — Contract and security evidence
 
-- known-good NanoGPT request succeeds;
-- secrets never logged/chat-persisted;
-- local paths convert successfully to data URLs;
-- local upload returns durable path;
-- failed request does not auto-retry into another paid request.
+**Status: complete.**
+
+Document NanoGPT image APIs, Qwen capabilities, SillyTavern secret/proxy behavior, local image upload, privacy risks, size limits, and transport alternatives.
+
+Gate result:
+
+- M03-B, M03-C and M03-E may proceed;
+- production M03-D transport and paid M03-G diagnostic remain gated on a privacy-safe server-side transport decision.
+
+### M03-B — Request validation and building
+
+Build a pure deterministic validator/request builder for the normalized Image API.
+
+Requirements:
+
+- validate prompt/model/settings;
+- `n = 1`;
+- preserve reference ordering;
+- 0–3 references accepted, 4+ rejected before networking;
+- full data-URL references through `input_references`;
+- use exact current `qwen-image` metadata for optional guidance/steps/negative-prompt controls instead of guessing field names;
+- no fetch, DOM, credentials, or chat mutation.
+
+### M03-C — Provider response normalization
+
+Normalize only provider response forms supported by authoritative evidence or the later live diagnostic.
+
+Requirements:
+
+- fail closed on malformed/empty results;
+- distinguish local bytes/base64 from temporary remote URLs;
+- never treat temporary provider URLs as durable chat paths;
+- no network or chat mutation.
+
+### M03-D — NanoGPT transport
+
+Implement the single-request provider boundary with mocked tests first.
+
+Requirements:
+
+- one call per explicit caller invocation;
+- structured errors for auth/rate/provider/network/timeout/malformed response;
+- no secret/base64 logging;
+- no automatic retry, including 429/5xx/timeout;
+- cancellation after submission may be an uncertain paid outcome.
+
+**Production endpoint gate:** a privacy-safe same-origin server path must be chosen before live transport is accepted. Preferred long-term direction is a narrow update to SillyTavern's existing NanoGPT image proxy; a small server plugin is the explicit fallback if its distribution cost is accepted.
+
+### M03-E — SillyTavern-local image I/O
+
+Implement reusable primitives for:
+
+- validated SillyTavern-local image path -> same-origin fetch -> Blob -> data URL;
+- temporary diagnostic File/Blob -> data URL;
+- validated generated base64 -> `POST /api/images/upload`;
+- durable local path validation.
+
+No M04 character-library storage layout is frozen here.
+
+### M03-F — Provider settings and diagnostic UI
+
+Add only nonsensitive provider/model defaults and diagnostic controls.
+
+Requirements:
+
+- no Chromatic Images API-key field;
+- credential readiness comes from SillyTavern's existing NanoGPT secret state;
+- zero automatic paid calls;
+- mobile/theme-safe UI;
+- no proposal-card Generate wiring.
+
+### M03-G — Explicit diagnostic generation
+
+First deliberately billable path, available only after the transport gate is closed.
+
+Flow:
+
+~~~text
+explicit diagnostic click
+ -> validate
+ -> load 0–3 refs
+ -> build request
+ -> one NanoGPT call
+ -> normalize
+ -> local upload
+ -> show durable local path/preview
+~~~
+
+Failures never mutate chat and never auto-retry.
+
+### M03-H — Integration and closeout
+
+Validate:
+
+1. 0 refs;
+2. 1 ref;
+3. 2 refs;
+4. 3 refs;
+5. 4th rejected preflight;
+6. bad local path -> no paid call;
+7. provider failure -> no upload;
+8. upload failure -> no false durable result;
+9. successful local output survives reload;
+10. Android/mobile diagnostics;
+11. no surprise generation on reload/chat switch;
+12. M02 proposal and Regex behavior remain intact.
+
+Update documentation with the exact shipped transport/model/settings behavior.
 
 ### Stop point
 
-No proposal Generate wiring.
-
----
+No proposal Generate wiring. M05 remains the first end-to-end `CI_IMAGE` generation milestone.
 
 ## M04 — Stable character identity and trusted reference library
 
@@ -536,14 +636,14 @@ Prepare public stable development release.
 
 # Mission acceptance discipline
 
-1. Canonical main is baseline.
-2. Sandbox is synchronized/reset from canonical.
-3. AI Studio receives one mission only.
-4. ChatGPT reviews actual sandbox diff.
-5. Only approved paths move into canonical mission branch.
-6. Validation runs again in canonical repo.
-7. User tests in SillyTavern when runtime behavior exists.
-8. Mission merges only after acceptance.
-9. Roadmap status changes after acceptance, not implementation claim.
+1. The canonical repository/local checkout is the baseline.
+2. Only one bounded mission is active at a time.
+3. Gemini implements coding work only when explicitly assigned; ChatGPT may directly own research/documentation missions.
+4. Review the actual pushed diff/content rather than implementation claims.
+5. Run the full relevant validation in the canonical checkout.
+6. Perform real SillyTavern smoke tests whenever runtime behavior changes.
+7. Do not commit credentials, personal generated images, or transient artifacts.
+8. Accept the current mission before advancing the roadmap.
+9. Roadmap status changes after acceptance, not merely after implementation.
 
 See `docs/architecture.md` for full invariants and workflow.
