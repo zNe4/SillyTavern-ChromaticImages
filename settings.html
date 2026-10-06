@@ -36,8 +36,71 @@
                 </h3>
                 <p class="chromatic-images-status-text">
                     Chromatic Images is installed correctly.
-                    Image proposals and generation are not enabled in this milestone.
+                    Contextual image proposals are enabled. Image generation is not enabled yet.
                 </p>
+            </section>
+            <section
+                id="chromatic-images-regex-section"
+                class="chromatic-images-regex-section"
+                aria-labelledby="chromatic-images-regex-heading"
+            >
+                <h3
+                    id="chromatic-images-regex-heading"
+                    class="chromatic-images-regex-title"
+                >
+                    Prompt hygiene
+                </h3>
+                <p class="chromatic-images-regex-description">
+                    Chromatic Images uses one global SillyTavern Regex script to keep image-control records out of future model prompts while leaving stored chat unchanged.
+                </p>
+                <div
+                    id="chromatic-images-regex-status-list"
+                    class="chromatic-images-regex-status-list"
+                    role="list"
+                    aria-label="Required Regex scripts"
+                >
+                    <div
+                        class="chromatic-images-regex-status-row"
+                        role="listitem"
+                    >
+                        <span class="chromatic-images-regex-status-label">
+                            Prompt hygiene
+                        </span>
+                        <span
+                            id="chromatic-images-regex-prompt-hygiene-status"
+                            class="chromatic-images-regex-status-value"
+                            data-regex-status="unavailable"
+                        >
+                            Checking…
+                        </span>
+                    </div>
+                </div>
+                <p
+                    id="chromatic-images-regex-summary"
+                    class="chromatic-images-regex-summary"
+                    role="status"
+                    aria-live="polite"
+                >
+                    Checking prompt-hygiene Regex…
+                </p>
+                <div class="chromatic-images-regex-actions">
+                    <button
+                        id="chromatic-images-regex-repair"
+                        class="menu_button chromatic-images-regex-repair"
+                        type="button"
+                        aria-describedby="chromatic-images-regex-summary chromatic-images-regex-feedback"
+                        disabled
+                    >
+                        Check Regex
+                    </button>
+                </div>
+                <p
+                    id="chromatic-images-regex-feedback"
+                    class="chromatic-images-feedback chromatic-images-regex-feedback"
+                    role="status"
+                    aria-live="polite"
+                    hidden
+                ></p>
             </section>
         </div>
     </div>

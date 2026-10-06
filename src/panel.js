@@ -4,6 +4,7 @@ import {
     PANEL_ID,
     PANEL_DRAWER_TOGGLE_ID,
 } from './constants.js';
+import { refreshRegexIntegrationControl } from './regex-panel.js';
 
 const registeredAccessibleDrawers = new WeakSet();
 
@@ -82,4 +83,5 @@ export function refreshPanelState() {
     }
 
     registerDrawerAccessibility(panel);
+    refreshRegexIntegrationControl(panel);
 }

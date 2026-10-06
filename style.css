@@ -178,3 +178,127 @@
     outline-offset: 2px;
 }
 
+/* --- Chromatic Images Regex Settings (M02-H) --- */
+
+.chromatic-images-regex-section {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    margin: 0.75rem 0;
+    padding: 0.75rem;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background: color-mix(
+        in srgb,
+        var(--SmartThemeBlurTintColor) 40%,
+        transparent
+    );
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-regex-title {
+    margin: 0 0 0.5rem;
+    font-size: 1.05em;
+    font-weight: 700;
+    min-width: 0;
+}
+
+.chromatic-images-regex-description {
+    margin: 0.35rem 0 0.75rem;
+    opacity: 0.85;
+    font-size: 0.9em;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-regex-status-list {
+    display: grid;
+    gap: 0.4rem;
+    margin: 0.5rem 0;
+    min-width: 0;
+}
+
+.chromatic-images-regex-status-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background: color-mix(
+        in srgb,
+        var(--SmartThemeBlurTintColor) 60%,
+        transparent
+    );
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-regex-status-label {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-regex-status-value {
+    flex: 0 0 auto;
+    font-weight: 700;
+    font-size: 0.9em;
+}
+
+.chromatic-images-regex-summary {
+    margin: 0.5rem 0;
+    font-size: 0.85em;
+    opacity: 0.85;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-regex-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    min-width: 0;
+}
+
+.chromatic-images-regex-repair {
+    box-sizing: border-box;
+    width: auto;
+    max-width: 100%;
+    min-width: 0;
+    white-space: nowrap;
+    overflow-wrap: normal;
+    word-break: normal;
+}
+
+.chromatic-images-regex-repair:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.chromatic-images-regex-feedback {
+    margin-top: 0.5rem;
+    font-size: 0.85em;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-regex-feedback[hidden] {
+    display: none !important;
+}
+
+.chromatic-images-regex-feedback[data-feedback-kind="valid"] {
+    opacity: 0.95;
+    font-weight: 600;
+}
+
+.chromatic-images-regex-feedback[data-feedback-kind="warning"] {
+    opacity: 0.95;
+    font-weight: 600;
+}
+
+.chromatic-images-regex-feedback[data-feedback-kind="error"] {
+    opacity: 0.95;
+    font-weight: 600;
+}
+
+

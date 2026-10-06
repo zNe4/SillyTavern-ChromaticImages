@@ -50,15 +50,17 @@ including:
 - disabled-extension detection;
 - safe explicit repair preserving unrelated global scripts, unmanaged fields,
   and installed UUIDs;
-- atomic save with rollback on persistence failure.
+- atomic save with rollback on persistence failure;
+- generic Regex status/repair settings-controller pattern (WeakMap panel state,
+  listener idempotency, textContent-only rendering, and accessible feedback).
 
 Chromatic Dialogue-specific product systems were not imported. In particular,
 Chromatic Images does not inherit Dialogue color assignments, operation modes,
 character registration, automatic review, prompt macros, dialogue-display
-regex patterns, tone styling runtime, or legacy migration behavior. Chromatic
-Images uses solely prompt-hygiene regex to hide its own image records from
-outgoing prompt context without altering stored messages or requiring chat
-reloads.
+regex patterns, two-script display controls, tone styling runtime, or legacy
+migration behavior. Chromatic Images uses solely prompt-hygiene regex to hide
+its own image records from outgoing prompt context without altering stored
+messages or requiring chat reloads.
 
 ## SLAY Images
 

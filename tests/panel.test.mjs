@@ -14,22 +14,44 @@ import {
 function createMockElement(id, tagName = 'div') {
     const attributes = new Map();
     const eventListeners = new Map();
+    const childrenMap = new Map();
     let innerHTML = '';
+    let textContent = '';
 
     return {
         id,
         tagName: tagName.toUpperCase(),
+        dataset: {},
+        disabled: false,
+        hidden: false,
         get innerHTML() {
             return innerHTML;
         },
         set innerHTML(value) {
             innerHTML = value;
         },
+        get textContent() {
+            return textContent;
+        },
+        set textContent(value) {
+            textContent = String(value);
+        },
         getAttribute(name) {
             return attributes.get(name) ?? null;
         },
         setAttribute(name, value) {
             attributes.set(name, String(value));
+            if (name.startsWith('data-')) {
+                const camel = name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+                this.dataset[camel] = String(value);
+            }
+        },
+        removeAttribute(name) {
+            attributes.delete(name);
+            if (name.startsWith('data-')) {
+                const camel = name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+                delete this.dataset[camel];
+            }
         },
         addEventListener(event, listener) {
             if (!eventListeners.has(event)) {
@@ -40,11 +62,14 @@ function createMockElement(id, tagName = 'div') {
         getListeners(event) {
             return eventListeners.get(event) ?? [];
         },
+        setChild(selector, element) {
+            childrenMap.set(selector, element);
+        },
         querySelector(selector) {
-            if (selector === `#${PANEL_DRAWER_TOGGLE_ID}` && this.id === PANEL_ID) {
-                return this.drawerToggle ?? null;
+            if (selector === `#${PANEL_DRAWER_TOGGLE_ID}` && this.id === PANEL_ID && this.drawerToggle) {
+                return this.drawerToggle;
             }
-            return null;
+            return childrenMap.get(selector) ?? null;
         },
     };
 }
@@ -298,3 +323,68 @@ test('G. Drawer accessibility toggles aria-expanded on activations', () => {
         globalThis.document = origDoc;
     }
 });
+
+test('H. refreshPanelState refreshes Regex UI when panel contains regex elements without mutating settings', () => {
+    const origDoc = globalThis.document;
+    const origST = globalThis.SillyTavern;
+
+    try {
+        let saveCalls = 0;
+        const extensionSettings = { regex: [] };
+
+        globalThis.SillyTavern = {
+            getContext() {
+                return {
+                    extensionSettings,
+                    saveSettingsDebounced() {
+                        saveCalls += 1;
+                    },
+                };
+            },
+        };
+
+        const panel = createMockElement(PANEL_ID);
+        const drawerToggle = createMockElement(PANEL_DRAWER_TOGGLE_ID, 'button');
+        panel.drawerToggle = drawerToggle;
+
+        const promptHygieneStatus = createMockElement('chromatic-images-regex-prompt-hygiene-status');
+        const summary = createMockElement('chromatic-images-regex-summary');
+        const repairBtn = createMockElement('chromatic-images-regex-repair', 'button');
+        const feedback = createMockElement('chromatic-images-regex-feedback');
+
+        panel.setChild('#chromatic-images-regex-prompt-hygiene-status', promptHygieneStatus);
+        panel.setChild('#chromatic-images-regex-summary', summary);
+        panel.setChild('#chromatic-images-regex-repair', repairBtn);
+        panel.setChild('#chromatic-images-regex-feedback', feedback);
+
+        globalThis.document = {
+            getElementById(id) {
+                if (id === PANEL_ID) {
+                    return panel;
+                }
+                return null;
+            },
+        };
+
+        refreshPanelState();
+
+        assert.equal(promptHygieneStatus.textContent, 'Missing');
+        assert.equal(summary.textContent, 'Prompt hygiene is missing or outdated.');
+        assert.equal(repairBtn.textContent, 'Install / Repair Regex');
+        assert.equal(repairBtn.disabled, false);
+        assert.equal(extensionSettings.regex.length, 0);
+        assert.equal(saveCalls, 0);
+
+        // Repeated refresh should not duplicate click listeners
+        refreshPanelState();
+        refreshPanelState();
+
+        const clickListeners = repairBtn.getListeners('click');
+        assert.equal(clickListeners.length, 1);
+        assert.equal(saveCalls, 0);
+    } finally {
+        globalThis.document = origDoc;
+        globalThis.SillyTavern = origST;
+    }
+});
+
