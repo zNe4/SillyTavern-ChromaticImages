@@ -48,7 +48,7 @@ test('4. canonical script fields match exact expected configuration', () => {
     assert.equal(script.maxDepth, null);
     assert.equal(
         script.findRegex,
-        '/^[ \\t]*(?:<!--[ \\t]*CI_(?:IMAGE|RESULT)\\b[^\\r\\n]*-->|!\\[ChromaticImages\\]\\([^\\r\\n)]*\\))[ \\t]*(?:\\r?\\n)?/gm',
+        '/^[ \\t]*(?:<!--[ \\t]*CI_(?:IMAGE|RESULT)\\b[^\\r\\n]*-->|!\\[ChromaticImages\\]\\([^\\r\\n)]*\\))[ \\t]*(?:\\r?\\n|$)/gm',
     );
 });
 
@@ -292,3 +292,19 @@ test('24. regex preserves inline CI_IMAGE and CI_RESULT mentions', () => {
     assert.equal(applyScript(script, inlineResult), inlineResult);
     assert.equal(applyScript(script, inlineMarkdown), inlineMarkdown);
 });
+
+test('25. regex preserves record markers followed by trailing prose on the same line', () => {
+    const script = MANAGED_REGEX_SCRIPTS[0];
+    const trailingImage = '<!-- CI_IMAGE {"characters":[],"prompt":"x"} --> trailing prose\n';
+    const trailingResult = '<!-- CI_RESULT {"v":1} --> trailing prose\n';
+    const trailingMarkdown = '![ChromaticImages](/foo.png) trailing prose\n';
+    const indentedTrailingImage = '    <!-- CI_IMAGE {"characters":[],"prompt":"x"} --> trailing prose\n';
+    const noNewlineTrailing = '<!-- CI_IMAGE {"characters":[],"prompt":"x"} --> trailing prose';
+
+    assert.equal(applyScript(script, trailingImage), trailingImage);
+    assert.equal(applyScript(script, trailingResult), trailingResult);
+    assert.equal(applyScript(script, trailingMarkdown), trailingMarkdown);
+    assert.equal(applyScript(script, indentedTrailingImage), indentedTrailingImage);
+    assert.equal(applyScript(script, noNewlineTrailing), noNewlineTrailing);
+});
+
