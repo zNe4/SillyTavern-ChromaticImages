@@ -6,11 +6,13 @@ import path from 'node:path';
 import {
     QWEN_IMAGE_MODEL_ID,
     QWEN_IMAGE_MAX_REFERENCES,
+    QWEN_IMAGE_MAX_PROMPT_CODE_UNITS,
     QWEN_IMAGE_DEFAULT_RESOLUTION,
     QWEN_IMAGE_RESOLUTIONS,
     QWEN_IMAGE_REFERENCE_MIME_TYPES,
     buildQwenImageRequest,
 } from '../src/providers/nanogpt-qwen-request.js';
+import { validateImageProposalRecords } from '../src/proposal-validator.js';
 
 const VALID_PNG_REF = 'data:image/png;base64,AAAA';
 const VALID_JPEG_REF = 'data:image/jpeg;base64,BBBB';
@@ -23,6 +25,7 @@ const VALID_WEBP_REF = 'data:image/webp;base64,CCCC';
 test('exported constants have expected types and immutability', () => {
     assert.strictEqual(QWEN_IMAGE_MODEL_ID, 'qwen-image');
     assert.strictEqual(QWEN_IMAGE_MAX_REFERENCES, 3);
+    assert.strictEqual(QWEN_IMAGE_MAX_PROMPT_CODE_UNITS, 3000);
     assert.strictEqual(QWEN_IMAGE_DEFAULT_RESOLUTION, 'auto');
 
     assert.strictEqual(Object.isFrozen(QWEN_IMAGE_RESOLUTIONS), true);
@@ -43,6 +46,12 @@ test('exported constants match the committed metadata snapshot', () => {
 
     // Model ID
     assert.strictEqual(QWEN_IMAGE_MODEL_ID, snapshot.model.id);
+
+    // Max prompt code units matches metadata
+    assert.strictEqual(
+        QWEN_IMAGE_MAX_PROMPT_CODE_UNITS,
+        snapshot.model.supported_parameters.max_prompt_characters
+    );
 
     // Max references compatibility: provider allows at least 3, project cap is 3
     assert.ok(snapshot.model.supported_parameters.max_input_images >= 3);
@@ -180,15 +189,24 @@ test('trims outer prompt whitespace and preserves internal formatting', () => {
     );
 });
 
-test('accepts exactly 8000 UTF-16 code units in prompt', () => {
-    const prompt8000 = 'x'.repeat(8000);
-    const result = buildQwenImageRequest({
+test('accepts prompt at boundary lengths (2999 and 3000 UTF-16 code units)', () => {
+    const prompt2999 = 'x'.repeat(2999);
+    const result2999 = buildQwenImageRequest({
         model: 'qwen-image',
-        prompt: '  ' + prompt8000 + '  ',
+        prompt: prompt2999,
     });
 
-    assert.strictEqual(result.ok, true);
-    assert.strictEqual(result.request.prompt, prompt8000);
+    assert.strictEqual(result2999.ok, true);
+    assert.strictEqual(result2999.request.prompt, prompt2999);
+
+    const prompt3000 = 'x'.repeat(3000);
+    const result3000 = buildQwenImageRequest({
+        model: 'qwen-image',
+        prompt: '  ' + prompt3000 + '  ',
+    });
+
+    assert.strictEqual(result3000.ok, true);
+    assert.strictEqual(result3000.request.prompt, prompt3000);
 });
 
 // -----------------------------------------------------------------------------
@@ -381,15 +399,40 @@ test('rejects empty, whitespace-only, or non-string prompt with invalid-prompt',
     }
 });
 
-test('rejects prompt exceeding 8000 code units with prompt-too-long', () => {
-    const prompt8001 = 'a'.repeat(8001);
-    const result = buildQwenImageRequest({
+test('rejects prompt exceeding 3000 code units (3001 and 8000) with prompt-too-long', () => {
+    const prompt3001 = 'a'.repeat(3001);
+    const result3001 = buildQwenImageRequest({
         model: 'qwen-image',
-        prompt: prompt8001,
+        prompt: prompt3001,
     });
 
-    assert.strictEqual(result.ok, false);
-    assert.deepEqual(result.errors, ['prompt-too-long']);
+    assert.strictEqual(result3001.ok, false);
+    assert.deepEqual(result3001.errors, ['prompt-too-long']);
+
+    const prompt8000 = 'a'.repeat(8000);
+    const result8000 = buildQwenImageRequest({
+        model: 'qwen-image',
+        prompt: prompt8000,
+    });
+
+    assert.strictEqual(result8000.ok, false);
+    assert.deepEqual(result8000.errors, ['prompt-too-long']);
+});
+
+test('existing M02 proposal validation behavior retains 8000 code units ceiling', () => {
+    const record = {
+        raw: '<!-- CI_IMAGE {"characters":["Hina"],"prompt":"x"} -->',
+        start: 0,
+        end: 50,
+        payload: {
+            characters: ['Hina'],
+            prompt: 'x'.repeat(8000),
+        },
+    };
+    const res = validateImageProposalRecords([record]);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.proposals.length, 1);
+    assert.strictEqual(res.proposals[0].prompt.length, 8000);
 });
 
 // -----------------------------------------------------------------------------

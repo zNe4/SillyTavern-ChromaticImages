@@ -21,7 +21,13 @@ export const QWEN_IMAGE_MODEL_ID = 'qwen-image';
 export const QWEN_IMAGE_MAX_REFERENCES = 3;
 
 /**
- * Default resolution per captured provider metadata.
+ * Maximum prompt length in UTF-16 code units supported by the provider route.
+ * @type {3000}
+ */
+export const QWEN_IMAGE_MAX_PROMPT_CODE_UNITS = 3000;
+
+/**
+ * Chromatic Images project-selected default resolution.
  * @type {'auto'}
  */
 export const QWEN_IMAGE_DEFAULT_RESOLUTION = 'auto';
@@ -111,7 +117,7 @@ export function buildQwenImageRequest(options) {
         const trimmed = options.prompt.trim();
         if (trimmed.length === 0) {
             recordError(errors, 'invalid-prompt');
-        } else if (trimmed.length > 8000) {
+        } else if (trimmed.length > QWEN_IMAGE_MAX_PROMPT_CODE_UNITS) {
             recordError(errors, 'prompt-too-long');
         } else {
             normalizedPrompt = trimmed;

@@ -107,9 +107,8 @@ The public normalized metadata for `qwen-image` was captured in `docs/m03-qwen-i
 Exact verified fields:
 - `model`: `'qwen-image'`
 - `supported_parameters`:
-  - `max_prompt_characters`: 3000 (Chromatic Images retains protocol ceiling of 8000 UTF-16 code units for builder validation)
-  - `prompt_length`: `{ "status": "known", "unit": "utf16_code_units", "trim_whitespace": true }`
-  - `resolutions`: `["auto", "1024x1024", "512x512", "768x1024", "576x1024", "1024x768", "1024x576"]` (default `'auto'`)
+  - `max_prompt_characters`: 3000 (`prompt_length: { "status": "known", "unit": "utf16_code_units", "trim_whitespace": true }`). The provider route limit of 3,000 UTF-16 code units is stricter than the 8,000-character proposal protocol ceiling (`CI_IMAGE`), representing distinct validation layers: proposal validation permits up to 8,000 code units in chat records, while `buildQwenImageRequest()` strictly enforces the provider's 3,000-code-unit ceiling after outer trimming.
+  - `resolutions`: `["auto", "1024x1024", "512x512", "768x1024", "576x1024", "1024x768", "1024x576"]`. The metadata does not specify an explicit default; `'auto'` is the Chromatic Images project-selected default.
   - `max_images`: 4
   - `max_output_images`: 4
   - `max_input_images`: 3
@@ -345,7 +344,7 @@ It does not remove the M03 transport gate.
 
 ### M03-B
 
-Completed: pure request validator/builder implemented in `src/providers/nanogpt-qwen-request.js` with metadata snapshot in `docs/m03-qwen-image-metadata.json` and exhaustive test coverage in `tests/nanogpt-qwen-request.test.mjs`.
+Completed: pure request validator/builder implemented in `src/providers/nanogpt-qwen-request.js` with metadata snapshot in `docs/m03-qwen-image-metadata.json` and exhaustive test coverage in `tests/nanogpt-qwen-request.test.mjs`, pending review acceptance of the final correction.
 
 ### M03-C
 
@@ -371,6 +370,6 @@ Blocked until a privacy-safe server-side transport is selected.
 
 **PASS, with one explicit transport product decision deferred.**
 
-M03-B is the next mission, preceded by a non-billable current `qwen-image` metadata snapshot for the optional model-specific fields.
+M03-B request builder is implemented (with final review correction applied).
 
 The project must not reuse `/api/sd/nanogpt/generate` unchanged and must not introduce direct browser API-key storage merely to avoid the server transport decision.
