@@ -6,11 +6,11 @@
 
 **Phase:** M03 — NanoGPT/Qwen transport and local image primitives.
 
-**Current mission:** M03-D1 (Mocked single-request NanoGPT image transport core) implemented and verified, ready for independent review. M03-D2 (Production NanoGPT transport) has not begun.
+**Current mission:** M03-D2B2 (Chromatic Images production dispatch adapter) implemented and verified, ready for independent review.
 
-**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, and M03-C response normalizer (accepted for provable behavior; unverified normalized envelope deferred to M03-G).
+**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, M03-C response normalizer (accepted for provable behavior; unverified normalized envelope deferred to M03-G), M03-D1 single-request transport core (accepted), M03-D2A server path architecture decision (accepted; narrow core proxy update selected), and M03-D2B1 SillyTavern normalized proxy (implemented and verified locally; committed in local SillyTavern checkout, pending upstream PR).
 
-**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building, response normalization, and pure mocked transport core are implemented. Paid image generation is not enabled.
+**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building, response normalization, pure mocked transport core, and production dispatch adapter with capability guard are implemented. Paid image generation is not enabled.
 
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
@@ -227,7 +227,7 @@ No NanoGPT and no reference library yet.
 
 ## M03 — NanoGPT/Qwen transport and local image primitives
 
-**Status:** M03-A complete; M03-B accepted; M03-C accepted for currently provable behavior (normalized success-envelope adapter remains deferred); M03-D1 is implemented and under independent review; M03-D2 has not begun and remains gated.
+**Status:** M03-A complete; M03-B accepted; M03-C accepted for currently provable behavior (normalized success-envelope adapter remains deferred); M03-D1 accepted; M03-D2A accepted; M03-D2B1 implemented locally in SillyTavern checkout; M03-D2B2 implemented and under independent review.
 
 ### Goal
 
@@ -289,7 +289,7 @@ Implemented scope:
 
 ### M03-D1 — Mocked single-request NanoGPT image transport core
 
-**Status: Complete (ready for independent review).**
+**Status: Accepted.**
 
 Pure single-request transport core implemented in `src/providers/nanogpt-image-transport.js` with comprehensive test coverage in `tests/nanogpt-image-transport.test.mjs`.
 
@@ -305,17 +305,17 @@ Implemented scope:
 
 ### M03-D2 — Production NanoGPT transport
 
-**Status: Not started (gated).**
+**Status: Subdivided into D2A, D2B1, and D2B2.**
 
-Implement production same-origin transport once the server path architecture decision is settled.
-
-Requirements:
-- Production endpoint selection, API key retrieval, and SillyTavern secret access.
-- Same-origin browser endpoint.
-- Zero raw credential exposure in browser extension settings or chat history.
-- Never log sensitive request bodies or base64 references.
-
-**Production endpoint gate:** a privacy-safe same-origin server path must be chosen before live transport is accepted. Preferred long-term direction is a narrow update to SillyTavern's existing NanoGPT image proxy; a small server plugin is the explicit fallback if its distribution cost is accepted.
+- **M03-D2A (Server path architecture decision): Accepted.** Narrow SillyTavern core proxy route update selected (`GET`/`POST /api/sd/nanogpt/images`) over server plugin.
+- **M03-D2B1 (SillyTavern normalized proxy): Complete locally.** Implemented and committed in local SillyTavern checkout (`origin/staging` baseline `ad29cbda62e92f145e44d7a10398a38af22ca986`). Adds `GET` capability and `POST` proxy with server-side validation, `SECRET_KEYS.NANOGPT` authentication, `x-st-nanogpt-proxy: v1` response marker, zero body logging, and 25 unit tests. Not yet submitted upstream; upstream PR #6107 affects only legacy `/nanogpt/generate` and does not conflict.
+- **M03-D2B2 (Chromatic Images production dispatch adapter): Implemented (ready for independent review).**
+  - Target module: `src/providers/nanogpt-image-dispatch.js`.
+  - Comprehensive unit test coverage: `tests/nanogpt-image-dispatch.test.mjs`.
+  - Implements `checkNanoGptImagesCapability()` with session-memory caching, `x-st-nanogpt-proxy: v1` marker validation, bounded capability timeout, and caller cancellation cleanup.
+  - Implements `createNanoGptImageDispatch()` for standard same-origin POST requests.
+  - Implements `sendProductionNanoGptImageRequest()` with universal proxy marker interception across all dispatches (default or custom), pre-flight dependency/capability isolation (`dispatchAttempted: false`), whole-operation timeout budgeting, and conservative post-dispatch failure classification (`uncertainBilling: true`).
+  - Privacy guarantee: zero logging or exposure of RP prompts, base64 images, or secrets.
 
 ### M03-E — SillyTavern-local image I/O
 

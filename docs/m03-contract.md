@@ -392,7 +392,20 @@ Implemented pure mocked transport core in `src/providers/nanogpt-image-transport
 
 ### M03-D2
 
-Production same-origin transport remains gated on the core-proxy vs server-plugin architecture decision. Production endpoint selection, API key retrieval, and SillyTavern secret access belong strictly to M03-D2. Direct browser credentials and paid generation remain forbidden.
+Subdivided and resolved through M03-D2A, M03-D2B1, and M03-D2B2:
+
+1. **M03-D2A (Server path architecture decision):** Option A (Narrow SillyTavern core update) was approved over Option C (server plugin). It establishes a dedicated same-origin proxy route (`/api/sd/nanogpt/images`) preserving `SECRET_KEYS.NANOGPT` without logging request bodies or base64 references.
+2. **M03-D2B1 (SillyTavern normalized proxy):** Implemented in the local SillyTavern checkout (`origin/staging` baseline `ad29cbda62e92f145e44d7a10398a38af22ca986`):
+   - Capability route: `GET /api/sd/nanogpt/images` returns `{ ok: true, route: 'nanogpt-images' }` with header `x-st-nanogpt-proxy: v1`. Makes zero external network calls.
+   - Generation route: `POST /api/sd/nanogpt/images` forwards to `https://api.nano-gpt.com/api/v1/images` with server-side `x-api-key`, transparent status and stream piping, independent validation (16 reference limit, 30MB JSON limit), zero request body logging, and response header `x-st-nanogpt-proxy: v1`.
+   - Upstream reconciliation note: SillyTavern PR #6107 modifies only the legacy `/nanogpt/generate` route; the normalized proxy route is architecturally separate. Eventual upstream submission will rebase and reconcile.
+3. **M03-D2B2 (Chromatic Images production dispatch adapter):** Implemented in `src/providers/nanogpt-image-dispatch.js` with comprehensive test coverage in `tests/nanogpt-image-dispatch.test.mjs`:
+   - Exports: `checkNanoGptImagesCapability()`, `clearNanoGptImagesCapabilityCache()`, `createNanoGptImageDispatch()`, `sendProductionNanoGptImageRequest()`.
+   - Pre-flight capability guard: queries `GET /api/sd/nanogpt/images`, caches positive capability in session memory, and fails closed with `sillytavern-update-required` if proxy is absent.
+   - Universal marker verification: wraps every dispatch execution (default or injected) to observe `x-st-nanogpt-proxy: v1` on the raw `Response` before D1 normalization. Unmarked responses never become clean success and clear the capability cache.
+   - Whole-operation timeout budgeting: accounts for capability elapsed time and passes remaining budget to D1.
+   - Preserves M03-D1 conservative billing uncertainty: post-dispatch failures retain `dispatchAttempted: true` and `uncertainBilling: true`. Pre-dispatch failures guarantee `dispatchAttempted: false` and `uncertainBilling: false`.
+   - Privacy guarantee: zero logging or leakage of RP scene prompts, reference images, or credentials.
 
 ### M03-E
 
@@ -404,7 +417,7 @@ Nonsensitive settings/diagnostics may later proceed. Do not add a Chromatic Imag
 
 ### M03-G
 
-Blocked until a privacy-safe server-side transport is selected.
+Diagnostic generation will use the verified production dispatch adapter once authorized. Direct browser keys remain prohibited.
 
 ## 19. M03-A gate result
 
