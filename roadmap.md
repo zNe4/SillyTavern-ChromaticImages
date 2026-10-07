@@ -227,7 +227,7 @@ No NanoGPT and no reference library yet.
 
 ## M03 — NanoGPT/Qwen transport and local image primitives
 
-**Status:** M03-A complete; M03-B next.
+**Status:** M03-A and M03-B complete; M03-C next.
 
 ### Goal
 
