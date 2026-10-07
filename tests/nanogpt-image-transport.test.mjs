@@ -213,14 +213,20 @@ test('rejects invalid timeoutMs values with invalid-options', async () => {
     }
 });
 
-test('rejects invalid signal objects with invalid-options', async () => {
+test('rejects invalid and malformed signal objects before dispatch with invalid-options and zero dispatch', async () => {
     const invalidSignals = [
         null,
         'signal',
         123,
         true,
         {},
-        { aborted: false }, // missing addEventListener
+        { aborted: false }, // missing addEventListener and removeEventListener
+        { aborted: false, addEventListener() {} }, // missing removeEventListener
+        { aborted: false, addEventListener() {}, removeEventListener: 'not-a-func' },
+        { addEventListener() {}, removeEventListener() {} }, // missing boolean aborted
+        { aborted: 'false', addEventListener() {}, removeEventListener() {} }, // non-boolean aborted
+        { aborted: 1, addEventListener() {}, removeEventListener() {} }, // non-boolean aborted
+        { aborted: false, addEventListener: 'not-a-func', removeEventListener() {} },
     ];
 
     for (const signal of invalidSignals) {
@@ -777,6 +783,88 @@ test('clears timeout timer on successful completion', async () => {
     }
 });
 
+test('clears timeout timer on provider HTTP failure', async () => {
+    let timerCleared = false;
+    const origClearTimeout = globalThis.clearTimeout;
+
+    try {
+        globalThis.clearTimeout = (handle) => {
+            timerCleared = true;
+            return origClearTimeout(handle);
+        };
+
+        const result = await sendNanoGptImageTransportRequest({
+            request: DUMMY_REQUEST,
+            dispatch: async () => ({
+                status: 500,
+            }),
+            timeoutMs: 5000,
+        });
+
+        assert.strictEqual(result.ok, false);
+        assert.strictEqual(result.status, 500);
+        assert.strictEqual(timerCleared, true, 'clearTimeout must be invoked on HTTP failure');
+    } finally {
+        globalThis.clearTimeout = origClearTimeout;
+    }
+});
+
+test('clears timeout timer on operation timeout', async () => {
+    let timerCleared = false;
+    const origClearTimeout = globalThis.clearTimeout;
+
+    try {
+        globalThis.clearTimeout = (handle) => {
+            timerCleared = true;
+            return origClearTimeout(handle);
+        };
+
+        const result = await sendNanoGptImageTransportRequest({
+            request: DUMMY_REQUEST,
+            dispatch: async () => new Promise(() => {}),
+            timeoutMs: 15,
+        });
+
+        assert.strictEqual(result.ok, false);
+        assert.strictEqual(result.error.kind, TRANSPORT_ERROR_CODES.TIMEOUT);
+        assert.strictEqual(timerCleared, true, 'clearTimeout must be invoked on timeout');
+    } finally {
+        globalThis.clearTimeout = origClearTimeout;
+    }
+});
+
+test('clears timeout timer on caller cancellation', async () => {
+    let timerCleared = false;
+    const origClearTimeout = globalThis.clearTimeout;
+    const controller = new AbortController();
+
+    try {
+        globalThis.clearTimeout = (handle) => {
+            timerCleared = true;
+            return origClearTimeout(handle);
+        };
+
+        const promise = sendNanoGptImageTransportRequest({
+            request: DUMMY_REQUEST,
+            dispatch: async () => new Promise(() => {}),
+            signal: controller.signal,
+            timeoutMs: 5000,
+        });
+
+        setTimeout(() => {
+            controller.abort();
+        }, 10);
+
+        const result = await promise;
+
+        assert.strictEqual(result.ok, false);
+        assert.strictEqual(result.error.kind, TRANSPORT_ERROR_CODES.CANCELLED);
+        assert.strictEqual(timerCleared, true, 'clearTimeout must be invoked on caller cancellation');
+    } finally {
+        globalThis.clearTimeout = origClearTimeout;
+    }
+});
+
 // -----------------------------------------------------------------------------
 // Race Hardening & Late Settlement
 // -----------------------------------------------------------------------------
@@ -809,6 +897,108 @@ test('late resolution or rejection after timeout does not alter outcome or leak 
     // Outcome remains the timeout failure
     assert.strictEqual(result.status, null);
     assert.strictEqual(result.body, null);
+});
+
+test('late dispatch rejection after timeout does not alter outcome, retry, or leak uncaught error', async () => {
+    let dispatchCount = 0;
+    let lateRejected = false;
+
+    const result = await sendNanoGptImageTransportRequest({
+        request: DUMMY_REQUEST,
+        dispatch: async () => {
+            dispatchCount++;
+            return new Promise((_, reject) => {
+                setTimeout(() => {
+                    lateRejected = true;
+                    reject(new Error('late dispatch rejection after timeout'));
+                }, 40);
+            });
+        },
+        timeoutMs: 15,
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.error.kind, TRANSPORT_ERROR_CODES.TIMEOUT);
+    assert.strictEqual(result.status, null);
+    assert.strictEqual(result.body, null);
+    assert.strictEqual(result.dispatchAttempted, true);
+    assert.strictEqual(result.uncertainBilling, true);
+
+    // Wait for the late rejection timer to fire
+    await new Promise((r) => setTimeout(r, 60));
+    assert.strictEqual(lateRejected, true);
+    assert.strictEqual(dispatchCount, 1, 'must not retry dispatch after late rejection');
+    assert.strictEqual(result.error.kind, TRANSPORT_ERROR_CODES.TIMEOUT);
+});
+
+test('late response.json() resolution after timeout does not alter outcome, retry, or leak uncaught error', async () => {
+    let dispatchCount = 0;
+    let lateResolved = false;
+
+    const result = await sendNanoGptImageTransportRequest({
+        request: DUMMY_REQUEST,
+        dispatch: async () => {
+            dispatchCount++;
+            return {
+                status: 200,
+                json: () => new Promise((resolve) => {
+                    setTimeout(() => {
+                        lateResolved = true;
+                        resolve({ lateData: 'resolved-after-timeout' });
+                    }, 40);
+                }),
+            };
+        },
+        timeoutMs: 15,
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.error.kind, TRANSPORT_ERROR_CODES.TIMEOUT);
+    assert.strictEqual(result.status, 200, 'must preserve status 200 obtained before body parse timeout');
+    assert.strictEqual(result.body, null);
+    assert.strictEqual(result.dispatchAttempted, true);
+    assert.strictEqual(result.uncertainBilling, true);
+
+    // Wait for the late json resolution timer to fire
+    await new Promise((r) => setTimeout(r, 60));
+    assert.strictEqual(lateResolved, true);
+    assert.strictEqual(dispatchCount, 1, 'must not retry dispatch after late body resolution');
+    assert.strictEqual(result.body, null, 'late body resolution must not overwrite null body');
+});
+
+test('late response.json() rejection after timeout does not alter outcome, retry, or leak uncaught error', async () => {
+    let dispatchCount = 0;
+    let lateRejected = false;
+
+    const result = await sendNanoGptImageTransportRequest({
+        request: DUMMY_REQUEST,
+        dispatch: async () => {
+            dispatchCount++;
+            return {
+                status: 200,
+                json: () => new Promise((_, reject) => {
+                    setTimeout(() => {
+                        lateRejected = true;
+                        reject(new SyntaxError('late malformed JSON after timeout'));
+                    }, 40);
+                }),
+            };
+        },
+        timeoutMs: 15,
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.error.kind, TRANSPORT_ERROR_CODES.TIMEOUT);
+    assert.strictEqual(result.status, 200, 'must preserve status 200 obtained before body parse timeout');
+    assert.strictEqual(result.body, null);
+    assert.strictEqual(result.dispatchAttempted, true);
+    assert.strictEqual(result.uncertainBilling, true);
+
+    // Wait for the late json rejection timer to fire
+    await new Promise((r) => setTimeout(r, 60));
+    assert.strictEqual(lateRejected, true);
+    assert.strictEqual(dispatchCount, 1, 'must not retry dispatch after late body rejection');
+    assert.strictEqual(result.error.kind, TRANSPORT_ERROR_CODES.TIMEOUT);
 });
 
 // -----------------------------------------------------------------------------

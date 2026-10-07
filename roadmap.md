@@ -227,7 +227,7 @@ No NanoGPT and no reference library yet.
 
 ## M03 — NanoGPT/Qwen transport and local image primitives
 
-**Status:** M03-A and M03-B complete; M03-C in review (partially completed, awaiting normalized contract evidence).
+**Status:** M03-A complete; M03-B accepted; M03-C accepted for currently provable behavior (normalized success-envelope adapter remains deferred); M03-D1 is implemented and under independent review; M03-D2 has not begun and remains gated.
 
 ### Goal
 

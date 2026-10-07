@@ -101,7 +101,9 @@ export async function sendNanoGptImageTransportRequest(options) {
         if (
             options.signal === null ||
             typeof options.signal !== 'object' ||
-            typeof options.signal.addEventListener !== 'function'
+            typeof options.signal.aborted !== 'boolean' ||
+            typeof options.signal.addEventListener !== 'function' ||
+            typeof options.signal.removeEventListener !== 'function'
         ) {
             return createPreDispatchFailure(
                 TRANSPORT_ERROR_CODES.INVALID_OPTIONS,
@@ -121,6 +123,7 @@ export async function sendNanoGptImageTransportRequest(options) {
     let receivedStatus = null;
     let timedOut = false;
     let cancelled = false;
+    let dispatchAttempted = false;
     let timerHandle = null;
     let callerAbortHandler = null;
 
@@ -163,6 +166,7 @@ export async function sendNanoGptImageTransportRequest(options) {
         });
 
         const pipelinePromise = (async () => {
+            dispatchAttempted = true;
             const response = await options.dispatch(options.request, { signal: internalController.signal });
 
             if (response === null || typeof response !== 'object') {
@@ -262,14 +266,17 @@ export async function sendNanoGptImageTransportRequest(options) {
             if (err.status !== undefined) {
                 errorStatus = err.status;
             }
+        } else if (!dispatchAttempted) {
+            kind = TRANSPORT_ERROR_CODES.INVALID_OPTIONS;
+            message = 'Transport initialization failed before dispatch.';
         }
 
         return {
             ok: false,
             status: errorStatus,
             body: null,
-            dispatchAttempted: true,
-            uncertainBilling: true,
+            dispatchAttempted,
+            uncertainBilling: dispatchAttempted,
             error: {
                 kind,
                 message,
