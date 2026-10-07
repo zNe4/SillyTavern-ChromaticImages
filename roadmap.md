@@ -308,7 +308,7 @@ Implemented scope:
 **Status: Subdivided into D2A, D2B1, and D2B2.**
 
 - **M03-D2A (Server path architecture decision): Accepted.** Narrow SillyTavern core proxy route update selected (`GET`/`POST /api/sd/nanogpt/images`) over server plugin.
-- **M03-D2B1 (SillyTavern normalized proxy): Complete locally.** Implemented and committed in local SillyTavern checkout (`origin/staging` baseline `ad29cbda62e92f145e44d7a10398a38af22ca986`). Adds `GET` capability and `POST` proxy with server-side validation, `SECRET_KEYS.NANOGPT` authentication, `x-st-nanogpt-proxy: v1` response marker, zero body logging, and 25 unit tests. Not yet submitted upstream; upstream PR #6107 affects only legacy `/nanogpt/generate` and does not conflict.
+- **M03-D2B1 (SillyTavern normalized proxy): Complete locally.** Implemented and committed in local SillyTavern checkout (`origin/staging` baseline `ad29cbda62e92f145e44d7a10398a38af22ca986`). Adds `GET` capability and `POST` proxy with server-side validation (16-reference generic ceiling and 50 MiB outbound JSON ceiling), `SECRET_KEYS.NANOGPT` authentication, `x-st-nanogpt-proxy: v1` response marker, zero body logging, and 25 unit tests. Not yet submitted upstream; open PR #6107 affects only legacy `/nanogpt/generate` behavior and does not provide the normalized D2B1 contract. D2B2 does not depend on PR #6107; if #6107 or other NanoGPT changes land before a future SillyTavern upstream contribution, D2B1 must be rebased and reconciled against current staging.
 - **M03-D2B2 (Chromatic Images production dispatch adapter): Implemented (ready for independent review).**
   - Target module: `src/providers/nanogpt-image-dispatch.js`.
   - Comprehensive unit test coverage: `tests/nanogpt-image-dispatch.test.mjs`.

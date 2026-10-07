@@ -7,7 +7,7 @@
  * Key guarantees:
  * - Zero raw NanoGPT credential ownership, retrieval, or persistence in browser JS.
  * - Single-request dispatch without automatic retries.
- * - Conservative billing uncertainty: all post-dispatch outcomes preserve uncertainBilling: true.
+ * - Conservative billing uncertainty: all post-dispatch failures preserve uncertainBilling: true.
  * - Pre-flight capability verification with session-memory caching.
  * - Universal proxy marker verification (x-st-nanogpt-proxy: v1) across all dispatches.
  * - Whole-operation timeout budgeting and caller cancellation propagation.
