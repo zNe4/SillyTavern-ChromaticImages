@@ -370,11 +370,29 @@ Completed: pure request validator/builder implemented in `src/providers/nanogpt-
 
 ### M03-C
 
-Completed response normalizer and validator in `src/providers/nanogpt-image-response.js` with exhaustive test coverage in `tests/nanogpt-image-response.test.mjs`. Normalizes documented OpenAI-compatible base64 and remote URL outputs. Strictly fails closed on `source: 'normalized'` due to unverified vendor response documentation. M03-C remains open for review and not fully accepted until the normalized contract is resolved via future authorized diagnostic (M03-G).
+Accepted for all provable behavior: pure response normalizer and validator implemented in `src/providers/nanogpt-image-response.js` with exhaustive test coverage in `tests/nanogpt-image-response.test.mjs`. Normalizes documented OpenAI-compatible base64 and remote URL outputs. Strictly fails closed on `source: 'normalized'` due to unverified vendor response documentation. Resolving the normalized success contract is deferred to a future explicitly authorized diagnostic (M03-G).
 
-### M03-D
+### M03-D1
 
-Mocked transport/error work may proceed; production same-origin transport remains gated.
+Implemented pure mocked transport core in `src/providers/nanogpt-image-transport.js` with comprehensive test coverage in `tests/nanogpt-image-transport.test.mjs`.
+- Export: `sendNanoGptImageTransportRequest(options)`
+- Contract:
+  - `options.request`: plain object
+  - `options.dispatch`: injected function `(request, { signal }) => Promise<Response>`
+  - `options.timeoutMs`: optional positive integer (no internal timer armed if omitted)
+  - `options.signal`: optional `AbortSignal` instance
+- Invariants:
+  - **Single dispatch:** At most one invocation of `dispatch` per explicit caller call. Zero automatic retries under any circumstance.
+  - **Conservative billing uncertainty:** Any failure after `dispatch` has been called yields `dispatchAttempted: true` and `uncertainBilling: true` (including HTTP 401/403, 429, 4xx, 5xx, network drops, timeouts, caller cancellations, and malformed responses). Only pre-dispatch failures yield `dispatchAttempted: false` and `uncertainBilling: false`. Successful 2xx responses yield `uncertainBilling: false` (transport outcome unambiguous; not a claim that the call was free).
+  - **HTTP status preservation:** `status: number | null` preserves received HTTP status codes whenever an HTTP response was obtained, including body-parse timeouts, body-parse cancellations, and malformed responses. `status: null` indicates no usable HTTP status was obtained.
+  - **Lifecycle deadline & cancellation:** Timeout and cancellation cover both `dispatch()` and `response.json()` body parsing via `Promise.race`.
+  - **Resource cleanup:** `clearTimeout` and caller signal `removeEventListener` are guaranteed to run in `finally` on every exit path.
+  - **Privacy:** Error objects, diagnostics, and module code never leak RP scene prompts, credentials, or image payloads.
+  - **M03-C handoff:** Transport `body` is verified compatible with `normalizeNanoGptImageResponse(body, { source: 'openai-compatible' })`.
+
+### M03-D2
+
+Production same-origin transport remains gated on the core-proxy vs server-plugin architecture decision. Production endpoint selection, API key retrieval, and SillyTavern secret access belong strictly to M03-D2. Direct browser credentials and paid generation remain forbidden.
 
 ### M03-E
 

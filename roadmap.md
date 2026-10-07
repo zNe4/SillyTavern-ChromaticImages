@@ -6,11 +6,11 @@
 
 **Phase:** M03 — NanoGPT/Qwen transport and local image primitives.
 
-**Current mission:** M03-C implemented for documented compatibility contract; normalized route adapter remains blocked on unverified provider response envelope pending live diagnostic (M03-G). M03-C remains open for review and not fully accepted; M03-D has not begun.
+**Current mission:** M03-D1 (Mocked single-request NanoGPT image transport core) implemented and verified, ready for independent review. M03-D2 (Production NanoGPT transport) has not begun.
 
-**Completed:** M01 scaffold and M02 message protocol / inline UI / managed prompt hygiene.
+**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, and M03-C response normalizer (accepted for provable behavior; unverified normalized envelope deferred to M03-G).
 
-**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, and managed prompt-hygiene Regex UI are implemented. Paid image generation is not enabled.
+**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building, response normalization, and pure mocked transport core are implemented. Paid image generation is not enabled.
 
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
@@ -275,7 +275,7 @@ Requirements:
 
 ### M03-C — Provider response normalization
 
-**Status:** In review (partially completed).
+**Status: Accepted (for provable behavior).**
 
 Pure response normalizer and validator implemented in `src/providers/nanogpt-image-response.js` with comprehensive test coverage in `tests/nanogpt-image-response.test.mjs`.
 
@@ -285,21 +285,35 @@ Implemented scope:
 - Detects provider error envelopes and rejects invalid or unsafe inputs.
 - Conservative URL validation: HTTPS only, no credentials, rejects obvious localhost/private/loopback destinations.
 - Syntactic check only; full SSRF/DNS-rebinding protection belongs to network layer.
-- Strictly fails closed with `unverified-normalized-response-contract` when `source: 'normalized'` is passed, as vendor reference documentation does not specify a normative success envelope for `POST /api/v1/images`.
-- Milestone M03-C is not fully accepted until the normalized response contract is resolved via future authorized diagnostic (M03-G).
-- Do not advance to M03-D.
+- Strictly fails closed with `unverified-normalized-response-contract` when `source: 'normalized'` is passed, as vendor reference documentation does not specify a normative success envelope for `POST /api/v1/images`. Resolving the normalized success contract is deferred to a future explicitly authorized diagnostic (M03-G).
 
-### M03-D — NanoGPT transport
+### M03-D1 — Mocked single-request NanoGPT image transport core
 
-Implement the single-request provider boundary with mocked tests first.
+**Status: Complete (ready for independent review).**
+
+Pure single-request transport core implemented in `src/providers/nanogpt-image-transport.js` with comprehensive test coverage in `tests/nanogpt-image-transport.test.mjs`.
+
+Implemented scope:
+- Pure `sendNanoGptImageTransportRequest(options)` with injected `dispatch`.
+- At most one invocation of `dispatch` per explicit caller invocation (zero automatic retries under any circumstance).
+- Conservative billing uncertainty: all post-dispatch failures return `dispatchAttempted: true` and `uncertainBilling: true` (including HTTP 401/403, 429, 4xx, 5xx, network drops, timeouts, caller cancellations, and malformed responses). Only pre-dispatch failures return `dispatchAttempted: false` and `uncertainBilling: false`.
+- HTTP status preservation: HTTP status codes (100–599) are preserved on all responses that obtained an HTTP response, including body-parse timeouts, body-parse cancellations, and malformed responses. `status: null` indicates no usable HTTP status was obtained.
+- Whole-lifecycle timeout and cancellation covering both `dispatch()` and `response.json()` body parsing via `Promise.race`.
+- Resource cleanup: timeout timer handles cleared and caller `AbortSignal` listeners detached in `finally` on every exit path.
+- Privacy guarantee: error objects, diagnostics, and module code never leak RP scene prompts, credentials, or image payloads.
+- Verified contract compatibility with M03-C response normalizer.
+
+### M03-D2 — Production NanoGPT transport
+
+**Status: Not started (gated).**
+
+Implement production same-origin transport once the server path architecture decision is settled.
 
 Requirements:
-
-- one call per explicit caller invocation;
-- structured errors for auth/rate/provider/network/timeout/malformed response;
-- no secret/base64 logging;
-- no automatic retry, including 429/5xx/timeout;
-- cancellation after submission may be an uncertain paid outcome.
+- Production endpoint selection, API key retrieval, and SillyTavern secret access.
+- Same-origin browser endpoint.
+- Zero raw credential exposure in browser extension settings or chat history.
+- Never log sensitive request bodies or base64 references.
 
 **Production endpoint gate:** a privacy-safe same-origin server path must be chosen before live transport is accepted. Preferred long-term direction is a narrow update to SillyTavern's existing NanoGPT image proxy; a small server plugin is the explicit fallback if its distribution cost is accepted.
 
