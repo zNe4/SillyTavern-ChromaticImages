@@ -6,7 +6,7 @@
 
 **Phase:** M03 — NanoGPT/Qwen transport and local image primitives.
 
-**Current mission:** M03-A evidence complete; M03-B request building is next.
+**Current mission:** M03-B complete; M03-C next.
 
 **Completed:** M01 scaffold and M02 message protocol / inline UI / managed prompt hygiene.
 
