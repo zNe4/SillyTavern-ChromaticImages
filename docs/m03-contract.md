@@ -313,14 +313,23 @@ The pinned SLAY donor uses the same core pattern: same-origin `fetch(path)` -> `
 
 ## 13. Size/reference constraints
 
-For the current `qwen-image` catalog snapshot:
+For the captured `qwen-image` metadata snapshot:
 
-- maximum references: 3;
-- route total shown: 30 MB.
+- `max_input_images: 3`;
+- `input_reference_constraints.route`: `min_width: 8`, `min_height: 8`, `max_width: 16384`, `max_height: 16384`, `max_bytes: 31457280`, `formats: ["png", "jpeg", "webp"]`.
 
-Base64 expands binary data by roughly one third before JSON overhead. M03-E should use a conservative preflight based on current model endpoint metadata and encoded size rather than relying on SillyTavern's 500 MB parser ceiling.
+The previous contract draft noted catalog wording `route total shown: 30 MB`. Captured route metadata shows `max_bytes: 31457280`, but does not prove whether 30 MB is an aggregate route ceiling or a per-item limit.
 
-NanoGPT endpoint metadata is authoritative for accepted formats and max bytes.
+To guarantee safety and prevent mobile memory exhaustion, Chromatic Images establishes an explicit **conservative application policy** (not a vendor contract claim):
+
+- Maximum 3 reference images (`MAX_REFERENCE_COUNT = 3`);
+- Aggregate decoded reference budget $\le 31,457,280$ bytes (30 MiB);
+- Individual reference image necessarily $\le 31,457,280$ bytes;
+- Remaining aggregate budget is checked *before* full base64 data URL conversion;
+- Sequential processing to keep peak memory minimal on mobile;
+- With base64 expansion ($\text{encoded length} \approx 4 \times \lceil\text{bytes}/3\rceil$), 30 MiB of decoded reference data expands to $\approx 40$ MiB of data URLs, keeping the total request payload comfortably below D2B1's distinct 50 MiB outbound proxy ceiling;
+- A separate defensive upload ceiling (`MAX_GENERATED_IMAGE_BYTES = 31,457,280`) governs generated output localization;
+- Dimension validation boundary: M03-E does not decode or parse image dimensions; NanoGPT route-side preflight retains responsibility for its documented pixel dimension constraints ($8 \le \text{width/height} \le 16384$).
 
 ## 14. Paid-operation semantics
 
@@ -409,7 +418,14 @@ Subdivided and resolved through M03-D2A, M03-D2B1, and M03-D2B2:
 
 ### M03-E
 
-Cleared for local-path/data-URL and `/api/images/upload` primitives.
+Implemented pure and browser-side local image I/O primitives in `src/images/local-image-io.js` with comprehensive test coverage in `tests/local-image-io.test.mjs`:
+- `validateDurableUserImagePath(path)`: strictly confines paths to `/user/images/...`, disallows literal/encoded/double-encoded traversal, query strings, fragments, control characters, backslashes, and restricts extensions to `.png`, `.jpg`, `.jpeg`, `.webp`.
+- `detectSupportedImageFormat(bytes, options)`: detects PNG, JPEG, WEBP magic bytes authentically; rejects unsupported or truncated formats; validates optional expected MIME.
+- `imageBlobToDataUrl(blob, options)`: browser-native Blob to canonical data URL conversion using `FileReader`, zero Node Buffer dependencies, full cancellation cleanup, single-settle safety, and reader output validation.
+- `loadUserImageAsDataUrl(path, options)`: same-origin GET with `redirect: 'error'` and `credentials: 'same-origin'`, decoupled from SillyTavern CSRF headers; authoritative size checked before data URL conversion.
+- `prepareImageReferences(inputs, options)`: sequential reference batch processing with hard 3-reference ceiling and pre-conversion budget enforcement against aggregate 30 MiB ceiling.
+- `uploadGeneratedImageBase64(options)`: derives format from binary magic bytes, enforces separate defensive upload ceiling (`MAX_GENERATED_IMAGE_BYTES = 31_457_280`), validates safe filename ($\le 128$ code units), uses SillyTavern `getRequestHeaders()`, and independently validates server-returned paths.
+- Boundaries: Remote provider URL retrieval remains deferred until M03-G proves it is needed. PR #5872 (multipart upload) and PR #5374 (character reference media) remain non-dependencies. Zero provider calls or paid requests.
 
 ### M03-F
 

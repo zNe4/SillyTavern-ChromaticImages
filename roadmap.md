@@ -6,11 +6,11 @@
 
 **Phase:** M03 — NanoGPT/Qwen transport and local image primitives.
 
-**Current mission:** M03-D2B2 (Chromatic Images production dispatch adapter) implemented and verified, ready for independent review.
+**Current mission:** M03-E (SillyTavern-local image I/O) implemented and verified, ready for independent review.
 
-**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, M03-C response normalizer (accepted for provable behavior; unverified normalized envelope deferred to M03-G), M03-D1 single-request transport core (accepted), M03-D2A server path architecture decision (accepted; narrow core proxy update selected), and M03-D2B1 SillyTavern normalized proxy (implemented and verified locally; committed in local SillyTavern checkout, pending upstream PR).
+**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, M03-C response normalizer (accepted for provable behavior; unverified normalized envelope deferred to M03-G), M03-D1 single-request transport core (accepted), M03-D2A server path architecture decision (accepted; narrow core proxy update selected), M03-D2B1 SillyTavern normalized proxy (implemented and verified locally; committed in local SillyTavern checkout, pending upstream PR), and M03-D2B2 Chromatic Images production dispatch adapter (accepted).
 
-**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building, response normalization, pure mocked transport core, and production dispatch adapter with capability guard are implemented. Paid image generation is not enabled.
+**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building, response normalization, pure mocked transport core, production dispatch adapter with capability guard, and local image I/O primitives are implemented. Paid image generation is not enabled.
 
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
@@ -227,7 +227,7 @@ No NanoGPT and no reference library yet.
 
 ## M03 — NanoGPT/Qwen transport and local image primitives
 
-**Status:** M03-A complete; M03-B accepted; M03-C accepted for currently provable behavior (normalized success-envelope adapter remains deferred); M03-D1 accepted; M03-D2A accepted; M03-D2B1 implemented locally in SillyTavern checkout; M03-D2B2 implemented and under independent review.
+**Status:** M03-A complete; M03-B accepted; M03-C accepted for currently provable behavior (normalized success-envelope adapter remains deferred); M03-D1 accepted; M03-D2A accepted; M03-D2B1 implemented locally in SillyTavern checkout; M03-D2B2 accepted; M03-E implemented and under independent review.
 
 ### Goal
 
@@ -309,7 +309,7 @@ Implemented scope:
 
 - **M03-D2A (Server path architecture decision): Accepted.** Narrow SillyTavern core proxy route update selected (`GET`/`POST /api/sd/nanogpt/images`) over server plugin.
 - **M03-D2B1 (SillyTavern normalized proxy): Complete locally.** Implemented and committed in local SillyTavern checkout (`origin/staging` baseline `ad29cbda62e92f145e44d7a10398a38af22ca986`). Adds `GET` capability and `POST` proxy with server-side validation (16-reference generic ceiling and 50 MiB outbound JSON ceiling), `SECRET_KEYS.NANOGPT` authentication, `x-st-nanogpt-proxy: v1` response marker, zero body logging, and 25 unit tests. Not yet submitted upstream; open PR #6107 affects only legacy `/nanogpt/generate` behavior and does not provide the normalized D2B1 contract. D2B2 does not depend on PR #6107; if #6107 or other NanoGPT changes land before a future SillyTavern upstream contribution, D2B1 must be rebased and reconciled against current staging.
-- **M03-D2B2 (Chromatic Images production dispatch adapter): Implemented (ready for independent review).**
+- **M03-D2B2 (Chromatic Images production dispatch adapter): Accepted.**
   - Target module: `src/providers/nanogpt-image-dispatch.js`.
   - Comprehensive unit test coverage: `tests/nanogpt-image-dispatch.test.mjs`.
   - Implements `checkNanoGptImagesCapability()` with session-memory caching, `x-st-nanogpt-proxy: v1` marker validation, bounded capability timeout, and caller cancellation cleanup.
@@ -319,14 +319,18 @@ Implemented scope:
 
 ### M03-E — SillyTavern-local image I/O
 
-Implement reusable primitives for:
+**Status: Implemented (ready for independent review).**
 
-- validated SillyTavern-local image path -> same-origin fetch -> Blob -> data URL;
-- temporary diagnostic File/Blob -> data URL;
-- validated generated base64 -> `POST /api/images/upload`;
-- durable local path validation.
+Pure and browser-side primitives implemented in `src/images/local-image-io.js` with comprehensive unit test coverage in `tests/local-image-io.test.mjs`.
 
-No M04 character-library storage layout is frozen here.
+Implemented scope:
+- Strict durable user image path validator (`validateDurableUserImagePath`) enforcing `/user/images/...` confinement, no traversal (literal, percent-encoded, or double-encoded), no query/fragment, no control characters, and strict PNG/JPEG/WEBP extensions.
+- Authentic byte signature detection (`detectSupportedImageFormat`) for PNG, JPEG, and WEBP magic bytes.
+- Browser-native Blob/File to canonical data URL conversion (`imageBlobToDataUrl`) using `FileReader` with zero Node Buffer dependencies, full cancellation support, single-settle safety, and reader output validation.
+- Same-origin local path reading (`loadUserImageAsDataUrl`) using `fetch` with `redirect: 'error'`, `credentials: 'same-origin'`, and decoupled from SillyTavern CSRF headers.
+- Sequential reference batch preparation (`prepareImageReferences`) with hard 3-reference ceiling and pre-conversion budget enforcement against an aggregate 30 MiB ceiling.
+- Generated raw base64 upload (`uploadGeneratedImageBase64`) with format derived from magic bytes, separate defensive upload ceiling, safe filename validation ($\le 128$ code units), SillyTavern `getRequestHeaders()` authentication, and independent re-validation of server-returned paths.
+- No M04 character-library storage layout or M05 message rewriting is frozen here.
 
 ### M03-F — Provider settings and diagnostic UI
 
