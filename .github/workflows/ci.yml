@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: Node.js ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Check JavaScript and test syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          git ls-files -z -- '*.js' '*.mjs' |
+            while IFS= read -r -d '' file; do
+              node --check "$file"
+            done
+
+      - name: Run tests
+        run: npm test
