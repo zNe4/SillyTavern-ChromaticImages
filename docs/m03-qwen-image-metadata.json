@@ -1,0 +1,173 @@
+{
+  "capturedAt": "2026-10-07T00:37:56.257Z",
+  "modelsUrl": "https://api.nano-gpt.com/api/v1/images/models",
+  "model": {
+    "id": "qwen-image",
+    "architecture": {
+      "modality": "text+image->image",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "output_modalities": [
+        "image"
+      ]
+    },
+    "supported_parameters": {
+      "max_prompt_characters": 3000,
+      "prompt_length": {
+        "status": "known",
+        "unit": "utf16_code_units",
+        "trim_whitespace": true
+      },
+      "resolutions": [
+        "auto",
+        "1024x1024",
+        "512x512",
+        "768x1024",
+        "576x1024",
+        "1024x768",
+        "1024x576"
+      ],
+      "max_images": 4,
+      "max_output_images": 4,
+      "max_input_images": 3,
+      "input_image_constraints": {
+        "max_items": 3,
+        "route": {
+          "min_width": 8,
+          "min_height": 8,
+          "max_width": 16384,
+          "max_height": 16384,
+          "max_bytes": 31457280,
+          "formats": [
+            "png",
+            "jpeg",
+            "webp"
+          ],
+          "source": "route-preflight",
+          "note": "NanoGPT route-level validation before provider submission."
+        }
+      }
+    },
+    "supports_streaming": false,
+    "capabilities": {
+      "image_generation": true,
+      "image_to_image": true,
+      "inpainting": false,
+      "nsfw": false
+    },
+    "endpoints": "/api/v1/images/models/qwen-image/endpoints"
+  },
+  "endpointMetadataUrl": "https://api.nano-gpt.com/api/v1/images/models/qwen-image/endpoints",
+  "endpoint": {
+    "provider_name": "Qwen",
+    "provider_slug": "qwen",
+    "supported_parameters": {
+      "max_prompt_characters": 3000,
+      "prompt_length": {
+        "status": "known",
+        "unit": "utf16_code_units",
+        "trim_whitespace": true
+      },
+      "resolutions": [
+        "auto",
+        "1024x1024",
+        "512x512",
+        "768x1024",
+        "576x1024",
+        "1024x768",
+        "1024x576"
+      ],
+      "max_images": 4,
+      "max_output_images": 4,
+      "max_input_images": 3,
+      "input_image_constraints": {
+        "max_items": 3,
+        "route": {
+          "min_width": 8,
+          "min_height": 8,
+          "max_width": 16384,
+          "max_height": 16384,
+          "max_bytes": 31457280,
+          "formats": [
+            "png",
+            "jpeg",
+            "webp"
+          ],
+          "source": "route-preflight",
+          "note": "NanoGPT route-level validation before provider submission."
+        }
+      }
+    },
+    "allowed_passthrough_parameters": [],
+    "pricing": [
+      {
+        "billable": "output_image",
+        "unit": "image",
+        "cost_usd": 0.02,
+        "currency": "USD",
+        "resolution": "1024x1024"
+      },
+      {
+        "billable": "output_image",
+        "unit": "image",
+        "cost_usd": 0.02,
+        "currency": "USD",
+        "resolution": "512x512"
+      },
+      {
+        "billable": "output_image",
+        "unit": "image",
+        "cost_usd": 0.02,
+        "currency": "USD",
+        "resolution": "768x1024"
+      },
+      {
+        "billable": "output_image",
+        "unit": "image",
+        "cost_usd": 0.02,
+        "currency": "USD",
+        "resolution": "576x1024"
+      },
+      {
+        "billable": "output_image",
+        "unit": "image",
+        "cost_usd": 0.02,
+        "currency": "USD",
+        "resolution": "1024x768"
+      },
+      {
+        "billable": "output_image",
+        "unit": "image",
+        "cost_usd": 0.02,
+        "currency": "USD",
+        "resolution": "1024x576"
+      },
+      {
+        "billable": "output_image",
+        "unit": "image",
+        "cost_usd": 0.02,
+        "currency": "USD",
+        "resolution": "auto"
+      }
+    ],
+    "input_reference_constraints": {
+      "max_items": 3,
+      "route": {
+        "min_width": 8,
+        "min_height": 8,
+        "max_width": 16384,
+        "max_height": 16384,
+        "max_bytes": 31457280,
+        "formats": [
+          "png",
+          "jpeg",
+          "webp"
+        ],
+        "source": "route-preflight",
+        "note": "NanoGPT route-level validation before provider submission."
+      }
+    }
+  }
+}

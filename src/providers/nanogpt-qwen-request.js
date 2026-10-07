@@ -1,0 +1,249 @@
+/**
+ * @file Pure request validator and builder for NanoGPT qwen-image requests.
+ *
+ * Enforces strict validation, parameter normalization, and provider payload construction
+ * for the Qwen image model on NanoGPT's normalized Image API (POST /api/v1/images).
+ *
+ * This module is completely deterministic and pure: no network transport, no secrets,
+ * no DOM access, and no runtime metadata reading.
+ */
+
+/**
+ * Exact NanoGPT model ID for Qwen Image MVP.
+ * @type {'qwen-image'}
+ */
+export const QWEN_IMAGE_MODEL_ID = 'qwen-image';
+
+/**
+ * Maximum reference images supported by project contract and provider route.
+ * @type {3}
+ */
+export const QWEN_IMAGE_MAX_REFERENCES = 3;
+
+/**
+ * Default resolution per captured provider metadata.
+ * @type {'auto'}
+ */
+export const QWEN_IMAGE_DEFAULT_RESOLUTION = 'auto';
+
+/**
+ * Supported resolutions per captured provider metadata.
+ * @type {readonly string[]}
+ */
+export const QWEN_IMAGE_RESOLUTIONS = Object.freeze([
+    'auto',
+    '1024x1024',
+    '512x512',
+    '768x1024',
+    '576x1024',
+    '1024x768',
+    '1024x576',
+]);
+
+/**
+ * Allowed reference image MIME types per captured provider metadata.
+ * @type {readonly string[]}
+ */
+export const QWEN_IMAGE_REFERENCE_MIME_TYPES = Object.freeze([
+    'image/png',
+    'image/jpeg',
+    'image/webp',
+]);
+
+const ALLOWED_OPTION_KEYS = new Set([
+    'model',
+    'prompt',
+    'references',
+    'resolution',
+]);
+
+const BASE64_PAYLOAD_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)$/;
+
+/**
+ * Builds and validates a normalized NanoGPT qwen-image request object.
+ *
+ * @param {unknown} options Input options object.
+ * @returns {{
+ *   ok: true,
+ *   request: {
+ *     model: 'qwen-image',
+ *     prompt: string,
+ *     n: 1,
+ *     resolution: string,
+ *     input_references?: string[],
+ *   },
+ *   errors: [],
+ * } | {
+ *   ok: false,
+ *   request: null,
+ *   errors: string[],
+ * }}
+ */
+export function buildQwenImageRequest(options) {
+    if (!isPlainObject(options)) {
+        return {
+            ok: false,
+            request: null,
+            errors: ['invalid-options'],
+        };
+    }
+
+    const errors = [];
+
+    // Reject unknown options
+    for (const key of Object.keys(options)) {
+        if (!ALLOWED_OPTION_KEYS.has(key)) {
+            recordError(errors, 'unknown-option');
+            break;
+        }
+    }
+
+    // Validate model
+    if (options.model !== QWEN_IMAGE_MODEL_ID) {
+        recordError(errors, 'invalid-model');
+    }
+
+    // Validate prompt
+    let normalizedPrompt = '';
+    if (typeof options.prompt !== 'string') {
+        recordError(errors, 'invalid-prompt');
+    } else {
+        const trimmed = options.prompt.trim();
+        if (trimmed.length === 0) {
+            recordError(errors, 'invalid-prompt');
+        } else if (trimmed.length > 8000) {
+            recordError(errors, 'prompt-too-long');
+        } else {
+            normalizedPrompt = trimmed;
+        }
+    }
+
+    // Validate resolution
+    let validatedResolution = QWEN_IMAGE_DEFAULT_RESOLUTION;
+    if ('resolution' in options && options.resolution !== undefined) {
+        if (
+            typeof options.resolution !== 'string' ||
+            !QWEN_IMAGE_RESOLUTIONS.includes(options.resolution)
+        ) {
+            recordError(errors, 'invalid-resolution');
+        } else {
+            validatedResolution = options.resolution;
+        }
+    }
+
+    // Validate references
+    let validatedReferences = [];
+    if ('references' in options && options.references !== undefined) {
+        if (!Array.isArray(options.references)) {
+            recordError(errors, 'invalid-references');
+        } else {
+            if (options.references.length > QWEN_IMAGE_MAX_REFERENCES) {
+                recordError(errors, 'too-many-references');
+            }
+            let hasInvalidRef = false;
+            for (const ref of options.references) {
+                if (!isValidReferenceDataUrl(ref)) {
+                    hasInvalidRef = true;
+                    break;
+                }
+            }
+            if (hasInvalidRef) {
+                recordError(errors, 'invalid-reference');
+            } else {
+                validatedReferences = [...options.references];
+            }
+        }
+    }
+
+    if (errors.length > 0) {
+        return {
+            ok: false,
+            request: null,
+            errors,
+        };
+    }
+
+    const request = {
+        model: QWEN_IMAGE_MODEL_ID,
+        prompt: normalizedPrompt,
+        n: 1,
+        resolution: validatedResolution,
+    };
+
+    if (validatedReferences.length > 0) {
+        request.input_references = [...validatedReferences];
+    }
+
+    return {
+        ok: true,
+        request,
+        errors: [],
+    };
+}
+
+/**
+ * Checks whether a value is a plain object.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isPlainObject(value) {
+    if (
+        value === null ||
+        typeof value !== 'object' ||
+        Array.isArray(value)
+    ) {
+        return false;
+    }
+
+    const proto = Object.getPrototypeOf(value);
+
+    return (
+        proto === Object.prototype ||
+        proto === null
+    );
+}
+
+/**
+ * Validates a reference image string as a full data URL.
+ *
+ * @param {unknown} ref
+ * @returns {boolean}
+ */
+function isValidReferenceDataUrl(ref) {
+    if (typeof ref !== 'string') {
+        return false;
+    }
+    if (!ref.startsWith('data:')) {
+        return false;
+    }
+    const semicolonIndex = ref.indexOf(';');
+    if (semicolonIndex === -1) {
+        return false;
+    }
+    const mime = ref.slice(5, semicolonIndex);
+    if (!QWEN_IMAGE_REFERENCE_MIME_TYPES.includes(mime)) {
+        return false;
+    }
+    const prefix = ref.slice(semicolonIndex, semicolonIndex + 8);
+    if (prefix !== ';base64,') {
+        return false;
+    }
+    const payload = ref.slice(semicolonIndex + 8);
+    if (payload.length === 0) {
+        return false;
+    }
+    return BASE64_PAYLOAD_PATTERN.test(payload);
+}
+
+/**
+ * Records a deterministic, deduplicated error code.
+ *
+ * @param {string[]} errors
+ * @param {string} code
+ */
+function recordError(errors, code) {
+    if (!errors.includes(code)) {
+        errors.push(code);
+    }
+}

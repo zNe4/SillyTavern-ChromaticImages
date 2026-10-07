@@ -1,10 +1,10 @@
 # M03 contract and security evidence
 
-> M03-A evidence snapshot for Chromatic Images.
+> M03-A / M03-B evidence snapshot for Chromatic Images.
 >
-> Verified: 2026-10-06.
+> Verified: 2026-10-06 (M03-A), updated 2026-10-07 (M03-B metadata capture).
 >
-> Documentation-only mission: no paid image generation was performed.
+> Documentation and pure request builder: no paid image generation was performed.
 
 ## 1. Scope
 
@@ -99,16 +99,30 @@ Current catalog also includes:
 Qwen Image 3 is a plausible later quality upgrade while preserving the three-reference concept, but changing the default is a product/cost/quality decision, not an M03-A documentation migration.
 
 ## 4. Model-specific parameter names
+ 
+**Proven capability & metadata (captured 2026-10-07 via `GET /api/v1/images/models` and `GET /api/v1/images/models/qwen-image/endpoints`):**
 
-**Proven capability:** `qwen-image` supports guidance, inference steps, negative prompt, resolution, seed and output-count controls.
+The public normalized metadata for `qwen-image` was captured in `docs/m03-qwen-image-metadata.json`.
 
-**Unresolved normalized JSON names:** the generic normalized guide intentionally requires clients to discover model-specific `supported_parameters`. Legacy/compatibility examples use names such as `guidance_scale` and `num_inference_steps`, while current SillyTavern's old native proxy sends `scale` and `num_steps`.
+Exact verified fields:
+- `model`: `'qwen-image'`
+- `supported_parameters`:
+  - `max_prompt_characters`: 3000 (Chromatic Images retains protocol ceiling of 8000 UTF-16 code units for builder validation)
+  - `prompt_length`: `{ "status": "known", "unit": "utf16_code_units", "trim_whitespace": true }`
+  - `resolutions`: `["auto", "1024x1024", "512x512", "768x1024", "576x1024", "1024x768", "1024x576"]` (default `'auto'`)
+  - `max_images`: 4
+  - `max_output_images`: 4
+  - `max_input_images`: 3
+  - `input_image_constraints`:
+    - `max_items`: 3 (project cap is fixed to 3)
+    - `route`: `min_width: 8`, `min_height: 8`, `max_width: 16384`, `max_height: 16384`, `max_bytes: 31457280` (approx 30 MB)
+    - `formats`: `["png", "jpeg", "webp"]`
+- `allowed_passthrough_parameters`: `[]`
 
-M03-B must not blend those schemas.
+**Resolved normalized JSON names:**
+The normalized route for `qwen-image` does **not** expose parameters for guidance scale (`guidance_scale` / `scale`), inference steps (`num_inference_steps` / `num_steps`), negative prompt (`negative_prompt`), or seed (`seed`). `allowed_passthrough_parameters` is explicitly empty (`[]`).
 
-Before freezing optional Qwen controls, capture a **non-billable** current `GET /api/v1/images/models` + returned `qwen-image` endpoint-metadata snapshot and use those exact keys/allowed values.
-
-Core M03-B work may proceed with proven normalized fields: `model`, `prompt`, `n: 1`, `resolution`, and `input_references`.
+Therefore, M03-B builder strictly rejects caller attempts to inject those fields (or their internal names `guidanceScale`, `inferenceSteps`, `negativePrompt`, `seed`), preserving the purity and security of the normalized request.
 
 ## 5. Provider response contract
 
@@ -320,7 +334,7 @@ It does not remove the M03 transport gate.
 
 ## 17. Unresolved items
 
-1. Exact current normalized `qwen-image` `supported_parameters` keys/allowed values for optional guidance, steps and negative prompt. Capture the public model metadata before freezing those fields in M03-B.
+1. **Resolved in M03-B:** Captured current normalized `qwen-image` metadata from `https://api.nano-gpt.com/api/v1/images/models/qwen-image/endpoints` (`docs/m03-qwen-image-metadata.json`). Proven that normalized route supports only `model`, `prompt`, `n`, `resolution`, and `input_references` (max 3, formats png/jpeg/webp). Optional guidance, steps, negative prompt, and seed are not exposed on this route and are rejected as unknown options by the request builder.
 2. Normative normalized success response for `qwen-image`; resolve from authoritative metadata/schema or M03-G live validation.
 3. Core proxy update vs server-plugin fallback for production transport.
 4. If plugin fallback is selected, prove a supported maintainable way to reuse the existing NanoGPT secret without credential duplication.
@@ -331,7 +345,7 @@ It does not remove the M03 transport gate.
 
 ### M03-B
 
-Cleared for pure request validation/building around `model`, `prompt`, `n: 1`, `resolution`, `input_references`, and max-three reference validation. Capture the non-billable model metadata snapshot before freezing optional Qwen-specific controls.
+Completed: pure request validator/builder implemented in `src/providers/nanogpt-qwen-request.js` with metadata snapshot in `docs/m03-qwen-image-metadata.json` and exhaustive test coverage in `tests/nanogpt-qwen-request.test.mjs`.
 
 ### M03-C
 
