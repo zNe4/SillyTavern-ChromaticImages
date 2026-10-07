@@ -6,7 +6,7 @@
 
 **Phase:** M03 — NanoGPT/Qwen transport and local image primitives.
 
-**Current mission:** M03-B complete; M03-C next.
+**Current mission:** M03-C implemented for documented compatibility contract; normalized route adapter remains blocked on unverified provider response envelope pending live diagnostic (M03-G). M03-C remains open for review and not fully accepted; M03-D has not begun.
 
 **Completed:** M01 scaffold and M02 message protocol / inline UI / managed prompt hygiene.
 
@@ -227,7 +227,7 @@ No NanoGPT and no reference library yet.
 
 ## M03 — NanoGPT/Qwen transport and local image primitives
 
-**Status:** M03-A and M03-B complete; M03-C next.
+**Status:** M03-A and M03-B complete; M03-C in review (partially completed, awaiting normalized contract evidence).
 
 ### Goal
 
@@ -275,14 +275,19 @@ Requirements:
 
 ### M03-C — Provider response normalization
 
-Normalize only provider response forms supported by authoritative evidence or the later live diagnostic.
+**Status:** In review (partially completed).
 
-Requirements:
+Pure response normalizer and validator implemented in `src/providers/nanogpt-image-response.js` with comprehensive test coverage in `tests/nanogpt-image-response.test.mjs`.
 
-- fail closed on malformed/empty results;
-- distinguish local bytes/base64 from temporary remote URLs;
-- never treat temporary provider URLs as durable chat paths;
-- no network or chat mutation.
+Implemented scope:
+- Normalizes documented OpenAI-compatible base64 and remote URL outputs.
+- Enforces strict envelope, single-image `n = 1`, and field mutual exclusivity validation.
+- Detects provider error envelopes and rejects invalid or unsafe inputs.
+- Conservative URL validation: HTTPS only, no credentials, rejects obvious localhost/private/loopback destinations.
+- Syntactic check only; full SSRF/DNS-rebinding protection belongs to network layer.
+- Strictly fails closed with `unverified-normalized-response-contract` when `source: 'normalized'` is passed, as vendor reference documentation does not specify a normative success envelope for `POST /api/v1/images`.
+- Milestone M03-C is not fully accepted until the normalized response contract is resolved via future authorized diagnostic (M03-G).
+- Do not advance to M03-D.
 
 ### M03-D — NanoGPT transport
 

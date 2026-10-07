@@ -125,13 +125,35 @@ Therefore, M03-B builder strictly rejects caller attempts to inject those fields
 
 ## 5. Provider response contract
 
-The OpenAI-compatible image route is proven to return `data[i].b64_json` by default or a short-lived signed `data[i].url` when URL output is requested. Provider URLs are therefore never durable Chromatic Images result paths.
+Inspected official vendor sources (verified 2026-10-07):
+- OpenAI-compatible endpoint reference: `https://docs.nano-gpt.com/api-reference/endpoint/image-generation-openai`
+- Image generation overview: `https://docs.nano-gpt.com/api-reference/image-generation`
+- Normalized generation route reference: `https://docs.nano-gpt.com/api-reference/endpoint/image-api-generate`
 
-Current SillyTavern's old NanoGPT proxy expects NanoGPT's native response at `data[0].b64_json` and converts it to `{ image: base64 }`.
+### 5.1 Confirmed OpenAI-compatible response format
+The OpenAI-compatible image route (`POST /v1/images/generations` and related) is proven by official OpenAPI schemas to return a plain-object envelope with a `data` array:
+- Each `data[i]` contains either `b64_json` (raw base64 string, default) or `url` (short-lived signed HTTPS URL), never both and never neither.
+- Signed URLs expire after a short period (~1 hour) and are untrusted, temporary representations, never durable Chromatic Images result paths.
+- Top-level non-payload metadata fields (`created`, `cost`, `paymentSource`, `remainingBalance`) may be present on the envelope and are not classified as errors.
+- Chromatic Images MVP strictly requires `n = 1`, requiring `data` to have length exactly 1.
 
-**Unresolved:** the normalized `POST /api/v1/images` documentation does not currently provide a normative `qwen-image` success body that should be hard-coded here.
+Current SillyTavern's legacy NanoGPT proxy expects NanoGPT's native response at `data[0].b64_json` and converts it to `{ image: base64 }`.
 
-M03-C must only normalize response shapes proven by an authoritative schema/metadata update or the later explicitly authorized M03-G live diagnostic. Do not infer normalized success merely from compatibility routes.
+### 5.2 Unverified normalized response format
+**Unresolved:** The official vendor reference documentation for the normalized route (`POST /api/v1/images`) documents request fields and error responses (`missing_model`, `invalid_input_references`, `conflicting_image_inputs`, `unsupported_stream`, `unsupported_provider_options`), but does not provide any normative success response envelope or schema.
+
+Therefore, the normalized success response contract remains unverified. As mandated by project discipline, we do not assume the normalized endpoint returns an OpenAI-compatible envelope merely because both routes exist on the same platform.
+
+### 5.3 Implemented response normalizer boundaries (M03-C)
+Pure, deterministic validator implemented in `src/providers/nanogpt-image-response.js`:
+- Supported sources: `openai-compatible` (fully validated) and `normalized` (strict fail-closed).
+- Source `normalized` strictly returns `{ ok: false, image: null, errors: ['unverified-normalized-response-contract'] }`.
+- Error envelope detection: known provider error envelopes (`error` object/string, `object: 'error'`, `status: 'error'`, `type: 'error'`) return `provider-error-response`.
+- Base64 validation: pure syntactic character set and padding verification (`invalid-image-base64`). No image decoding performed at this layer.
+- URL validation: purely syntactic and conservative. Requires HTTPS (`unsafe-image-url-protocol`), rejects embedded credentials (`unsafe-image-url-credentials`), and rejects obvious localhost, loopback, private RFC1918, link-local, and local-network IPv4/IPv6 destinations (`unsafe-image-url-target`).
+- Retrieval security boundary: Syntactic URL validation does not eliminate DNS-rebinding, redirect, or complete SSRF risks; network-level retrieval security and sandboxing belong to later network layers (M03-E). Normalizer never performs network fetches.
+- What M03-D may safely reuse: `normalizeNanoGptImageResponse(response, { source: 'openai-compatible' })` can be used to parse mocked/live compatibility responses into `{ ok: true, image: { kind: 'base64', data } | { kind: 'remote-url', url }, errors: [] }`.
+- Future resolution: A future explicitly authorized diagnostic (M03-G) must safely inspect the response structure before implementing the normalized adapter. Diagnostics and normalizers must never record or log base64 data, signed URL query tokens, or raw credentials.
 
 ## 6. Authentication and browser security
 
@@ -334,7 +356,7 @@ It does not remove the M03 transport gate.
 ## 17. Unresolved items
 
 1. **Resolved in M03-B:** Captured current normalized `qwen-image` metadata from `https://api.nano-gpt.com/api/v1/images/models/qwen-image/endpoints` (`docs/m03-qwen-image-metadata.json`). Proven that normalized route supports only `model`, `prompt`, `n`, `resolution`, and `input_references` (max 3, formats png/jpeg/webp). Optional guidance, steps, negative prompt, and seed are not exposed on this route and are rejected as unknown options by the request builder.
-2. Normative normalized success response for `qwen-image`; resolve from authoritative metadata/schema or M03-G live validation.
+2. Normative normalized success response for `qwen-image`; remains unverified in vendor documentation. Implemented response normalizer (`src/providers/nanogpt-image-response.js`) strictly fails closed on `source: 'normalized'`. Resolve from authoritative metadata/schema or future M03-G live validation.
 3. Core proxy update vs server-plugin fallback for production transport.
 4. If plugin fallback is selected, prove a supported maintainable way to reuse the existing NanoGPT secret without credential duplication.
 5. Real Android memory behavior with three large base64 references, to be tested M03-E/H.
@@ -348,7 +370,7 @@ Completed: pure request validator/builder implemented in `src/providers/nanogpt-
 
 ### M03-C
 
-Cleared, but normalize only response shapes that become authoritative.
+Completed response normalizer and validator in `src/providers/nanogpt-image-response.js` with exhaustive test coverage in `tests/nanogpt-image-response.test.mjs`. Normalizes documented OpenAI-compatible base64 and remote URL outputs. Strictly fails closed on `source: 'normalized'` due to unverified vendor response documentation. M03-C remains open for review and not fully accepted until the normalized contract is resolved via future authorized diagnostic (M03-G).
 
 ### M03-D
 
