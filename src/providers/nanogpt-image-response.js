@@ -20,8 +20,10 @@
  *   DNS-rebinding or SSRF risks; retrieval security belongs to the later network layer.
  * - Remote URLs are marked as untrusted temporary representations, never durable chat paths.
  *   Never persist or log provider credentials, RP prompts, or reference-image base64.
- * - Error outputs return only deterministic machine-readable codes; raw response bodies,
- *   image base64, RP prompts, API keys, and signed URL tokens are never persisted or returned.
+ * - Image base64 and signed URL tokens are never exposed through error output, logs,
+ *   or diagnostics. Successful normalization is of course allowed to return the validated
+ *   image payload or temporary signed URL, but failures fail closed with machine-readable
+ *   error codes only.
  */
 
 /**
@@ -336,8 +338,19 @@ function isLocalOrPrivateHost(rawHostname) {
     }
 
     let host = rawHostname.toLowerCase();
+    const isIpv6 = host.startsWith('[') || host.includes(':');
     if (host.startsWith('[') && host.endsWith(']')) {
         host = host.slice(1, -1);
+    }
+
+    if (!isIpv6) {
+        // Strip trailing root dots for canonical DNS hostname checking
+        while (host.endsWith('.')) {
+            host = host.slice(0, -1);
+        }
+        if (host.length === 0) {
+            return true;
+        }
     }
 
     // Local hostnames and domains

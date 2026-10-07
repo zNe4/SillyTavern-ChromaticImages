@@ -591,6 +591,51 @@ test('rejects obvious localhost, loopback, and private targets with unsafe-image
     }
 });
 
+test('rejects hostnames with trailing root dots targeting local domains', () => {
+    const trailingDotTargets = [
+        ['localhost with trailing root dot', 'https://localhost./image.png'],
+        ['foo.localhost with trailing root dot', 'https://foo.localhost./image.png'],
+        ['router.local with trailing root dot', 'https://router.local./image.png'],
+        ['auth.internal with trailing root dot', 'https://auth.internal./image.png'],
+        ['gateway.lan with trailing root dot', 'https://gateway.lan./image.png'],
+    ];
+
+    for (const [desc, url] of trailingDotTargets) {
+        const result = normalizeNanoGptImageResponse(
+            { data: [{ url }] },
+            { source: 'openai-compatible' }
+        );
+
+        assert.strictEqual(
+            result.ok,
+            false,
+            `Expected unsafe-image-url-target for: ${desc} (${url})`
+        );
+        assert.deepEqual(result.errors, ['unsafe-image-url-target']);
+    }
+});
+
+test('accepts valid public HTTPS URLs including domain with trailing root dot', () => {
+    const publicUrls = [
+        'https://api.nano-gpt.com/cdn/generated.png',
+        'https://example.com/images/character.png',
+        'https://cdn.example.org:443/render.webp',
+        'https://images.example.com./photo.jpeg',
+    ];
+
+    for (const url of publicUrls) {
+        const result = normalizeNanoGptImageResponse(
+            { data: [{ url }] },
+            { source: 'openai-compatible' }
+        );
+
+        assert.strictEqual(result.ok, true, `Expected public URL to be accepted: ${url}`);
+        assert.strictEqual(result.image.kind, 'remote-url');
+        assert.strictEqual(result.image.url, url);
+        assert.deepEqual(result.errors, []);
+    }
+});
+
 // -----------------------------------------------------------------------------
 // Immutability, Privacy & Module Purity
 // -----------------------------------------------------------------------------
