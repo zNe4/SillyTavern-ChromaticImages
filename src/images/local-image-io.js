@@ -460,6 +460,13 @@ function validateReaderDataUrlResult(result) {
  */
 function readBlobViaFileReader(blob, signal) {
     return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            const abortErr = new Error('Operation cancelled by caller');
+            abortErr.name = 'AbortError';
+            reject(abortErr);
+            return;
+        }
+
         let settled = false;
         const reader = new FileReader();
 
@@ -515,6 +522,11 @@ function readBlobViaFileReader(blob, signal) {
 
         if (signal) {
             signal.addEventListener('abort', onAbort, { once: true });
+        }
+
+        if (signal?.aborted) {
+            onAbort();
+            return;
         }
 
         reader.readAsDataURL(blob);
@@ -583,6 +595,10 @@ export async function imageBlobToDataUrl(blob, options = {}) {
         return { ok: false, dataUrl: null, format: null, mime: null, byteLength: blob.size, errors: [LOCAL_IO_ERROR_CODES.BLOB_READ_FAILED] };
     }
 
+    if (options.signal?.aborted) {
+        return { ok: false, dataUrl: null, format: null, mime: null, byteLength: blob.size, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
+    }
+
     const sigResult = detectSupportedImageFormat(prefixBuffer);
     if (!sigResult.ok) {
         return { ok: false, dataUrl: null, format: null, mime: null, byteLength: blob.size, errors: sigResult.errors };
@@ -597,6 +613,10 @@ export async function imageBlobToDataUrl(blob, options = {}) {
         ) {
             return { ok: false, dataUrl: null, format: null, mime: null, byteLength: blob.size, errors: [LOCAL_IO_ERROR_CODES.MIME_SIGNATURE_MISMATCH] };
         }
+    }
+
+    if (options.signal?.aborted) {
+        return { ok: false, dataUrl: null, format: null, mime: null, byteLength: blob.size, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
     }
 
     // Data-URL conversion
@@ -614,6 +634,10 @@ export async function imageBlobToDataUrl(blob, options = {}) {
             return { ok: false, dataUrl: null, format: null, mime: null, byteLength: blob.size, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
         }
         return { ok: false, dataUrl: null, format: null, mime: null, byteLength: blob.size, errors: [LOCAL_IO_ERROR_CODES.BLOB_READ_FAILED] };
+    }
+
+    if (options.signal?.aborted) {
+        return { ok: false, dataUrl: null, format: null, mime: null, byteLength: blob.size, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
     }
 
     // Validate reader output
@@ -698,6 +722,10 @@ export async function loadUserImageAsDataUrl(path, options = {}) {
         return { ok: false, dataUrl: null, format: null, mime: null, byteLength: 0, status: null, errors: [LOCAL_IO_ERROR_CODES.FETCH_NETWORK_ERROR] };
     }
 
+    if (options.signal?.aborted) {
+        return { ok: false, dataUrl: null, format: null, mime: null, byteLength: 0, status: response?.status ?? null, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
+    }
+
     if (response === null || typeof response !== 'object') {
         return { ok: false, dataUrl: null, format: null, mime: null, byteLength: 0, status: null, errors: [LOCAL_IO_ERROR_CODES.FETCH_NETWORK_ERROR] };
     }
@@ -705,17 +733,6 @@ export async function loadUserImageAsDataUrl(path, options = {}) {
     // Observable redirect detection
     if (response.redirected === true) {
         return { ok: false, dataUrl: null, format: null, mime: null, byteLength: 0, status: response.status ?? null, errors: [LOCAL_IO_ERROR_CODES.FETCH_REDIRECT_DETECTED] };
-    }
-
-    if (typeof response.url === 'string' && response.url.length > 0) {
-        try {
-            const parsedUrl = new URL(response.url);
-            if (parsedUrl.pathname !== pathValidation.path) {
-                return { ok: false, dataUrl: null, format: null, mime: null, byteLength: 0, status: response.status ?? null, errors: [LOCAL_IO_ERROR_CODES.FETCH_REDIRECT_DETECTED] };
-            }
-        } catch {
-            // If response.url is not a valid URL, ignore URL pathname check
-        }
     }
 
     if (response.status < 200 || response.status >= 300) {
@@ -731,6 +748,10 @@ export async function loadUserImageAsDataUrl(path, options = {}) {
         }
     }
 
+    if (options.signal?.aborted) {
+        return { ok: false, dataUrl: null, format: null, mime: null, byteLength: 0, status: response.status, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
+    }
+
     let blob;
     try {
         blob = await response.blob();
@@ -739,6 +760,10 @@ export async function loadUserImageAsDataUrl(path, options = {}) {
             return { ok: false, dataUrl: null, format: null, mime: null, byteLength: 0, status: response.status, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
         }
         return { ok: false, dataUrl: null, format: null, mime: null, byteLength: 0, status: response.status, errors: [LOCAL_IO_ERROR_CODES.BLOB_READ_FAILED] };
+    }
+
+    if (options.signal?.aborted) {
+        return { ok: false, dataUrl: null, format: null, mime: null, byteLength: 0, status: response.status, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
     }
 
     const conversion = await imageBlobToDataUrl(blob, {
@@ -757,6 +782,10 @@ export async function loadUserImageAsDataUrl(path, options = {}) {
             status: response.status,
             errors: conversion.errors,
         };
+    }
+
+    if (options.signal?.aborted) {
+        return { ok: false, dataUrl: null, format: null, mime: null, byteLength: conversion.byteLength, status: response.status, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
     }
 
     // Check Content-Type header if present
@@ -900,6 +929,16 @@ export async function prepareImageReferences(inputs, options = {}) {
                 items: [],
                 totalByteLength: accumulatedDecodedBytes,
                 errors: [LOCAL_IO_ERROR_CODES.INVALID_REFERENCE_INPUT],
+            };
+        }
+
+        if (options.signal?.aborted) {
+            return {
+                ok: false,
+                references: [],
+                items: [],
+                totalByteLength: accumulatedDecodedBytes,
+                errors: [LOCAL_IO_ERROR_CODES.CANCELLED],
             };
         }
 
@@ -1088,12 +1127,20 @@ export async function uploadGeneratedImageBase64(options = {}) {
         return { ok: false, path: null, format: sigResult.format, byteLength: decodedBytes, status: null, errors: [LOCAL_IO_ERROR_CODES.UPLOAD_NETWORK_ERROR] };
     }
 
+    if (options.signal?.aborted) {
+        return { ok: false, path: null, format: sigResult.format, byteLength: decodedBytes, status: response?.status ?? null, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
+    }
+
     if (response === null || typeof response !== 'object') {
         return { ok: false, path: null, format: sigResult.format, byteLength: decodedBytes, status: null, errors: [LOCAL_IO_ERROR_CODES.UPLOAD_NETWORK_ERROR] };
     }
 
     if (response.status < 200 || response.status >= 300) {
         return { ok: false, path: null, format: sigResult.format, byteLength: decodedBytes, status: response.status, errors: [LOCAL_IO_ERROR_CODES.UPLOAD_HTTP_ERROR] };
+    }
+
+    if (options.signal?.aborted) {
+        return { ok: false, path: null, format: sigResult.format, byteLength: decodedBytes, status: response.status, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
     }
 
     let body;
@@ -1104,6 +1151,10 @@ export async function uploadGeneratedImageBase64(options = {}) {
             return { ok: false, path: null, format: sigResult.format, byteLength: decodedBytes, status: response.status, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
         }
         return { ok: false, path: null, format: sigResult.format, byteLength: decodedBytes, status: response.status, errors: [LOCAL_IO_ERROR_CODES.UPLOAD_MALFORMED_RESPONSE] };
+    }
+
+    if (options.signal?.aborted) {
+        return { ok: false, path: null, format: sigResult.format, byteLength: decodedBytes, status: response.status, errors: [LOCAL_IO_ERROR_CODES.CANCELLED] };
     }
 
     if (!isPlainObject(body) || typeof body.path !== 'string') {

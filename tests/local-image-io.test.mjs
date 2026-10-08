@@ -361,6 +361,110 @@ test('5.8 imageBlobToDataUrl handles AbortSignal validation and pre-aborted sign
     assert.equal(readerCalled, false, 'Reader must not be called when signal is already aborted');
 });
 
+test('5.9 imageBlobToDataUrl cancels cleanly when signal aborts during prefix arrayBuffer read', async () => {
+    const controller = new AbortController();
+    let readerStarted = false;
+    const customBlob = {
+        size: 8,
+        type: 'image/png',
+        slice: () => ({
+            arrayBuffer: async () => {
+                controller.abort();
+                return PNG_MAGIC.buffer;
+            },
+        }),
+    };
+
+    const res = await imageBlobToDataUrl(customBlob, {
+        signal: controller.signal,
+        readDataUrl: async () => {
+            readerStarted = true;
+            return `data:image/png;base64,${PNG_B64}`;
+        },
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.errors[0], LOCAL_IO_ERROR_CODES.CANCELLED);
+    assert.equal(readerStarted, false, 'Full data URL reader must never be started if signal aborts during prefix read');
+});
+
+test('5.10 imageBlobToDataUrl returns cancelled if caller aborts while injected readDataUrl is pending', async () => {
+    const controller = new AbortController();
+    const blob = new Blob([PNG_MAGIC], { type: 'image/png' });
+
+    const resolvingReader = async () => {
+        controller.abort(); // Caller aborts while reader is pending
+        return `data:image/png;base64,${PNG_B64}`; // Injected reader resolves anyway
+    };
+
+    const res = await imageBlobToDataUrl(blob, {
+        signal: controller.signal,
+        readDataUrl: resolvingReader,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.errors[0], LOCAL_IO_ERROR_CODES.CANCELLED);
+    assert.equal(res.dataUrl, null);
+});
+
+test('5.11 imageBlobToDataUrl prevents FileReader from starting a read when signal is aborted', async () => {
+    let readAsDataURLCalls = 0;
+    class MockFileReader {
+        readAsDataURL() {
+            readAsDataURLCalls++;
+        }
+    }
+
+    const originalFileReader = globalThis.FileReader;
+    try {
+        globalThis.FileReader = MockFileReader;
+        const controller = new AbortController();
+        const customBlob = {
+            size: 8,
+            type: 'image/png',
+            slice: () => ({
+                arrayBuffer: async () => {
+                    // Abort right before FileReader boundary is entered
+                    controller.abort();
+                    return PNG_MAGIC.buffer;
+                },
+            }),
+        };
+
+        const res = await imageBlobToDataUrl(customBlob, { signal: controller.signal });
+        assert.equal(res.ok, false);
+        assert.equal(res.errors[0], LOCAL_IO_ERROR_CODES.CANCELLED);
+        assert.equal(readAsDataURLCalls, 0, 'readAsDataURL must not be called when signal is aborted before FileReader boundary');
+    } finally {
+        globalThis.FileReader = originalFileReader;
+    }
+});
+
+test('5.12 imageBlobToDataUrl succeeds via browser FileReader when not aborted', async () => {
+    class MockSuccessFileReader {
+        readAsDataURL() {
+            queueMicrotask(() => {
+                this.result = `data:image/png;base64,${PNG_B64}`;
+                if (typeof this.onload === 'function') {
+                    this.onload();
+                }
+            });
+        }
+    }
+
+    const originalFileReader = globalThis.FileReader;
+    try {
+        globalThis.FileReader = MockSuccessFileReader;
+        const blob = new Blob([PNG_MAGIC], { type: 'image/png' });
+        const res = await imageBlobToDataUrl(blob);
+        assert.equal(res.ok, true);
+        assert.equal(res.format, 'png');
+        assert.equal(res.dataUrl, `data:image/png;base64,${PNG_B64}`);
+    } finally {
+        globalThis.FileReader = originalFileReader;
+    }
+});
+
 // ============================================================================
 // 6. Local User Image Path Fetch (`loadUserImageAsDataUrl`)
 // ============================================================================
@@ -424,8 +528,8 @@ test('6.3 loadUserImageAsDataUrl handles non-2xx status preserving HTTP status c
     assert.equal(res.errors[0], LOCAL_IO_ERROR_CODES.FETCH_NON_2XX_STATUS);
 });
 
-test('6.4 loadUserImageAsDataUrl detects observable redirects', async () => {
-    // 1. response.redirected === true
+test('6.4 loadUserImageAsDataUrl rejects observable redirects when redirected === true', async () => {
+    // 1. response.redirected === true (internal redirect)
     const mockFetch1 = async () => ({
         status: 200,
         redirected: true,
@@ -433,29 +537,92 @@ test('6.4 loadUserImageAsDataUrl detects observable redirects', async () => {
         blob: async () => new Blob([PNG_MAGIC]),
     });
     const res1 = await loadUserImageAsDataUrl('/user/images/hina.png', { fetch: mockFetch1 });
+    assert.equal(res1.ok, false);
     assert.equal(res1.errors[0], LOCAL_IO_ERROR_CODES.FETCH_REDIRECT_DETECTED);
 
-    // 2. response.url divergence
+    // 2. external redirect where redirected === true
     const mockFetch2 = async () => ({
         status: 200,
-        url: 'http://localhost:8000/different/path.png',
+        redirected: true,
+        url: 'https://evil.com/tracker.png',
         headers: new Headers(),
         blob: async () => new Blob([PNG_MAGIC]),
     });
     const res2 = await loadUserImageAsDataUrl('/user/images/hina.png', { fetch: mockFetch2 });
+    assert.equal(res2.ok, false);
     assert.equal(res2.errors[0], LOCAL_IO_ERROR_CODES.FETCH_REDIRECT_DETECTED);
 });
 
-test('6.5 loadUserImageAsDataUrl classifies generic fetch rejection as network error', async () => {
-    const mockFetch = async () => {
+test('6.5 loadUserImageAsDataUrl classifies generic fetch rejection as network error and rejects external redirect', async () => {
+    // Generic fetch rejection (TypeError)
+    const mockFetch1 = async () => {
         throw new TypeError('Failed to fetch');
     };
-    const res = await loadUserImageAsDataUrl('/user/images/hina.png', { fetch: mockFetch });
-    assert.equal(res.ok, false);
-    assert.equal(res.errors[0], LOCAL_IO_ERROR_CODES.FETCH_NETWORK_ERROR);
+    const res1 = await loadUserImageAsDataUrl('/user/images/hina.png', { fetch: mockFetch1 });
+    assert.equal(res1.ok, false);
+    assert.equal(res1.errors[0], LOCAL_IO_ERROR_CODES.FETCH_NETWORK_ERROR);
+
+    // Browser fetch rejecting on redirect when redirect: 'error' is configured
+    const mockFetch2 = async (url, opts) => {
+        assert.equal(opts.redirect, 'error');
+        throw new TypeError('Failed to fetch: redirect encountered with redirect: error');
+    };
+    const res2 = await loadUserImageAsDataUrl('/user/images/hina.png', { fetch: mockFetch2 });
+    assert.equal(res2.ok, false);
+    assert.equal(res2.errors[0], LOCAL_IO_ERROR_CODES.FETCH_NETWORK_ERROR);
 });
 
-test('6.6 loadUserImageAsDataUrl handles early Content-Length ceiling check', async () => {
+test('6.6 loadUserImageAsDataUrl succeeds for Unicode path when response.url is percent-encoded', async () => {
+    let requestedPath = null;
+    const mockFetch = async (url) => {
+        requestedPath = url;
+        return {
+            status: 200,
+            url: 'http://localhost:8000/user/images/%E5%A6%83%E5%A5%88%201.jpeg',
+            headers: new Headers({
+                'content-type': 'image/jpeg',
+            }),
+            blob: async () => new Blob([JPEG_MAGIC], { type: 'image/jpeg' }),
+        };
+    };
+
+    const res = await loadUserImageAsDataUrl('/user/images/妃奈 1.jpeg', {
+        fetch: mockFetch,
+        readDataUrl: testReader,
+    });
+    assert.equal(res.ok, true);
+    assert.equal(requestedPath, '/user/images/妃奈 1.jpeg');
+    assert.equal(res.format, 'jpeg');
+    assert.equal(res.mime, 'image/jpeg');
+    assert.equal(res.dataUrl, `data:image/jpeg;base64,${JPEG_B64}`);
+});
+
+test('6.7 loadUserImageAsDataUrl succeeds for path with spaces when response.url has %20 serialization', async () => {
+    let requestedPath = null;
+    const mockFetch = async (url) => {
+        requestedPath = url;
+        return {
+            status: 200,
+            url: 'http://localhost:8000/user/images/file%20name.png',
+            headers: new Headers({
+                'content-type': 'image/png',
+            }),
+            blob: async () => new Blob([PNG_MAGIC], { type: 'image/png' }),
+        };
+    };
+
+    const res = await loadUserImageAsDataUrl('/user/images/file name.png', {
+        fetch: mockFetch,
+        readDataUrl: testReader,
+    });
+    assert.equal(res.ok, true);
+    assert.equal(requestedPath, '/user/images/file name.png');
+    assert.equal(res.format, 'png');
+    assert.equal(res.mime, 'image/png');
+    assert.equal(res.dataUrl, `data:image/png;base64,${PNG_B64}`);
+});
+
+test('6.8 loadUserImageAsDataUrl handles early Content-Length ceiling check', async () => {
     let blobCalled = false;
     const mockFetch = async () => ({
         status: 200,
@@ -477,13 +644,58 @@ test('6.6 loadUserImageAsDataUrl handles early Content-Length ceiling check', as
     assert.equal(blobCalled, false, 'Blob reading must be avoided when Content-Length exceeds ceiling');
 });
 
-test('6.7 loadUserImageAsDataUrl handles cancellation', async () => {
+test('6.9 loadUserImageAsDataUrl handles cancellation', async () => {
     const controller = new AbortController();
     controller.abort();
 
     const res = await loadUserImageAsDataUrl('/user/images/hina.png', {
         signal: controller.signal,
         fetch: async () => assert.fail('Fetch must not be called when pre-aborted'),
+    });
+    assert.equal(res.ok, false);
+    assert.equal(res.errors[0], LOCAL_IO_ERROR_CODES.CANCELLED);
+});
+
+test('6.10 loadUserImageAsDataUrl handles cancellation occurring after fetch resolves before response.blob()', async () => {
+    const controller = new AbortController();
+    let blobCalled = false;
+    const mockFetch = async () => {
+        controller.abort();
+        return {
+            status: 200,
+            headers: new Headers(),
+            blob: async () => {
+                blobCalled = true;
+                return new Blob([PNG_MAGIC]);
+            },
+        };
+    };
+
+    const res = await loadUserImageAsDataUrl('/user/images/hina.png', {
+        fetch: mockFetch,
+        signal: controller.signal,
+        readDataUrl: testReader,
+    });
+    assert.equal(res.ok, false);
+    assert.equal(res.errors[0], LOCAL_IO_ERROR_CODES.CANCELLED);
+    assert.equal(blobCalled, false, 'response.blob() must not be called when signal aborted after fetch');
+});
+
+test('6.11 loadUserImageAsDataUrl handles cancellation occurring during response.blob() when blob() resolves', async () => {
+    const controller = new AbortController();
+    const mockFetch = async () => ({
+        status: 200,
+        headers: new Headers(),
+        blob: async () => {
+            controller.abort();
+            return new Blob([PNG_MAGIC]);
+        },
+    });
+
+    const res = await loadUserImageAsDataUrl('/user/images/hina.png', {
+        fetch: mockFetch,
+        signal: controller.signal,
+        readDataUrl: testReader,
     });
     assert.equal(res.ok, false);
     assert.equal(res.errors[0], LOCAL_IO_ERROR_CODES.CANCELLED);
@@ -778,6 +990,51 @@ test('8.10 uploadGeneratedImageBase64 handles cancellation during response.json(
             const err = new Error('Body parse aborted');
             err.name = 'AbortError';
             throw err;
+        },
+    });
+
+    const res = await uploadGeneratedImageBase64({
+        image: PNG_B64,
+        fetch: mockFetch,
+        signal: controller.signal,
+        getRequestHeaders: () => ({}),
+    });
+    assert.equal(res.ok, false);
+    assert.equal(res.errors[0], LOCAL_IO_ERROR_CODES.CANCELLED);
+});
+
+test('8.11 uploadGeneratedImageBase64 handles cancellation occurring after fetch resolves before response.json()', async () => {
+    const controller = new AbortController();
+    let jsonCalled = false;
+    const mockFetch = async () => {
+        controller.abort();
+        return {
+            status: 200,
+            json: async () => {
+                jsonCalled = true;
+                return { path: '/user/images/out.png' };
+            },
+        };
+    };
+
+    const res = await uploadGeneratedImageBase64({
+        image: PNG_B64,
+        fetch: mockFetch,
+        signal: controller.signal,
+        getRequestHeaders: () => ({}),
+    });
+    assert.equal(res.ok, false);
+    assert.equal(res.errors[0], LOCAL_IO_ERROR_CODES.CANCELLED);
+    assert.equal(jsonCalled, false, 'response.json() must not be called when signal aborted after upload fetch');
+});
+
+test('8.12 uploadGeneratedImageBase64 handles cancellation occurring during response.json() when json() resolves', async () => {
+    const controller = new AbortController();
+    const mockFetch = async () => ({
+        status: 200,
+        json: async () => {
+            controller.abort();
+            return { path: '/user/images/out.png' };
         },
     });
 
