@@ -57,24 +57,24 @@ const ALLOWED_CAPABILITY_OPTION_KEYS = new Set([
 ]);
 
 /**
- * Session-memory cache for positive normalized capability check.
+ * Route-scoped capability state for normalized NanoGPT image proxy.
+ * Tracks session-memory positive cache and operation identity.
  * Never persisted to localStorage, extensionSettings, or chat files.
- * @type {boolean | null}
  */
-let cachedCapabilitySupported = null;
+const normalizedRouteState = {
+    cachedSupported: null,
+    operationId: 0,
+};
 
 /**
- * Session-memory cache for positive compatibility generations capability check.
+ * Route-scoped capability state for compatibility NanoGPT generations image proxy.
+ * Tracks session-memory positive cache and operation identity.
  * Never persisted to localStorage, extensionSettings, or chat files.
- * @type {boolean | null}
  */
-let cachedGenerationsCapabilitySupported = null;
-
-/**
- * Sequential counter to isolate capability checks and reject stale completions.
- * @type {number}
- */
-let capabilityCheckCounter = 0;
+const generationsRouteState = {
+    cachedSupported: null,
+    operationId: 0,
+};
 
 /**
  * Checks whether a value is a plain JavaScript object.
@@ -237,6 +237,10 @@ function validatePreFlightDependenciesAndOptions(options) {
  * @param {object} params.options
  * @returns {Promise<{
  *   supported: boolean,
+ * @param {{ cachedSupported: boolean | null, operationId: number }} params.routeState
+ * @param {object} [params.options]
+ * @returns {Promise<{
+ *   supported: boolean,
  *   cached: boolean,
  *   status: number | null,
  *   error: { kind: string, message: string } | null,
@@ -247,8 +251,7 @@ async function checkCapabilityCore({
     markerValue: expectedMarkerValue,
     expectedRoute,
     featureDescription,
-    getCached,
-    setCached,
+    routeState,
     options = {},
 }) {
     if (!isPlainObject(options)) {
@@ -357,7 +360,7 @@ async function checkCapabilityCore({
         };
     }
 
-    // 1. Check pre-call cancellation before cache hit
+    // 1. Check pre-call cancellation before cache hit and before state mutation
     if (options.signal?.aborted) {
         return {
             supported: false,
@@ -370,8 +373,13 @@ async function checkCapabilityCore({
         };
     }
 
-    // 2. Cache hit in current page session
-    if (getCached() === true && !options.forceCheck) {
+    // 2. Starting a forced recheck must not let an older positive cache bypass an in-progress revalidation
+    if (options.forceCheck) {
+        routeState.cachedSupported = null;
+    }
+
+    // 3. Cache hit in current page session
+    if (routeState.cachedSupported === true && !options.forceCheck) {
         return {
             supported: true,
             cached: true,
@@ -380,7 +388,7 @@ async function checkCapabilityCore({
         };
     }
 
-    const checkId = ++capabilityCheckCounter;
+    const checkId = ++routeState.operationId;
     let timedOut = false;
     let cancelled = false;
     let timerHandle = null;
@@ -390,8 +398,8 @@ async function checkCapabilityCore({
     const internalController = new AbortController();
 
     const invalidateIfForced = () => {
-        if (options.forceCheck && checkId === capabilityCheckCounter) {
-            setCached(null);
+        if (options.forceCheck && checkId === routeState.operationId) {
+            routeState.cachedSupported = null;
         }
     };
 
@@ -473,14 +481,36 @@ async function checkCapabilityCore({
                 }
 
                 if (body && typeof body === 'object' && body.ok === true && body.route === expectedRoute) {
-                    if (!internalController.signal.aborted && !timedOut && !cancelled && checkId === capabilityCheckCounter) {
-                        setCached(true);
+                    const isSuperseded = checkId !== routeState.operationId;
+                    const isDead = internalController.signal.aborted || timedOut || cancelled;
+
+                    if (!isDead && !isSuperseded) {
+                        routeState.cachedSupported = true;
+                        return {
+                            supported: true,
+                            cached: false,
+                            status: 200,
+                            error: null,
+                        };
                     }
+
+                    if (!isDead && routeState.cachedSupported === true) {
+                        return {
+                            supported: true,
+                            cached: true,
+                            status: 200,
+                            error: null,
+                        };
+                    }
+
                     return {
-                        supported: true,
+                        supported: false,
                         cached: false,
-                        status: 200,
-                        error: null,
+                        status: null,
+                        error: {
+                            kind: DISPATCH_ERROR_CODES.CANCELLED,
+                            message: 'Capability check superseded by newer verification.',
+                        },
                     };
                 }
 
@@ -610,8 +640,7 @@ export async function checkNanoGptImagesCapability(options = {}) {
         markerValue: NANOGPT_PROXY_MARKER_VALUE,
         expectedRoute: 'nanogpt-images',
         featureDescription: 'normalized NanoGPT image support',
-        getCached: () => cachedCapabilitySupported,
-        setCached: (val) => { cachedCapabilitySupported = val; },
+        routeState: normalizedRouteState,
         options,
     });
 }
@@ -638,24 +667,25 @@ export async function checkNanoGptGenerationsCapability(options = {}) {
         markerValue: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE,
         expectedRoute: 'nanogpt-images-generations',
         featureDescription: 'NanoGPT compatibility image generations support',
-        getCached: () => cachedGenerationsCapabilitySupported,
-        setCached: (val) => { cachedGenerationsCapabilitySupported = val; },
+        routeState: generationsRouteState,
         options,
     });
 }
 
 /**
- * Clears the in-memory normalized capability cache.
+ * Clears the in-memory normalized capability cache and invalidates pending operations.
  */
 export function clearNanoGptImagesCapabilityCache() {
-    cachedCapabilitySupported = null;
+    normalizedRouteState.cachedSupported = null;
+    normalizedRouteState.operationId++;
 }
 
 /**
- * Clears the in-memory compatibility generations capability cache.
+ * Clears the in-memory compatibility generations capability cache and invalidates pending operations.
  */
 export function clearNanoGptGenerationsCapabilityCache() {
-    cachedGenerationsCapabilitySupported = null;
+    generationsRouteState.cachedSupported = null;
+    generationsRouteState.operationId++;
 }
 
 /**

@@ -103,6 +103,19 @@ function createTrackedController() {
     };
 }
 
+/**
+ * Creates a deferred promise with explicit external resolve and reject handles.
+ */
+function createDeferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
 // -----------------------------------------------------------------------------
 // Constants & Static Invariants
 // -----------------------------------------------------------------------------
@@ -1870,6 +1883,249 @@ test('capability cache: failed forced recheck clears prior positive compatibilit
     assert.strictEqual(probeCalled, true);
 });
 
+test('cross-route concurrency: normalized check does not supersede in-flight forced compatibility check', async () => {
+    clearNanoGptImagesCapabilityCache();
+    clearNanoGptGenerationsCapabilityCache();
+
+    // 1. Seed compatibility positive cache
+    const seedResult = await checkNanoGptGenerationsCapability({
+        fetch: async () => createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+            body: { ok: true, route: 'nanogpt-images-generations' },
+        }),
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(seedResult.supported, true);
+    assert.strictEqual(seedResult.cached, false);
+
+    // 2. Start forced compatibility check waiting on compatDeferred
+    const compatDeferred = createDeferred();
+    const compatPromise = checkNanoGptGenerationsCapability({
+        fetch: () => compatDeferred.promise,
+        getRequestHeaders: getMockHeaders,
+        forceCheck: true,
+    });
+
+    // 3. While compatibility check is in flight, start and complete a normalized check
+    const normResult = await checkNanoGptImagesCapability({
+        fetch: async () => createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_MARKER_VALUE },
+            body: { ok: true, route: 'nanogpt-images' },
+        }),
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(normResult.supported, true);
+
+    // 4. Compatibility check resolves with failure (404)
+    compatDeferred.resolve(createMockResponse({
+        status: 404,
+        headers: {},
+        body: null,
+    }));
+    const compatResult = await compatPromise;
+    assert.strictEqual(compatResult.supported, false);
+    assert.strictEqual(compatResult.error.kind, DISPATCH_ERROR_CODES.SILLYTAVERN_UPDATE_REQUIRED);
+
+    // 5. Subsequent unforced compatibility check MUST NOT hit cache; it must probe network
+    let subsequentProbeCalled = false;
+    const subsequentCompat = await checkNanoGptGenerationsCapability({
+        fetch: async () => {
+            subsequentProbeCalled = true;
+            return createMockResponse({ status: 500 });
+        },
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(subsequentProbeCalled, true);
+    assert.strictEqual(subsequentCompat.supported, false);
+    assert.strictEqual(subsequentCompat.cached, false);
+});
+
+test('cross-route concurrency: compatibility check does not supersede in-flight forced normalized check', async () => {
+    clearNanoGptImagesCapabilityCache();
+    clearNanoGptGenerationsCapabilityCache();
+
+    // 1. Seed normalized positive cache
+    const seedResult = await checkNanoGptImagesCapability({
+        fetch: async () => createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_MARKER_VALUE },
+            body: { ok: true, route: 'nanogpt-images' },
+        }),
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(seedResult.supported, true);
+    assert.strictEqual(seedResult.cached, false);
+
+    // 2. Start forced normalized check waiting on normDeferred
+    const normDeferred = createDeferred();
+    const normPromise = checkNanoGptImagesCapability({
+        fetch: () => normDeferred.promise,
+        getRequestHeaders: getMockHeaders,
+        forceCheck: true,
+    });
+
+    // 3. While normalized check is in flight, start and complete a compatibility check
+    const compatResult = await checkNanoGptGenerationsCapability({
+        fetch: async () => createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+            body: { ok: true, route: 'nanogpt-images-generations' },
+        }),
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(compatResult.supported, true);
+
+    // 4. Normalized check resolves with failure
+    normDeferred.resolve(createMockResponse({
+        status: 404,
+        headers: {},
+        body: null,
+    }));
+    const normFailResult = await normPromise;
+    assert.strictEqual(normFailResult.supported, false);
+
+    // 5. Subsequent unforced normalized check must probe network, not hit stale cache
+    let subsequentProbeCalled = false;
+    const subsequentNorm = await checkNanoGptImagesCapability({
+        fetch: async () => {
+            subsequentProbeCalled = true;
+            return createMockResponse({ status: 500 });
+        },
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(subsequentProbeCalled, true);
+    assert.strictEqual(subsequentNorm.supported, false);
+    assert.strictEqual(subsequentNorm.cached, false);
+});
+
+test('forced recheck immediately invalidates cache so concurrent unforced check does not bypass revalidation', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+
+    // 1. Seed positive cache
+    await checkNanoGptGenerationsCapability({
+        fetch: async () => createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+            body: { ok: true, route: 'nanogpt-images-generations' },
+        }),
+        getRequestHeaders: getMockHeaders,
+    });
+
+    // 2. Check A starts with forceCheck: true and hangs on checkADeferred
+    const checkADeferred = createDeferred();
+    const checkAPromise = checkNanoGptGenerationsCapability({
+        fetch: () => checkADeferred.promise,
+        getRequestHeaders: getMockHeaders,
+        forceCheck: true,
+    });
+
+    // 3. Check B starts with forceCheck: false while Check A is in flight
+    let checkBFetchCalled = false;
+    const checkBDeferred = createDeferred();
+    const checkBPromise = checkNanoGptGenerationsCapability({
+        fetch: () => {
+            checkBFetchCalled = true;
+            return checkBDeferred.promise;
+        },
+        getRequestHeaders: getMockHeaders,
+    });
+
+    // Verify Check B did NOT return a synchronous cache hit!
+    assert.strictEqual(checkBFetchCalled, true);
+
+    // Resolve Check A with 404
+    checkADeferred.resolve(createMockResponse({ status: 404, headers: {} }));
+    const resultA = await checkAPromise;
+    assert.strictEqual(resultA.supported, false);
+
+    // Resolve Check B with 404
+    checkBDeferred.resolve(createMockResponse({ status: 404, headers: {} }));
+    const resultB = await checkBPromise;
+    assert.strictEqual(resultB.supported, false);
+});
+
+test('explicit cache clearing invalidates in-flight check and prevents late positive caching (compatibility)', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+
+    const fetchDeferred = createDeferred();
+
+    // Start capability check
+    const checkPromise = checkNanoGptGenerationsCapability({
+        fetch: () => fetchDeferred.promise,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    // Explicit cache clear while operation is in flight
+    clearNanoGptGenerationsCapabilityCache();
+
+    // Now fetch resolves late with valid 200 OK + expected route
+    fetchDeferred.resolve(createMockResponse({
+        status: 200,
+        headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+        body: { ok: true, route: 'nanogpt-images-generations' },
+    }));
+
+    const result = await checkPromise;
+    // Must be superseded and report supported: false
+    assert.strictEqual(result.supported, false);
+    assert.strictEqual(result.cached, false);
+    assert.strictEqual(result.error.kind, DISPATCH_ERROR_CODES.CANCELLED);
+    assert.strictEqual(result.error.message, 'Capability check superseded by newer verification.');
+
+    // Verify cache remains empty; next check must probe network
+    let followUpFetchCalled = false;
+    const followUp = await checkNanoGptGenerationsCapability({
+        fetch: async () => {
+            followUpFetchCalled = true;
+            return createMockResponse({ status: 500 });
+        },
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(followUpFetchCalled, true);
+    assert.strictEqual(followUp.cached, false);
+    assert.strictEqual(followUp.supported, false);
+});
+
+test('explicit cache clearing invalidates in-flight check and prevents late positive caching (normalized)', async () => {
+    clearNanoGptImagesCapabilityCache();
+
+    const fetchDeferred = createDeferred();
+
+    const checkPromise = checkNanoGptImagesCapability({
+        fetch: () => fetchDeferred.promise,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    // Clear normalized cache during in-flight operation
+    clearNanoGptImagesCapabilityCache();
+
+    fetchDeferred.resolve(createMockResponse({
+        status: 200,
+        headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_MARKER_VALUE },
+        body: { ok: true, route: 'nanogpt-images' },
+    }));
+
+    const result = await checkPromise;
+    assert.strictEqual(result.supported, false);
+    assert.strictEqual(result.cached, false);
+    assert.strictEqual(result.error.kind, DISPATCH_ERROR_CODES.CANCELLED);
+    assert.strictEqual(result.error.message, 'Capability check superseded by newer verification.');
+
+    let followUpCalled = false;
+    const followUp = await checkNanoGptImagesCapability({
+        fetch: async () => {
+            followUpCalled = true;
+            return createMockResponse({ status: 500 });
+        },
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(followUpCalled, true);
+    assert.strictEqual(followUp.cached, false);
+    assert.strictEqual(followUp.supported, false);
+});
+
 test('capability check: pre-aborted signal takes precedence over positive cache hit', async () => {
     clearNanoGptImagesCapabilityCache();
     clearNanoGptGenerationsCapabilityCache();
@@ -1914,26 +2170,26 @@ test('capability check: late resolution after timeout does not mutate capability
     clearNanoGptImagesCapabilityCache();
     clearNanoGptGenerationsCapabilityCache();
 
-    const mockFetchSlow = async () => {
-        await new Promise((resolve) => setTimeout(resolve, 80));
-        return createMockResponse({
-            status: 200,
-            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
-            body: { ok: true, route: 'nanogpt-images-generations' },
-        });
-    };
+    const fetchDeferred = createDeferred();
 
-    // Check with 30ms timeout: will time out
+    // Check with 10ms timeout: will time out
     const timedOut = await checkNanoGptGenerationsCapability({
-        fetch: mockFetchSlow,
+        fetch: () => fetchDeferred.promise,
         getRequestHeaders: getMockHeaders,
-        timeoutMs: 30,
+        timeoutMs: 10,
     });
     assert.strictEqual(timedOut.supported, false);
     assert.strictEqual(timedOut.error.kind, DISPATCH_ERROR_CODES.TIMEOUT);
 
-    // Wait past the 80ms slow fetch completion
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // Resolve deferred fetch late after timeout
+    fetchDeferred.resolve(createMockResponse({
+        status: 200,
+        headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+        body: { ok: true, route: 'nanogpt-images-generations' },
+    }));
+
+    // Allow microtasks to settle
+    await new Promise((resolve) => setImmediate(resolve));
 
     // Subsequent check should NOT see cached true; it must run fetch
     let subsequentRan = false;
@@ -1954,19 +2210,55 @@ test('capability check: late resolution after timeout does not mutate capability
     assert.strictEqual(followUp.supported, true);
 });
 
-test('capability check: older interleaved check cannot overwrite newer cache state', async () => {
+test('capability check: late resolution after caller cancellation does not mutate capability cache', async () => {
     clearNanoGptGenerationsCapabilityCache();
 
-    // Check 1 starts and delays
-    const check1Promise = checkNanoGptGenerationsCapability({
+    const controller = new AbortController();
+    const fetchDeferred = createDeferred();
+
+    const checkPromise = checkNanoGptGenerationsCapability({
+        fetch: () => fetchDeferred.promise,
+        getRequestHeaders: getMockHeaders,
+        signal: controller.signal,
+    });
+
+    // Caller aborts while fetch is in-flight
+    controller.abort();
+
+    const result = await checkPromise;
+    assert.strictEqual(result.supported, false);
+    assert.strictEqual(result.error.kind, DISPATCH_ERROR_CODES.CANCELLED);
+
+    // Fetch resolves late with valid 200 OK
+    fetchDeferred.resolve(createMockResponse({
+        status: 200,
+        headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+        body: { ok: true, route: 'nanogpt-images-generations' },
+    }));
+
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Verify cache was not repopulated
+    let followUpRan = false;
+    const followUp = await checkNanoGptGenerationsCapability({
         fetch: async () => {
-            await new Promise((resolve) => setTimeout(resolve, 50));
-            return createMockResponse({
-                status: 200,
-                headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
-                body: { ok: true, route: 'nanogpt-images-generations' },
-            });
+            followUpRan = true;
+            return createMockResponse({ status: 500 });
         },
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(followUpRan, true);
+    assert.strictEqual(followUp.cached, false);
+});
+
+test('capability check: older interleaved check cannot overwrite newer cache state or report false readiness', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+
+    const check1Deferred = createDeferred();
+
+    // Check 1 starts and waits on check1Deferred
+    const check1Promise = checkNanoGptGenerationsCapability({
+        fetch: () => check1Deferred.promise,
         getRequestHeaders: getMockHeaders,
     });
 
@@ -1980,8 +2272,18 @@ test('capability check: older interleaved check cannot overwrite newer cache sta
     const check2Result = await check2Promise;
     assert.strictEqual(check2Result.supported, false);
 
-    // Wait for check 1 to finish
-    await check1Promise;
+    // Check 1 resolves late with valid 200 OK
+    check1Deferred.resolve(createMockResponse({
+        status: 200,
+        headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+        body: { ok: true, route: 'nanogpt-images-generations' },
+    }));
+
+    // Check 1 must NOT report positive readiness because Check 2 disproved it
+    const check1Result = await check1Promise;
+    assert.strictEqual(check1Result.supported, false);
+    assert.strictEqual(check1Result.cached, false);
+    assert.strictEqual(check1Result.error.kind, DISPATCH_ERROR_CODES.CANCELLED);
 
     // Subsequent call must not be cached as true because check 1 was superseded
     let fetchRan = false;
@@ -2015,6 +2317,36 @@ test('capability check: cleanly removes abort listeners from caller signal', asy
     assert.strictEqual(result.supported, true);
     assert.strictEqual(getAddedCount(), 1);
     assert.strictEqual(getRemovedCount(), 1);
+});
+
+test('capability check: cleanly removes abort listeners on caller abort and timeout', async () => {
+    clearNanoGptImagesCapabilityCache();
+
+    // 1. Caller abort branch
+    const tracked1 = createTrackedController();
+    const deferred1 = createDeferred();
+    const p1 = checkNanoGptImagesCapability({
+        fetch: () => deferred1.promise,
+        getRequestHeaders: getMockHeaders,
+        signal: tracked1.signal,
+    });
+    tracked1.controller.abort();
+    await p1;
+    assert.strictEqual(tracked1.getAddedCount(), 1);
+    assert.strictEqual(tracked1.getRemovedCount(), 1);
+
+    // 2. Timeout branch
+    const tracked2 = createTrackedController();
+    const deferred2 = createDeferred();
+    const p2 = checkNanoGptImagesCapability({
+        fetch: () => deferred2.promise,
+        getRequestHeaders: getMockHeaders,
+        signal: tracked2.signal,
+        timeoutMs: 10,
+    });
+    await p2;
+    assert.strictEqual(tracked2.getAddedCount(), 1);
+    assert.strictEqual(tracked2.getRemovedCount(), 1);
 });
 
 test('capability check: unknown options return static error message for both routes', async () => {
