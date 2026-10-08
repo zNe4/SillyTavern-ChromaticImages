@@ -71,6 +71,12 @@ let cachedCapabilitySupported = null;
 let cachedGenerationsCapabilitySupported = null;
 
 /**
+ * Sequential counter to isolate capability checks and reject stale completions.
+ * @type {number}
+ */
+let capabilityCheckCounter = 0;
+
+/**
  * Checks whether a value is a plain JavaScript object.
  *
  * @param {unknown} value
@@ -116,7 +122,7 @@ function validatePreFlightDependenciesAndOptions(options) {
                 ok: false,
                 error: {
                     kind: DISPATCH_ERROR_CODES.INVALID_DISPATCH_OPTIONS,
-                    message: `Unknown option '${key}' provided to dispatch service.`,
+                    message: 'Unknown option provided to dispatch service.',
                 },
             };
         }
@@ -265,7 +271,7 @@ async function checkCapabilityCore({
                 status: null,
                 error: {
                     kind: DISPATCH_ERROR_CODES.INVALID_DISPATCH_OPTIONS,
-                    message: `Unknown option '${key}' provided to capability check.`,
+                    message: 'Unknown option provided to capability check.',
                 },
             };
         }
@@ -351,17 +357,7 @@ async function checkCapabilityCore({
         };
     }
 
-    // Cache hit in current page session
-    if (getCached() === true && !options.forceCheck) {
-        return {
-            supported: true,
-            cached: true,
-            status: 200,
-            error: null,
-        };
-    }
-
-    // Check pre-call cancellation
+    // 1. Check pre-call cancellation before cache hit
     if (options.signal?.aborted) {
         return {
             supported: false,
@@ -374,12 +370,30 @@ async function checkCapabilityCore({
         };
     }
 
+    // 2. Cache hit in current page session
+    if (getCached() === true && !options.forceCheck) {
+        return {
+            supported: true,
+            cached: true,
+            status: 200,
+            error: null,
+        };
+    }
+
+    const checkId = ++capabilityCheckCounter;
     let timedOut = false;
     let cancelled = false;
     let timerHandle = null;
     let callerAbortHandler = null;
+    let internalAbortHandler = null;
 
     const internalController = new AbortController();
+
+    const invalidateIfForced = () => {
+        if (options.forceCheck && checkId === capabilityCheckCounter) {
+            setCached(null);
+        }
+    };
 
     try {
         if (options.signal) {
@@ -405,13 +419,14 @@ async function checkCapabilityCore({
                 }
                 return;
             }
-            internalController.signal.addEventListener('abort', () => {
+            internalAbortHandler = () => {
                 if (timedOut) {
                     reject({ kind: DISPATCH_ERROR_CODES.TIMEOUT });
                 } else {
                     reject({ kind: DISPATCH_ERROR_CODES.CANCELLED });
                 }
-            }, { once: true });
+            };
+            internalController.signal.addEventListener('abort', internalAbortHandler, { once: true });
         });
 
         const pipelinePromise = (async () => {
@@ -425,6 +440,7 @@ async function checkCapabilityCore({
             });
 
             if (response === null || typeof response !== 'object') {
+                invalidateIfForced();
                 return {
                     supported: false,
                     cached: false,
@@ -444,6 +460,7 @@ async function checkCapabilityCore({
                 try {
                     body = await response.json();
                 } catch {
+                    invalidateIfForced();
                     return {
                         supported: false,
                         cached: false,
@@ -456,7 +473,9 @@ async function checkCapabilityCore({
                 }
 
                 if (body && typeof body === 'object' && body.ok === true && body.route === expectedRoute) {
-                    setCached(true);
+                    if (!internalController.signal.aborted && !timedOut && !cancelled && checkId === capabilityCheckCounter) {
+                        setCached(true);
+                    }
                     return {
                         supported: true,
                         cached: false,
@@ -465,6 +484,7 @@ async function checkCapabilityCore({
                     };
                 }
 
+                invalidateIfForced();
                 return {
                     supported: false,
                     cached: false,
@@ -477,6 +497,7 @@ async function checkCapabilityCore({
             }
 
             if (response.status === 404 && !isMarked) {
+                invalidateIfForced();
                 return {
                     supported: false,
                     cached: false,
@@ -489,6 +510,7 @@ async function checkCapabilityCore({
             }
 
             if (response.status === 200 && !isMarked) {
+                invalidateIfForced();
                 return {
                     supported: false,
                     cached: false,
@@ -500,6 +522,7 @@ async function checkCapabilityCore({
                 };
             }
 
+            invalidateIfForced();
             return {
                 supported: false,
                 cached: false,
@@ -517,6 +540,7 @@ async function checkCapabilityCore({
         const result = await Promise.race([pipelinePromise, abortPromise]);
         return result;
     } catch (err) {
+        invalidateIfForced();
         if (cancelled || (options.signal && options.signal.aborted) || (err && err.kind === DISPATCH_ERROR_CODES.CANCELLED)) {
             return {
                 supported: false,
@@ -556,6 +580,10 @@ async function checkCapabilityCore({
         if (options.signal && callerAbortHandler) {
             options.signal.removeEventListener('abort', callerAbortHandler);
             callerAbortHandler = null;
+        }
+        if (internalAbortHandler) {
+            internalController.signal.removeEventListener('abort', internalAbortHandler);
+            internalAbortHandler = null;
         }
     }
 }

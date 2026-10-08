@@ -163,7 +163,7 @@ test('pre-flight: rejects unknown option keys with invalid-dispatch-options', as
     assert.strictEqual(result.dispatchAttempted, false);
     assert.strictEqual(result.uncertainBilling, false);
     assert.strictEqual(result.error.kind, DISPATCH_ERROR_CODES.INVALID_DISPATCH_OPTIONS);
-    assert.match(result.error.message, /Unknown option 'unrecognizedKey'/);
+    assert.strictEqual(result.error.message, 'Unknown option provided to dispatch service.');
 });
 
 test('pre-flight: rejects invalid request payloads', async () => {
@@ -1748,4 +1748,293 @@ test('sendProductionNanoGptGenerationsRequest: post-dispatch network error prese
     assert.strictEqual(result.uncertainBilling, true);
     assert.strictEqual(result.error.kind, TRANSPORT_ERROR_CODES.NETWORK_FAILURE);
 });
+
+// -----------------------------------------------------------------------------
+// Capability Cache Invalidation, Cancellation Precedence & Lifecycle Tests
+// -----------------------------------------------------------------------------
+
+test('capability cache: failed forced recheck clears prior positive normalized capability cache', async () => {
+    clearNanoGptImagesCapabilityCache();
+
+    let shouldFail = false;
+    const mockFetch = async () => {
+        if (shouldFail) {
+            return createMockResponse({
+                status: 404,
+                headers: {},
+                body: null,
+            });
+        }
+        return createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_MARKER_VALUE },
+            body: { ok: true, route: 'nanogpt-images' },
+        });
+    };
+
+    // 1. Initial success sets cache
+    const initial = await checkNanoGptImagesCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(initial.supported, true);
+    assert.strictEqual(initial.cached, false);
+
+    // 2. Unforced call hits cache
+    const cacheHit = await checkNanoGptImagesCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(cacheHit.supported, true);
+    assert.strictEqual(cacheHit.cached, true);
+
+    // 3. Forced recheck fails (e.g. 404)
+    shouldFail = true;
+    const failedForced = await checkNanoGptImagesCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+        forceCheck: true,
+    });
+    assert.strictEqual(failedForced.supported, false);
+    assert.strictEqual(failedForced.error.kind, DISPATCH_ERROR_CODES.SILLYTAVERN_UPDATE_REQUIRED);
+
+    // 4. Subsequent unforced call MUST NOT hit cache; it must re-probe and fail
+    let subsequentFetchCalls = 0;
+    const subsequent = await checkNanoGptImagesCapability({
+        fetch: async () => {
+            subsequentFetchCalls++;
+            return createMockResponse({ status: 500 });
+        },
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(subsequent.supported, false);
+    assert.strictEqual(subsequent.cached, false);
+    assert.strictEqual(subsequentFetchCalls, 1);
+});
+
+test('capability cache: failed forced recheck clears prior positive compatibility capability cache', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+
+    let shouldFail = false;
+    const mockFetch = async () => {
+        if (shouldFail) {
+            return createMockResponse({
+                status: 502,
+                headers: {},
+                body: null,
+            });
+        }
+        return createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+            body: { ok: true, route: 'nanogpt-images-generations' },
+        });
+    };
+
+    // 1. Initial success sets cache
+    const initial = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(initial.supported, true);
+    assert.strictEqual(initial.cached, false);
+
+    // 2. Unforced call hits cache
+    const cacheHit = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(cacheHit.supported, true);
+    assert.strictEqual(cacheHit.cached, true);
+
+    // 3. Forced recheck fails
+    shouldFail = true;
+    const failedForced = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+        forceCheck: true,
+    });
+    assert.strictEqual(failedForced.supported, false);
+
+    // 4. Subsequent unforced call is not a cache hit
+    let probeCalled = false;
+    const subsequent = await checkNanoGptGenerationsCapability({
+        fetch: async () => {
+            probeCalled = true;
+            return createMockResponse({ status: 500 });
+        },
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(subsequent.supported, false);
+    assert.strictEqual(subsequent.cached, false);
+    assert.strictEqual(probeCalled, true);
+});
+
+test('capability check: pre-aborted signal takes precedence over positive cache hit', async () => {
+    clearNanoGptImagesCapabilityCache();
+    clearNanoGptGenerationsCapabilityCache();
+
+    const mockFetch = async (url) => {
+        const isGen = url.includes('generations');
+        return createMockResponse({
+            status: 200,
+            headers: {
+                [NANOGPT_PROXY_MARKER_HEADER]: isGen ? NANOGPT_PROXY_GENERATIONS_MARKER_VALUE : NANOGPT_PROXY_MARKER_VALUE,
+            },
+            body: { ok: true, route: isGen ? 'nanogpt-images-generations' : 'nanogpt-images' },
+        });
+    };
+
+    // Seed positive caches
+    await checkNanoGptImagesCapability({ fetch: mockFetch, getRequestHeaders: getMockHeaders });
+    await checkNanoGptGenerationsCapability({ fetch: mockFetch, getRequestHeaders: getMockHeaders });
+
+    // Pre-aborted normalized check returns cancelled immediately
+    const preAbortedNormalized = await checkNanoGptImagesCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+        signal: AbortSignal.abort(),
+    });
+    assert.strictEqual(preAbortedNormalized.supported, false);
+    assert.strictEqual(preAbortedNormalized.cached, false);
+    assert.strictEqual(preAbortedNormalized.error.kind, DISPATCH_ERROR_CODES.CANCELLED);
+
+    // Pre-aborted compatibility check returns cancelled immediately
+    const preAbortedCompat = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+        signal: AbortSignal.abort(),
+    });
+    assert.strictEqual(preAbortedCompat.supported, false);
+    assert.strictEqual(preAbortedCompat.cached, false);
+    assert.strictEqual(preAbortedCompat.error.kind, DISPATCH_ERROR_CODES.CANCELLED);
+});
+
+test('capability check: late resolution after timeout does not mutate capability cache', async () => {
+    clearNanoGptImagesCapabilityCache();
+    clearNanoGptGenerationsCapabilityCache();
+
+    const mockFetchSlow = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+            body: { ok: true, route: 'nanogpt-images-generations' },
+        });
+    };
+
+    // Check with 30ms timeout: will time out
+    const timedOut = await checkNanoGptGenerationsCapability({
+        fetch: mockFetchSlow,
+        getRequestHeaders: getMockHeaders,
+        timeoutMs: 30,
+    });
+    assert.strictEqual(timedOut.supported, false);
+    assert.strictEqual(timedOut.error.kind, DISPATCH_ERROR_CODES.TIMEOUT);
+
+    // Wait past the 80ms slow fetch completion
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // Subsequent check should NOT see cached true; it must run fetch
+    let subsequentRan = false;
+    const followUp = await checkNanoGptGenerationsCapability({
+        fetch: async () => {
+            subsequentRan = true;
+            return createMockResponse({
+                status: 200,
+                headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+                body: { ok: true, route: 'nanogpt-images-generations' },
+            });
+        },
+        getRequestHeaders: getMockHeaders,
+    });
+
+    assert.strictEqual(subsequentRan, true);
+    assert.strictEqual(followUp.cached, false);
+    assert.strictEqual(followUp.supported, true);
+});
+
+test('capability check: older interleaved check cannot overwrite newer cache state', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+
+    // Check 1 starts and delays
+    const check1Promise = checkNanoGptGenerationsCapability({
+        fetch: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            return createMockResponse({
+                status: 200,
+                headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+                body: { ok: true, route: 'nanogpt-images-generations' },
+            });
+        },
+        getRequestHeaders: getMockHeaders,
+    });
+
+    // Check 2 starts immediately after and fails fast
+    const check2Promise = checkNanoGptGenerationsCapability({
+        fetch: async () => createMockResponse({ status: 404, headers: {} }),
+        getRequestHeaders: getMockHeaders,
+        forceCheck: true,
+    });
+
+    const check2Result = await check2Promise;
+    assert.strictEqual(check2Result.supported, false);
+
+    // Wait for check 1 to finish
+    await check1Promise;
+
+    // Subsequent call must not be cached as true because check 1 was superseded
+    let fetchRan = false;
+    const verifyResult = await checkNanoGptGenerationsCapability({
+        fetch: async () => {
+            fetchRan = true;
+            return createMockResponse({ status: 500, headers: {} });
+        },
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(fetchRan, true);
+    assert.strictEqual(verifyResult.cached, false);
+});
+
+test('capability check: cleanly removes abort listeners from caller signal', async () => {
+    clearNanoGptImagesCapabilityCache();
+    const { signal, getAddedCount, getRemovedCount } = createTrackedController();
+
+    const mockFetch = async () => createMockResponse({
+        status: 200,
+        headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_MARKER_VALUE },
+        body: { ok: true, route: 'nanogpt-images' },
+    });
+
+    const result = await checkNanoGptImagesCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+        signal,
+    });
+
+    assert.strictEqual(result.supported, true);
+    assert.strictEqual(getAddedCount(), 1);
+    assert.strictEqual(getRemovedCount(), 1);
+});
+
+test('capability check: unknown options return static error message for both routes', async () => {
+    const norm = await checkNanoGptImagesCapability({
+        fetch: async () => {},
+        getRequestHeaders: getMockHeaders,
+        unexpectedOption: 'xyz',
+    });
+    assert.strictEqual(norm.supported, false);
+    assert.strictEqual(norm.error.kind, DISPATCH_ERROR_CODES.INVALID_DISPATCH_OPTIONS);
+    assert.strictEqual(norm.error.message, 'Unknown option provided to capability check.');
+
+    const compat = await checkNanoGptGenerationsCapability({
+        fetch: async () => {},
+        getRequestHeaders: getMockHeaders,
+        anotherBogusOption: 123,
+    });
+    assert.strictEqual(compat.supported, false);
+    assert.strictEqual(compat.error.kind, DISPATCH_ERROR_CODES.INVALID_DISPATCH_OPTIONS);
+    assert.strictEqual(compat.error.message, 'Unknown option provided to capability check.');
+});
+
 

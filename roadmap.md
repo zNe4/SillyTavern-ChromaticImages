@@ -365,8 +365,8 @@ Implemented scope:
   - Proxy marker: `x-st-nanogpt-proxy: v1-compat`.
   - Upstream target: `POST https://api.nano-gpt.com/api/v1/images/generations` with `redirect: 'error'`.
   - Strict payload validation: `model === 'qwen-image'`, trimmed prompt 1..3000 UTF-16 code units, `nImages === 1` (rejects `n` and other aliases), 7 allowed resolutions, `response_format === 'b64_json'`, mutually exclusive `imageDataUrl` (1 reference) vs `imageDataUrls` (2-3 references) with authentic PNG/JPEG/WebP magic bytes and $\le 30$ MiB aggregate decoded bytes.
-  - Safeguards: 50 MB local application payload limit (HTTP 413), 50 MB upstream response ceiling with stream counting via `Transform` (HTTP 502), client disconnect abort propagation, and zero sensitive body logging.
-  - SillyTavern unit test suite: 25 comprehensive tests in `tests/stable-diffusion.test.js` (total 50 suite tests passing).
+  - Safeguards: 120s operation deadline (`DEFAULT_NANOGPT_GENERATIONS_TIMEOUT_MS = 120000`, configurable via `setNanoGptGenerationsTimeoutMs`), 50 MB local application payload limit (HTTP 413), strict Content-Length regex validation, 50 MB upstream response ceiling with stream counting via `Transform` (HTTP 502), client disconnect abort propagation, non-2xx upstream error body sanitization with body destruction, and static category console logging with zero raw error reflection.
+  - SillyTavern unit test suite: 35 tests in compatibility block in `tests/stable-diffusion.test.js` (total 60 suite tests passing).
 - Chromatic Images compatibility request builder (`src/providers/nanogpt-qwen-compat-request.js`):
   - Pure function `buildQwenImageCompatibilityRequest(options)`.
   - Maps references to `imageDataUrl` (1 ref) or `imageDataUrls` (2-3 refs), enforces bounds, and validates data URLs.
@@ -376,7 +376,8 @@ Implemented scope:
   - `clearNanoGptGenerationsCapabilityCache()` clearing only the compatibility cache.
   - `createNanoGptGenerationsDispatch(dependencies)` targeting `POST /api/sd/nanogpt/images/generations`.
   - `sendProductionNanoGptGenerationsRequest(options)` with pre-flight checks, timeout budgeting, and universal `v1-compat` marker verification wrapping default or custom dispatches.
-  - Unit tests: 15 compatibility dispatch tests in `tests/nanogpt-image-dispatch.test.mjs` (total 64 suite tests passing).
+  - Lifecycle & caching guarantees: pre-abort precedence over cache hit, failed forced recheck invalidation of positive cache for both routes, sequential operation counter preventing late-resolving stale operations from mutating cache, clean removal of internal and caller abort listeners in `finally`, static unknown option errors.
+  - Unit tests: 22 compatibility dispatch and capability lifecycle tests in `tests/nanogpt-image-dispatch.test.mjs` (total 71 suite tests passing, 620 project tests overall).
 - Isolation: normalized route (`v1`) and compatibility route (`v1-compat`) never share cache state or accept each other's markers.
 - Boundaries: zero paid calls, no diagnostic generation UI, no image generation.
 

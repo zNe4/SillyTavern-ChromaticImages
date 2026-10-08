@@ -481,8 +481,8 @@ Captured vendor evidence (NanoGPT Studio export `schema_version: media-integrati
 - Server proxy contract (SillyTavern `m03-d2b1-nanogpt-proxy` branch):
   - Routes: `GET /api/sd/nanogpt/images/generations` and `POST /api/sd/nanogpt/images/generations`
   - Marker: `x-st-nanogpt-proxy: v1-compat`
-  - Upstream request configuration: `redirect: 'error'`, `signal: abortController.signal`, `Content-Length` header forwarded
-  - Safeguards: 50 MB local application payload limit (HTTP 413), 50 MB upstream response ceiling with stream counting via `Transform` (HTTP 502), client disconnect abort forwarding, zero sensitive body logging
+  - Upstream request configuration: `redirect: 'error'`, `signal: abortController.signal`, `Content-Length` header forwarded with strict integer regex validation
+  - Safeguards: 120s default operation deadline (`DEFAULT_NANOGPT_GENERATIONS_TIMEOUT_MS = 120000`, test-configurable via `setNanoGptGenerationsTimeoutMs`) returning HTTP 504 on expiry and aborting upstream fetch/stream, 50 MB local application payload limit (HTTP 413), 50 MB upstream response ceiling with stream counting via `Transform` (HTTP 502), client disconnect abort forwarding, sanitization of non-2xx upstream error bodies to static `{ error: 'Upstream image generation failed.' }` with body disposal, and static category console error logging with zero error message/cause reflection
 - Client builder (`src/providers/nanogpt-qwen-compat-request.js`):
   - Pure function `buildQwenImageCompatibilityRequest(options)`
   - Rejects unknown options, enforces model and prompt bounds, maps references deterministically: 0 refs -> neither, 1 ref -> `imageDataUrl`, 2..3 refs -> `imageDataUrls`
@@ -491,7 +491,7 @@ Captured vendor evidence (NanoGPT Studio export `schema_version: media-integrati
   - `clearNanoGptGenerationsCapabilityCache()`: clears isolated session-memory cache `cachedGenerationsCapabilitySupported`
   - `createNanoGptGenerationsDispatch(dependencies)`: constructs low-level POST dispatch targeting `/api/sd/nanogpt/images/generations`
   - `sendProductionNanoGptGenerationsRequest(options)`: production service with pre-flight validation, capability checking, remaining timeout budgeting, universal `v1-compat` marker verification wrapping default or custom dispatches, and conservative billing uncertainty preservation
-  - Cache and marker isolation: normalized route (`v1`) and compatibility route (`v1-compat`) maintain completely independent positive capability caches and strictly fail closed if presented with the other route's marker
+  - Cache and lifecycle guarantees: caller pre-abort precedes positive capability cache hits, failed forced rechecks invalidate prior positive cache state for both routes, sequential operation counter prevents late-resolving stale operations from mutating cache, internal and caller abort listeners are cleanly cleaned up in `finally`, static error messages on invalid options, and normalized route (`v1`) and compatibility route (`v1-compat`) maintain completely independent positive capability caches and strictly fail closed if presented with the other route's marker
 
 #### M03-G2 — Diagnostic Image Generation & Settings UI Wiring
 
