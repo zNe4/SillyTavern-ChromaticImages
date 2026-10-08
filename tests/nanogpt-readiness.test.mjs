@@ -40,6 +40,7 @@ test('1. Options preflight: rejects invalid options shapes and unknown keys', as
     const unknownOptResult = await checkNanoGptCredentialReadiness({ ...mockDeps, unknownKey: true });
     assert.strictEqual(unknownOptResult.status, CREDENTIAL_STATUS.UNAVAILABLE);
     assert.strictEqual(unknownOptResult.error?.kind, CREDENTIAL_ERROR_CODES.INVALID_OPTIONS);
+    assert.strictEqual(unknownOptResult.error?.message, 'Unknown credential readiness option.');
 
     const invalidTimeoutResult = await checkNanoGptCredentialReadiness({ ...mockDeps, timeoutMs: -5 });
     assert.strictEqual(invalidTimeoutResult.status, CREDENTIAL_STATUS.UNAVAILABLE);
@@ -380,5 +381,160 @@ test('20. Privacy Invariant: secret descriptors and keys never leak into return 
         console.log = origLog;
         console.debug = origDebug;
         console.error = origError;
+    }
+});
+
+test('21. Privacy Invariant: sentinel sensitive strings in thrown exceptions and invalid options never leak', async () => {
+    const origLog = console.log;
+    const origWarn = console.warn;
+    const origError = console.error;
+    const origDebug = console.debug;
+    const loggedMessages = [];
+
+    const intercept = (...args) => {
+        loggedMessages.push(args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' '));
+    };
+
+    try {
+        console.log = intercept;
+        console.warn = intercept;
+        console.error = intercept;
+        console.debug = intercept;
+
+        const SENTINEL_SECRET = 'SENTINEL_SECRET_TOKEN_ABC123_XYZ789';
+
+        // Case A: Sentinel in unknown option key
+        const optResult = await checkNanoGptCredentialReadiness({
+            fetch: async () => createMockResponse(200, { [NANOGPT_SECRET_KEY]: null }),
+            getRequestHeaders: () => ({}),
+            [SENTINEL_SECRET]: 'sensitive-val',
+        });
+        assert.strictEqual(optResult.status, CREDENTIAL_STATUS.UNAVAILABLE);
+        assert.strictEqual(optResult.error?.message, 'Unknown credential readiness option.');
+        assert.doesNotMatch(JSON.stringify(optResult), new RegExp(SENTINEL_SECRET));
+
+        // Case B: Sentinel in thrown fetch error
+        const fetchResult = await checkNanoGptCredentialReadiness({
+            fetch: async () => {
+                throw new Error(`Failed with sensitive ${SENTINEL_SECRET}`);
+            },
+            getRequestHeaders: () => ({}),
+        });
+        assert.strictEqual(fetchResult.status, CREDENTIAL_STATUS.UNAVAILABLE);
+        assert.strictEqual(fetchResult.error?.kind, CREDENTIAL_ERROR_CODES.NETWORK_ERROR);
+        assert.doesNotMatch(JSON.stringify(fetchResult), new RegExp(SENTINEL_SECRET));
+
+        // Case C: Sentinel in thrown JSON parse error
+        const jsonResult = await checkNanoGptCredentialReadiness({
+            fetch: async () => ({
+                status: 200,
+                async json() {
+                    throw new Error(`JSON failed with sensitive ${SENTINEL_SECRET}`);
+                },
+            }),
+            getRequestHeaders: () => ({}),
+        });
+        assert.strictEqual(jsonResult.status, CREDENTIAL_STATUS.UNAVAILABLE);
+        assert.strictEqual(jsonResult.error?.kind, CREDENTIAL_ERROR_CODES.MALFORMED_RESPONSE);
+        assert.doesNotMatch(JSON.stringify(jsonResult), new RegExp(SENTINEL_SECRET));
+
+        // Verify zero console logs captured the sentinel
+        for (const msg of loggedMessages) {
+            assert.doesNotMatch(msg, new RegExp(SENTINEL_SECRET));
+        }
+    } finally {
+        console.log = origLog;
+        console.warn = origWarn;
+        console.error = origError;
+        console.debug = origDebug;
+    }
+});
+
+test('22. Lifecycle cleanup: caller abort listener and timers are cleaned up across all exit paths', async () => {
+    function createTrackedSignal() {
+        const controller = new AbortController();
+        let listenerCount = 0;
+        const origAdd = controller.signal.addEventListener.bind(controller.signal);
+        const origRemove = controller.signal.removeEventListener.bind(controller.signal);
+
+        controller.signal.addEventListener = (event, handler, options) => {
+            listenerCount += 1;
+            return origAdd(event, handler, options);
+        };
+        controller.signal.removeEventListener = (event, handler, options) => {
+            listenerCount -= 1;
+            return origRemove(event, handler, options);
+        };
+
+        return {
+            controller,
+            signal: controller.signal,
+            getListenerCount: () => listenerCount,
+        };
+    }
+
+    // 1. Success exit path
+    {
+        const tracked = createTrackedSignal();
+        const res = await checkNanoGptCredentialReadiness({
+            fetch: async () => createMockResponse(200, { [NANOGPT_SECRET_KEY]: null }),
+            getRequestHeaders: () => ({}),
+            signal: tracked.signal,
+        });
+        assert.strictEqual(res.status, CREDENTIAL_STATUS.NOT_CONFIGURED);
+        assert.strictEqual(tracked.getListenerCount(), 0);
+    }
+
+    // 2. HTTP error exit path
+    {
+        const tracked = createTrackedSignal();
+        const res = await checkNanoGptCredentialReadiness({
+            fetch: async () => createMockResponse(500, {}),
+            getRequestHeaders: () => ({}),
+            signal: tracked.signal,
+        });
+        assert.strictEqual(res.status, CREDENTIAL_STATUS.UNAVAILABLE);
+        assert.strictEqual(tracked.getListenerCount(), 0);
+    }
+
+    // 3. Network error exit path
+    {
+        const tracked = createTrackedSignal();
+        const res = await checkNanoGptCredentialReadiness({
+            fetch: async () => {
+                throw new Error('Network failed');
+            },
+            getRequestHeaders: () => ({}),
+            signal: tracked.signal,
+        });
+        assert.strictEqual(res.status, CREDENTIAL_STATUS.UNAVAILABLE);
+        assert.strictEqual(tracked.getListenerCount(), 0);
+    }
+
+    // 4. Timeout exit path
+    {
+        const tracked = createTrackedSignal();
+        const res = await checkNanoGptCredentialReadiness({
+            fetch: async () => new Promise(() => {}),
+            getRequestHeaders: () => ({}),
+            signal: tracked.signal,
+            timeoutMs: 30,
+        });
+        assert.strictEqual(res.status, CREDENTIAL_STATUS.UNAVAILABLE);
+        assert.strictEqual(tracked.getListenerCount(), 0);
+    }
+
+    // 5. Caller cancellation exit path
+    {
+        const tracked = createTrackedSignal();
+        const resPromise = checkNanoGptCredentialReadiness({
+            fetch: async () => new Promise((resolve) => setTimeout(resolve, 100)),
+            getRequestHeaders: () => ({}),
+            signal: tracked.signal,
+        });
+        tracked.controller.abort();
+        const res = await resPromise;
+        assert.strictEqual(res.status, CREDENTIAL_STATUS.CANCELLED);
+        assert.strictEqual(tracked.getListenerCount(), 0);
     }
 });

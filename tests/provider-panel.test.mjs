@@ -453,24 +453,84 @@ test('12. Single-flight lock ignores repeated clicks while check is running', as
     assert.strictEqual(fake.elements.runBtn.textContent, 'Check local setup');
 });
 
-test('13. Probe exception resilience: unexpected throw in one probe fails safely without freezing UI', async () => {
-    const fake = createFakePanel();
+test('13. Probe exception resilience: unexpected throw in probe fails safely without logging secrets or freezing UI', async () => {
+    const origLog = console.log;
+    const origWarn = console.warn;
+    const origError = console.error;
+    const origDebug = console.debug;
+    const loggedMessages = [];
 
-    refreshProviderPanel(fake, {
-        checkNanoGptCredentialReadiness: async () => {
-            throw new Error('Unexpected credential probe explosion');
-        },
-        checkNanoGptImagesCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
-    });
+    const intercept = (...args) => {
+        loggedMessages.push(args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' '));
+    };
 
-    fake.elements.runBtn.click();
-    await delay();
+    try {
+        console.log = intercept;
+        console.warn = intercept;
+        console.error = intercept;
+        console.debug = intercept;
 
-    // Credential safely fails to Unavailable, proxy succeeds independently
-    assert.strictEqual(fake.elements.credentialStatus.textContent, 'Unavailable');
-    assert.strictEqual(fake.elements.proxyStatus.textContent, 'Available');
-    assert.strictEqual(fake.elements.runBtn.disabled, false);
-    assert.strictEqual(fake.elements.runBtn.textContent, 'Check local setup');
+        const SENTINEL_SECRET = 'SENTINEL_PANEL_SECRET_TOKEN_445566';
+        const fake = createFakePanel();
+
+        // Sub-test A: Credential probe throws with sensitive sentinel, proxy probe succeeds
+        refreshProviderPanel(fake, {
+            checkNanoGptCredentialReadiness: async () => {
+                const err = new Error(`Secret crash: ${SENTINEL_SECRET}`);
+                err.secretKey = SENTINEL_SECRET;
+                throw err;
+            },
+            checkNanoGptImagesCapability: async () => ({
+                supported: true,
+                cached: false,
+                status: 200,
+                error: null,
+            }),
+        });
+
+        fake.elements.runBtn.click();
+        await delay();
+
+        // Credential safely fails to Unavailable, proxy succeeds independently
+        assert.strictEqual(fake.elements.credentialStatus.textContent, 'Unavailable');
+        assert.strictEqual(fake.elements.proxyStatus.textContent, 'Available');
+        assert.strictEqual(fake.elements.runBtn.disabled, false);
+        assert.strictEqual(fake.elements.runBtn.textContent, 'Check local setup');
+
+        // Sub-test B: Proxy probe throws with sensitive sentinel, credential probe succeeds
+        refreshProviderPanel(fake, {
+            checkNanoGptCredentialReadiness: async () => ({
+                status: CREDENTIAL_STATUS.CONFIGURED,
+                error: null,
+            }),
+            checkNanoGptImagesCapability: async () => {
+                const err = new Error(`Proxy crash: ${SENTINEL_SECRET}`);
+                err.secretKey = SENTINEL_SECRET;
+                throw err;
+            },
+        });
+
+        fake.elements.runBtn.click();
+        await delay();
+
+        assert.strictEqual(fake.elements.credentialStatus.textContent, 'Configured');
+        assert.strictEqual(fake.elements.proxyStatus.textContent, 'Unavailable');
+        assert.strictEqual(fake.elements.runBtn.disabled, false);
+
+        // Verify zero console logs captured the sentinel string
+        for (const msg of loggedMessages) {
+            assert.doesNotMatch(msg, new RegExp(SENTINEL_SECRET));
+        }
+
+        // Verify DOM elements never received the sentinel string
+        assert.doesNotMatch(fake.elements.summary.textContent, new RegExp(SENTINEL_SECRET));
+        assert.doesNotMatch(fake.elements.feedback.textContent, new RegExp(SENTINEL_SECRET));
+    } finally {
+        console.log = origLog;
+        console.warn = origWarn;
+        console.error = origError;
+        console.debug = origDebug;
+    }
 });
 
 test('14. Neutral cancellation outcome: restores UI to Not checked and re-enables button', async () => {
@@ -498,30 +558,117 @@ test('14. Neutral cancellation outcome: restores UI to Not checked and re-enable
     assert.strictEqual(fake.elements.runBtn.textContent, 'Check local setup');
 });
 
-test('15. Lifecycle invalidation: panel detachment during active check discards results without mutating detached DOM', async () => {
-    const fake = createFakePanel();
-    let finishCred;
-    const credPromise = new Promise((resolve) => { finishCred = resolve; });
+test('15. Lifecycle invalidation & detachment cleanup: handles detachment, aborts signal, cleans observer, and allows reattached recovery', async () => {
+    const origMutationObserver = globalThis.MutationObserver;
+    const origDocument = globalThis.document;
 
-    refreshProviderPanel(fake, {
-        checkNanoGptCredentialReadiness: async () => {
-            await credPromise;
-            return { status: CREDENTIAL_STATUS.CONFIGURED, error: null };
-        },
-        checkNanoGptImagesCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
-    });
+    class MockMutationObserver {
+        static instances = [];
+        constructor(callback) {
+            this.callback = callback;
+            this.observedTargets = [];
+            this.disconnected = false;
+            MockMutationObserver.instances.push(this);
+        }
+        observe(target, options) {
+            this.observedTargets.push({ target, options });
+        }
+        disconnect() {
+            this.disconnected = true;
+        }
+        trigger(records = [{ type: 'childList' }]) {
+            if (!this.disconnected) {
+                this.callback(records, this);
+            }
+        }
+    }
 
-    fake.elements.runBtn.click();
-    assert.strictEqual(fake.elements.credentialStatus.textContent, 'Checking…');
+    try {
+        globalThis.MutationObserver = MockMutationObserver;
+        globalThis.document = { body: {} };
 
-    // Simulate panel detachment while check is in flight
-    fake.isConnected = false;
+        const fake = createFakePanel();
+        fake.isConnected = true;
 
-    finishCred();
-    await delay();
+        let finishOldCred;
+        const oldCredPromise = new Promise((resolve) => { finishOldCred = resolve; });
+        let capturedSignal1 = null;
 
-    // Detached panel DOM should not have been updated with Configured result
-    assert.strictEqual(fake.elements.credentialStatus.textContent, 'Checking…');
+        refreshProviderPanel(fake, {
+            checkNanoGptCredentialReadiness: async ({ signal }) => {
+                capturedSignal1 = signal;
+                await oldCredPromise;
+                return { status: CREDENTIAL_STATUS.CONFIGURED, error: null };
+            },
+            checkNanoGptImagesCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+        });
+
+        // 1. Diagnostic click starts check
+        fake.elements.runBtn.click();
+        assert.strictEqual(fake.elements.runBtn.disabled, true);
+        assert.strictEqual(fake.elements.runBtn.textContent, 'Checking setup…');
+        assert.strictEqual(fake.elements.credentialStatus.textContent, 'Checking…');
+        assert.strictEqual(capturedSignal1?.aborted, false);
+        assert.strictEqual(MockMutationObserver.instances.length, 1);
+        const observer = MockMutationObserver.instances[0];
+
+        // 2. Panel detaches during pending diagnostic; MutationObserver triggers
+        fake.isConnected = false;
+        observer.trigger();
+
+        // Active AbortSignal becomes aborted
+        assert.strictEqual(capturedSignal1.aborted, true);
+        // Observer cleanup occurs
+        assert.strictEqual(observer.disconnected, true);
+
+        // 3. Late results from old check settle
+        finishOldCred();
+        await delay();
+
+        // Late results do not mutate detached elements
+        assert.strictEqual(fake.elements.credentialStatus.textContent, 'Checking…');
+        assert.strictEqual(fake.elements.proxyStatus.textContent, 'Checking…');
+
+        // 4. Same panel is reattached and refreshed
+        fake.isConnected = true;
+        let capturedSignal2 = null;
+        let finishNewCred;
+        const newCredPromise = new Promise((resolve) => { finishNewCred = resolve; });
+
+        refreshProviderPanel(fake, {
+            checkNanoGptCredentialReadiness: async ({ signal }) => {
+                capturedSignal2 = signal;
+                await newCredPromise;
+                return { status: CREDENTIAL_STATUS.CONFIGURED, error: null };
+            },
+            checkNanoGptImagesCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+        });
+
+        // Button does not remain permanently disabled; neutral state restored
+        assert.strictEqual(fake.elements.runBtn.disabled, false);
+        assert.strictEqual(fake.elements.runBtn.textContent, 'Check local setup');
+        assert.strictEqual(fake.elements.credentialStatus.textContent, 'Not checked');
+        assert.strictEqual(fake.elements.proxyStatus.textContent, 'Not checked');
+
+        // 5. New diagnostic click successfully starts a new check
+        fake.elements.runBtn.click();
+        assert.strictEqual(fake.elements.runBtn.disabled, true);
+        assert.strictEqual(fake.elements.runBtn.textContent, 'Checking setup…');
+        assert.strictEqual(capturedSignal2?.aborted, false);
+
+        // 6. Complete new check
+        finishNewCred();
+        await delay();
+
+        // Results of new check rendered successfully
+        assert.strictEqual(fake.elements.credentialStatus.textContent, 'Configured');
+        assert.strictEqual(fake.elements.proxyStatus.textContent, 'Available');
+        assert.strictEqual(fake.elements.runBtn.disabled, false);
+        assert.strictEqual(fake.elements.runBtn.textContent, 'Check local setup');
+    } finally {
+        globalThis.MutationObserver = origMutationObserver;
+        globalThis.document = origDocument;
+    }
 });
 
 test('16. settings.html template contains all required provider and diagnostic elements', () => {

@@ -433,7 +433,7 @@ Implemented nonsensitive provider settings and non-billable local diagnostic con
 - **Settings schema & persistence:**
   - Persisted namespace: `extensionSettings.chromatic_images = { resolution: 'auto' }`.
   - `readProviderSettings(extensionSettings)`: pure snapshot reader defaulting safely to `{ resolution: 'auto' }` without mutating or saving.
-  - `updateProviderResolution(extensionSettings, newResolution)`: schema-safe controlled mutator that validates against allowed resolutions (`auto`, `1:1`, `4:3`, `3:4`, `16:9`, `9:16`), replaces the namespace with a fresh object containing only `{ resolution: validatedResolution }`, strips unknown fields (e.g. `apiKey`, `prompt`), and saves exactly once per genuine change via `saveSettingsDebounced()`.
+  - `updateProviderResolution(extensionSettings, newResolution)`: schema-safe controlled mutator that validates against allowed resolutions (`auto`, `1024x1024`, `512x512`, `768x1024`, `576x1024`, `1024x768`, `1024x576`), replaces the namespace with a fresh object containing only `{ resolution: validatedResolution }`, strips unknown fields (e.g. `apiKey`, `prompt`), and saves exactly once per genuine change via `saveSettingsDebounced()`.
   - Read-only display: Provider is fixed to NanoGPT, model is fixed to `qwen-image`, 1 output per request, maximum 3 reference images.
 - **Credential readiness probe (`src/providers/nanogpt-readiness.js`):**
   - Route: `POST /api/secrets/read` using `getRequestHeaders({ omitContentType: true })`. Never requests raw key endpoints (`/api/secrets/find` or `/api/secrets/view`).
@@ -452,9 +452,15 @@ Implemented nonsensitive provider settings and non-billable local diagnostic con
   - Reuses M03-D2B2 `checkNanoGptImagesCapability({ forceCheck: true })` from `src/providers/nanogpt-image-dispatch.js`.
   - Maps missing proxy (HTTP 404 / `sillytavern-update-required`) to `"Update required"`.
 - **UI DOM controller (`src/provider-panel.js`):**
-  - Managed elements: `#chromatic-images-resolution-select`, `#chromatic-images-check-readiness-btn`, `#chromatic-images-credential-status-badge`, `#chromatic-images-proxy-status-badge`, and `#chromatic-images-diagnostic-summary`.
+  - Managed elements:
+    - `chromatic-images-resolution-select`
+    - `chromatic-images-diagnostics-run`
+    - `chromatic-images-credential-status`
+    - `chromatic-images-proxy-status`
+    - `chromatic-images-diagnostics-summary`
+    - `chromatic-images-diagnostics-feedback`
   - Lifecycle: `WeakMap` per-panel state tracking, single-flight click locking, generation token invalidation, and scoped `MutationObserver` on `document.body` to abort in-flight probes if the panel is detached.
-  - Safe error handling: `Promise.all` wrapped safely so individual probe failures never crash the UI or leave the button locked.
+  - Safe error handling: `Promise.all` wrapped safely so unexpected probe errors fail closed without logging sensitive exception objects or crashing the UI.
   - Neutral cancellation recovery: aborted probes restore badges to neutral `"Not checked"` state without writing failure summaries.
 - **Boundaries:** Zero paid requests, zero calls to `/api/sd/nanogpt/images` POST or `https://api.nano-gpt.com/*`, no proposal-card Generate wiring. M03-G remains the authorized diagnostic generation boundary.
 

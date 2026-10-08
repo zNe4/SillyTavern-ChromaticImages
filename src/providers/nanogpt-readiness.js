@@ -83,7 +83,7 @@ function validateReadinessOptions(options) {
                 ok: false,
                 error: {
                     kind: CREDENTIAL_ERROR_CODES.INVALID_OPTIONS,
-                    message: `Unknown option '${key}' provided to credential readiness check.`,
+                    message: 'Unknown credential readiness option.',
                 },
             };
         }
@@ -289,6 +289,7 @@ export async function checkNanoGptCredentialReadiness(options = {}) {
     let cancelled = false;
     let timerHandle = null;
     let callerAbortHandler = null;
+    let internalAbortHandler = null;
 
     const internalController = new AbortController();
 
@@ -321,15 +322,16 @@ export async function checkNanoGptCredentialReadiness(options = {}) {
                 }
                 return;
             }
+            internalAbortHandler = () => {
+                if (timedOut) {
+                    reject({ kind: CREDENTIAL_ERROR_CODES.TIMEOUT });
+                } else {
+                    reject({ kind: CREDENTIAL_ERROR_CODES.CANCELLED });
+                }
+            };
             internalController.signal.addEventListener(
                 'abort',
-                () => {
-                    if (timedOut) {
-                        reject({ kind: CREDENTIAL_ERROR_CODES.TIMEOUT });
-                    } else {
-                        reject({ kind: CREDENTIAL_ERROR_CODES.CANCELLED });
-                    }
-                },
+                internalAbortHandler,
                 { once: true },
             );
         });
@@ -426,6 +428,13 @@ export async function checkNanoGptCredentialReadiness(options = {}) {
         if (options.signal && callerAbortHandler) {
             options.signal.removeEventListener('abort', callerAbortHandler);
             callerAbortHandler = null;
+        }
+        if (internalAbortHandler) {
+            internalController.signal.removeEventListener(
+                'abort',
+                internalAbortHandler,
+            );
+            internalAbortHandler = null;
         }
     }
 }

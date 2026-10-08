@@ -23,7 +23,6 @@ import {
     DIAGNOSTICS_FEEDBACK_ID,
     DIAGNOSTICS_RUN_BUTTON_ID,
     DIAGNOSTICS_SUMMARY_ID,
-    LOG_PREFIX,
     PROXY_STATUS,
     PROXY_STATUS_ID,
     RESOLUTION_SELECT_ID,
@@ -36,6 +35,28 @@ import { checkNanoGptCredentialReadiness } from './providers/nanogpt-readiness.j
 import { checkNanoGptImagesCapability } from './providers/nanogpt-image-dispatch.js';
 
 const panelStateMap = new WeakMap();
+
+/**
+ * Checks whether a panel element is currently attached to the active document.
+ *
+ * @param {ParentNode|null|undefined} p
+ * @returns {boolean}
+ */
+function isPanelAttached(p) {
+    if (!p) {
+        return false;
+    }
+    if (typeof p.isConnected === 'boolean') {
+        return p.isConnected;
+    }
+    if (
+        typeof document !== 'undefined' &&
+        typeof document.contains === 'function'
+    ) {
+        return document.contains(p);
+    }
+    return true;
+}
 
 /**
  * Clear existing feedback on the diagnostics feedback element.
@@ -180,6 +201,28 @@ export function refreshProviderPanel(panel, deps = {}) {
     const currentSettings = readSettingsFn(getExtSettings());
     resolutionSelect.value = currentSettings.resolution;
 
+    // Restore neutral UI state when panel is refreshed while not actively checking
+    if (!state.isChecking) {
+        diagnosticsRunBtn.disabled = false;
+        if (diagnosticsRunBtn.textContent === 'Checking setup…') {
+            diagnosticsRunBtn.textContent = 'Check local setup';
+        }
+        if (credentialStatusEl.textContent === 'Checking…') {
+            credentialStatusEl.textContent = 'Not checked';
+            setCredentialStatusAttr(
+                credentialStatusEl,
+                CREDENTIAL_STATUS.NOT_CHECKED,
+            );
+        }
+        if (proxyStatusEl.textContent === 'Checking…') {
+            proxyStatusEl.textContent = 'Not checked';
+            setProxyStatusAttr(proxyStatusEl, PROXY_STATUS.NOT_CHECKED);
+        }
+        if (summaryEl.textContent === 'Checking local setup…') {
+            summaryEl.textContent = 'Diagnostics not run yet.';
+        }
+    }
+
     // Attach listeners once
     if (!state.listenerAttached) {
         resolutionSelect.addEventListener('change', () => {
@@ -207,7 +250,7 @@ export function refreshProviderPanel(panel, deps = {}) {
             }
 
             // Guard against clicking while detached
-            if (panel.isConnected === false) {
+            if (!isPanelAttached(panel)) {
                 return;
             }
 
@@ -215,7 +258,8 @@ export function refreshProviderPanel(panel, deps = {}) {
             state.generationToken += 1;
             const currentGeneration = state.generationToken;
 
-            state.activeAbortController = new AbortController();
+            const controller = new AbortController();
+            state.activeAbortController = controller;
 
             // Set up scoped MutationObserver to detect panel detachment during active check
             let detachmentObserver = null;
@@ -225,8 +269,21 @@ export function refreshProviderPanel(panel, deps = {}) {
                 document.body
             ) {
                 detachmentObserver = new MutationObserver(() => {
-                    if (panel.isConnected === false) {
-                        state.activeAbortController?.abort();
+                    if (!isPanelAttached(panel)) {
+                        if (state.generationToken === currentGeneration) {
+                            state.generationToken += 1;
+                            state.isChecking = false;
+                            if (state.activeAbortController === controller) {
+                                state.activeAbortController = null;
+                            }
+                            if (
+                                state.activeDetachmentObserver ===
+                                detachmentObserver
+                            ) {
+                                state.activeDetachmentObserver = null;
+                            }
+                        }
+                        controller.abort();
                         if (detachmentObserver) {
                             detachmentObserver.disconnect();
                             detachmentObserver = null;
@@ -266,19 +323,16 @@ export function refreshProviderPanel(panel, deps = {}) {
                     return await credCheckFn({
                         fetch: activeDeps.fetch,
                         getRequestHeaders: activeDeps.getRequestHeaders,
-                        signal: state.activeAbortController.signal,
+                        signal: controller.signal,
                         timeoutMs: 5000,
                     });
-                } catch (error) {
-                    console.error(
-                        `${LOG_PREFIX} Credential readiness probe threw unexpectedly:`,
-                        error,
-                    );
+                } catch {
                     return {
                         status: CREDENTIAL_STATUS.UNAVAILABLE,
                         error: {
                             kind: 'unexpected-error',
-                            message: 'Credential readiness check failed unexpectedly.',
+                            message:
+                                'Credential readiness check failed unexpectedly.',
                         },
                     };
                 }
@@ -290,21 +344,18 @@ export function refreshProviderPanel(panel, deps = {}) {
                         fetch: activeDeps.fetch,
                         getRequestHeaders: activeDeps.getRequestHeaders,
                         forceCheck: true,
-                        signal: state.activeAbortController.signal,
+                        signal: controller.signal,
                         timeoutMs: 5000,
                     });
-                } catch (error) {
-                    console.error(
-                        `${LOG_PREFIX} Proxy capability probe threw unexpectedly:`,
-                        error,
-                    );
+                } catch {
                     return {
                         supported: false,
                         cached: false,
                         status: null,
                         error: {
                             kind: 'unexpected-error',
-                            message: 'Proxy capability check failed unexpectedly.',
+                            message:
+                                'Proxy capability check failed unexpectedly.',
                         },
                     };
                 }
@@ -317,131 +368,142 @@ export function refreshProviderPanel(panel, deps = {}) {
                     credProbe,
                     proxyProbe,
                 ]);
+
+                // Lifecycle invalidation check: discard results if superseded or panel detached
+                if (
+                    state.generationToken !== currentGeneration ||
+                    !isPanelAttached(panel)
+                ) {
+                    return;
+                }
+
+                // Still connected and current operation: re-enable button
+                diagnosticsRunBtn.disabled = false;
+                diagnosticsRunBtn.textContent = 'Check local setup';
+
+                // Neutral cancellation outcome: reset to 'Not checked'
+                if (
+                    credResult?.status === CREDENTIAL_STATUS.CANCELLED ||
+                    proxyResult?.error?.kind === 'cancelled' ||
+                    controller.signal.aborted
+                ) {
+                    credentialStatusEl.textContent = 'Not checked';
+                    setCredentialStatusAttr(
+                        credentialStatusEl,
+                        CREDENTIAL_STATUS.NOT_CHECKED,
+                    );
+                    proxyStatusEl.textContent = 'Not checked';
+                    setProxyStatusAttr(proxyStatusEl, PROXY_STATUS.NOT_CHECKED);
+                    summaryEl.textContent = 'Readiness check cancelled.';
+                    clearFeedback(feedbackEl);
+                    return;
+                }
+
+                // Render credential readiness status
+                const credStatus = credResult?.status;
+                if (credStatus === CREDENTIAL_STATUS.CONFIGURED) {
+                    credentialStatusEl.textContent = 'Configured';
+                    setCredentialStatusAttr(
+                        credentialStatusEl,
+                        CREDENTIAL_STATUS.CONFIGURED,
+                    );
+                } else if (credStatus === CREDENTIAL_STATUS.NOT_CONFIGURED) {
+                    credentialStatusEl.textContent = 'Not configured';
+                    setCredentialStatusAttr(
+                        credentialStatusEl,
+                        CREDENTIAL_STATUS.NOT_CONFIGURED,
+                    );
+                } else {
+                    credentialStatusEl.textContent = 'Unavailable';
+                    setCredentialStatusAttr(
+                        credentialStatusEl,
+                        CREDENTIAL_STATUS.UNAVAILABLE,
+                    );
+                }
+
+                // Render proxy capability status
+                const isProxyAvailable = proxyResult?.supported === true;
+                const isUpdateRequired =
+                    proxyResult?.error?.kind === 'sillytavern-update-required';
+
+                if (isProxyAvailable) {
+                    proxyStatusEl.textContent = 'Available';
+                    setProxyStatusAttr(proxyStatusEl, PROXY_STATUS.AVAILABLE);
+                } else if (isUpdateRequired) {
+                    proxyStatusEl.textContent = 'Update required';
+                    setProxyStatusAttr(
+                        proxyStatusEl,
+                        PROXY_STATUS.UPDATE_REQUIRED,
+                    );
+                } else {
+                    proxyStatusEl.textContent = 'Unavailable';
+                    setProxyStatusAttr(proxyStatusEl, PROXY_STATUS.UNAVAILABLE);
+                }
+
+                // User-visible summary and actionable feedback wording
+                if (
+                    credStatus === CREDENTIAL_STATUS.CONFIGURED &&
+                    isProxyAvailable
+                ) {
+                    summaryEl.textContent =
+                        'Local readiness checks passed: a NanoGPT credential is configured and the image proxy is available. This does not verify the API key or provider balance.';
+                    clearFeedback(feedbackEl);
+                } else if (
+                    credStatus === CREDENTIAL_STATUS.NOT_CONFIGURED &&
+                    isProxyAvailable
+                ) {
+                    summaryEl.textContent =
+                        'NanoGPT credential is not configured.';
+                    showFeedback(
+                        feedbackEl,
+                        'NanoGPT API key is not configured. Open SillyTavern API Connections (Secrets) to add your NanoGPT key.',
+                        'warning',
+                    );
+                } else if (
+                    credStatus === CREDENTIAL_STATUS.CONFIGURED &&
+                    isUpdateRequired
+                ) {
+                    summaryEl.textContent =
+                        'Local image proxy update required.';
+                    showFeedback(
+                        feedbackEl,
+                        'Local proxy route was not found. SillyTavern update required with normalized NanoGPT image support.',
+                        'warning',
+                    );
+                } else if (
+                    credStatus === CREDENTIAL_STATUS.NOT_CONFIGURED &&
+                    isUpdateRequired
+                ) {
+                    summaryEl.textContent =
+                        'Local setup requires attention.';
+                    showFeedback(
+                        feedbackEl,
+                        'Configure your NanoGPT key in SillyTavern Secrets and install the patched image proxy.',
+                        'error',
+                    );
+                } else {
+                    summaryEl.textContent =
+                        'Local readiness check failed.';
+                    showFeedback(
+                        feedbackEl,
+                        'Failed to complete diagnostics due to a local communication error. Check server console.',
+                        'error',
+                    );
+                }
             } finally {
                 if (detachmentObserver) {
                     detachmentObserver.disconnect();
                     detachmentObserver = null;
+                }
+                if (state.activeDetachmentObserver === detachmentObserver) {
                     state.activeDetachmentObserver = null;
                 }
-            }
-
-            // Lifecycle invalidation check: discard results if superseded or panel detached
-            if (
-                state.generationToken !== currentGeneration ||
-                panel.isConnected === false
-            ) {
-                return;
-            }
-
-            state.isChecking = false;
-            diagnosticsRunBtn.disabled = false;
-            diagnosticsRunBtn.textContent = 'Check local setup';
-
-            // Neutral cancellation outcome: reset to 'Not checked'
-            if (
-                credResult?.status === CREDENTIAL_STATUS.CANCELLED ||
-                proxyResult?.error?.kind === 'cancelled' ||
-                state.activeAbortController?.signal?.aborted
-            ) {
-                credentialStatusEl.textContent = 'Not checked';
-                setCredentialStatusAttr(
-                    credentialStatusEl,
-                    CREDENTIAL_STATUS.NOT_CHECKED,
-                );
-                proxyStatusEl.textContent = 'Not checked';
-                setProxyStatusAttr(proxyStatusEl, PROXY_STATUS.NOT_CHECKED);
-                summaryEl.textContent = 'Readiness check cancelled.';
-                clearFeedback(feedbackEl);
-                return;
-            }
-
-            // Render credential readiness status
-            const credStatus = credResult?.status;
-            if (credStatus === CREDENTIAL_STATUS.CONFIGURED) {
-                credentialStatusEl.textContent = 'Configured';
-                setCredentialStatusAttr(
-                    credentialStatusEl,
-                    CREDENTIAL_STATUS.CONFIGURED,
-                );
-            } else if (credStatus === CREDENTIAL_STATUS.NOT_CONFIGURED) {
-                credentialStatusEl.textContent = 'Not configured';
-                setCredentialStatusAttr(
-                    credentialStatusEl,
-                    CREDENTIAL_STATUS.NOT_CONFIGURED,
-                );
-            } else {
-                credentialStatusEl.textContent = 'Unavailable';
-                setCredentialStatusAttr(
-                    credentialStatusEl,
-                    CREDENTIAL_STATUS.UNAVAILABLE,
-                );
-            }
-
-            // Render proxy capability status
-            const isProxyAvailable = proxyResult?.supported === true;
-            const isUpdateRequired =
-                proxyResult?.error?.kind === 'sillytavern-update-required';
-
-            if (isProxyAvailable) {
-                proxyStatusEl.textContent = 'Available';
-                setProxyStatusAttr(proxyStatusEl, PROXY_STATUS.AVAILABLE);
-            } else if (isUpdateRequired) {
-                proxyStatusEl.textContent = 'Update required';
-                setProxyStatusAttr(proxyStatusEl, PROXY_STATUS.UPDATE_REQUIRED);
-            } else {
-                proxyStatusEl.textContent = 'Unavailable';
-                setProxyStatusAttr(proxyStatusEl, PROXY_STATUS.UNAVAILABLE);
-            }
-
-            // User-visible summary and actionable feedback wording
-            if (
-                credStatus === CREDENTIAL_STATUS.CONFIGURED &&
-                isProxyAvailable
-            ) {
-                summaryEl.textContent =
-                    'Local readiness checks passed: a NanoGPT credential is configured and the image proxy is available. This does not verify the API key or provider balance.';
-                clearFeedback(feedbackEl);
-            } else if (
-                credStatus === CREDENTIAL_STATUS.NOT_CONFIGURED &&
-                isProxyAvailable
-            ) {
-                summaryEl.textContent =
-                    'NanoGPT credential is not configured.';
-                showFeedback(
-                    feedbackEl,
-                    'NanoGPT API key is not configured. Open SillyTavern API Connections (Secrets) to add your NanoGPT key.',
-                    'warning',
-                );
-            } else if (
-                credStatus === CREDENTIAL_STATUS.CONFIGURED &&
-                isUpdateRequired
-            ) {
-                summaryEl.textContent =
-                    'Local image proxy update required.';
-                showFeedback(
-                    feedbackEl,
-                    'Local proxy route was not found. SillyTavern update required with normalized NanoGPT image support.',
-                    'warning',
-                );
-            } else if (
-                credStatus === CREDENTIAL_STATUS.NOT_CONFIGURED &&
-                isUpdateRequired
-            ) {
-                summaryEl.textContent =
-                    'Local setup requires attention.';
-                showFeedback(
-                    feedbackEl,
-                    'Configure your NanoGPT key in SillyTavern Secrets and install the patched image proxy.',
-                    'error',
-                );
-            } else {
-                summaryEl.textContent =
-                    'Local readiness check failed.';
-                showFeedback(
-                    feedbackEl,
-                    'Failed to complete diagnostics due to a local communication error. Check server console.',
-                    'error',
-                );
+                if (state.activeAbortController === controller) {
+                    state.activeAbortController = null;
+                }
+                if (state.generationToken === currentGeneration) {
+                    state.isChecking = false;
+                }
             }
         });
 
