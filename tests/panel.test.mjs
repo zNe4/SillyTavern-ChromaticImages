@@ -388,3 +388,83 @@ test('H. refreshPanelState refreshes Regex UI when panel contains regex elements
     }
 });
 
+test('I. refreshPanelState refreshes both Regex and Provider UI sections safely without network or saves', () => {
+    const origDoc = globalThis.document;
+    const origST = globalThis.SillyTavern;
+
+    try {
+        let saveCalls = 0;
+        const extensionSettings = {
+            regex: [],
+            chromatic_images: { resolution: '768x1024' },
+        };
+
+        globalThis.SillyTavern = {
+            getContext() {
+                return {
+                    extensionSettings,
+                    saveSettingsDebounced() {
+                        saveCalls += 1;
+                    },
+                };
+            },
+        };
+
+        const panel = createMockElement(PANEL_ID);
+        const drawerToggle = createMockElement(PANEL_DRAWER_TOGGLE_ID, 'button');
+        panel.drawerToggle = drawerToggle;
+
+        // Regex elements
+        panel.setChild('#chromatic-images-regex-prompt-hygiene-status', createMockElement('chromatic-images-regex-prompt-hygiene-status'));
+        panel.setChild('#chromatic-images-regex-summary', createMockElement('chromatic-images-regex-summary'));
+        panel.setChild('#chromatic-images-regex-repair', createMockElement('chromatic-images-regex-repair', 'button'));
+        panel.setChild('#chromatic-images-regex-feedback', createMockElement('chromatic-images-regex-feedback'));
+
+        // Provider elements
+        const resolutionSelect = createMockElement('chromatic-images-resolution-select', 'select');
+        const diagnosticsBtn = createMockElement('chromatic-images-diagnostics-run', 'button');
+        const credStatus = createMockElement('chromatic-images-credential-status');
+        credStatus.textContent = 'Not checked';
+        const proxyStatus = createMockElement('chromatic-images-proxy-status');
+        proxyStatus.textContent = 'Not checked';
+        const diagSummary = createMockElement('chromatic-images-diagnostics-summary');
+        diagSummary.textContent = 'Diagnostics not run yet.';
+        const diagFeedback = createMockElement('chromatic-images-diagnostics-feedback');
+
+        panel.setChild('#chromatic-images-resolution-select', resolutionSelect);
+        panel.setChild('#chromatic-images-diagnostics-run', diagnosticsBtn);
+        panel.setChild('#chromatic-images-credential-status', credStatus);
+        panel.setChild('#chromatic-images-proxy-status', proxyStatus);
+        panel.setChild('#chromatic-images-diagnostics-summary', diagSummary);
+        panel.setChild('#chromatic-images-diagnostics-feedback', diagFeedback);
+
+        globalThis.document = {
+            getElementById(id) {
+                if (id === PANEL_ID) {
+                    return panel;
+                }
+                return null;
+            },
+        };
+
+        refreshPanelState();
+
+        // Verifies provider settings synchronization
+        assert.equal(resolutionSelect.value, '768x1024');
+        assert.equal(credStatus.textContent, 'Not checked');
+        assert.equal(proxyStatus.textContent, 'Not checked');
+        assert.equal(diagnosticsBtn.disabled, false);
+        assert.equal(saveCalls, 0);
+
+        // Repeated refresh does not duplicate listeners or save
+        refreshPanelState();
+        refreshPanelState();
+        assert.equal(resolutionSelect.getListeners('change').length, 1);
+        assert.equal(diagnosticsBtn.getListeners('click').length, 1);
+        assert.equal(saveCalls, 0);
+    } finally {
+        globalThis.document = origDoc;
+        globalThis.SillyTavern = origST;
+    }
+});
+

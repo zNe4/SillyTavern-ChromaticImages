@@ -40,6 +40,133 @@
                 </p>
             </section>
             <section
+                id="chromatic-images-provider-section"
+                class="chromatic-images-provider-section"
+                aria-labelledby="chromatic-images-provider-heading"
+            >
+                <h3
+                    id="chromatic-images-provider-heading"
+                    class="chromatic-images-section-title"
+                >
+                    Image provider
+                </h3>
+                <div class="chromatic-images-field-row">
+                    <span class="chromatic-images-field-label">Provider</span>
+                    <span
+                        id="chromatic-images-provider-value"
+                        class="chromatic-images-field-static"
+                    >
+                        NanoGPT
+                    </span>
+                </div>
+                <div class="chromatic-images-field-row">
+                    <span class="chromatic-images-field-label">Model</span>
+                    <span
+                        id="chromatic-images-model-value"
+                        class="chromatic-images-field-static"
+                    >
+                        qwen-image
+                    </span>
+                </div>
+                <div class="chromatic-images-field-row">
+                    <label
+                        for="chromatic-images-resolution-select"
+                        class="chromatic-images-field-label"
+                    >
+                        Default resolution
+                    </label>
+                    <select
+                        id="chromatic-images-resolution-select"
+                        class="text_pole chromatic-images-select"
+                    >
+                        <option value="auto">auto (Default)</option>
+                        <option value="1024x1024">1024x1024 (Square)</option>
+                        <option value="512x512">512x512 (Square small)</option>
+                        <option value="768x1024">768x1024 (Portrait)</option>
+                        <option value="576x1024">576x1024 (Portrait tall)</option>
+                        <option value="1024x768">1024x768 (Landscape)</option>
+                        <option value="1024x576">1024x576 (Landscape wide)</option>
+                    </select>
+                </div>
+            </section>
+            <section
+                id="chromatic-images-diagnostics-section"
+                class="chromatic-images-diagnostics-section"
+                aria-labelledby="chromatic-images-diagnostics-heading"
+            >
+                <h3
+                    id="chromatic-images-diagnostics-heading"
+                    class="chromatic-images-section-title"
+                >
+                    Connection diagnostics
+                </h3>
+                <p class="chromatic-images-section-description">
+                    Check readiness of local SillyTavern proxy and configured secret. This check is non-billable and does not test API key validity or provider balance.
+                </p>
+                <div
+                    id="chromatic-images-diagnostics-status-list"
+                    class="chromatic-images-status-list"
+                    role="list"
+                    aria-label="Diagnostic readiness status"
+                >
+                    <div
+                        class="chromatic-images-status-row"
+                        role="listitem"
+                    >
+                        <span class="chromatic-images-status-label">
+                            NanoGPT credential
+                        </span>
+                        <span
+                            id="chromatic-images-credential-status"
+                            class="chromatic-images-status-value"
+                            data-credential-status="not-checked"
+                        >
+                            Not checked
+                        </span>
+                    </div>
+                    <div
+                        class="chromatic-images-status-row"
+                        role="listitem"
+                    >
+                        <span class="chromatic-images-status-label">
+                            Local image proxy
+                        </span>
+                        <span
+                            id="chromatic-images-proxy-status"
+                            class="chromatic-images-status-value"
+                            data-proxy-status="not-checked"
+                        >
+                            Not checked
+                        </span>
+                    </div>
+                </div>
+                <p
+                    id="chromatic-images-diagnostics-summary"
+                    class="chromatic-images-diagnostics-summary"
+                    role="status"
+                    aria-live="polite"
+                >
+                    Diagnostics not run yet.
+                </p>
+                <div class="chromatic-images-diagnostics-actions">
+                    <button
+                        id="chromatic-images-diagnostics-run"
+                        class="menu_button chromatic-images-diagnostics-run"
+                        type="button"
+                        aria-describedby="chromatic-images-diagnostics-summary chromatic-images-diagnostics-feedback"
+                    >
+                        Check local setup
+                    </button>
+                </div>
+                <p
+                    id="chromatic-images-diagnostics-feedback"
+                    class="chromatic-images-feedback chromatic-images-diagnostics-feedback"
+                    role="status"
+                    aria-live="polite"
+                    hidden
+                ></p>
+            </section>
+            <section
                 id="chromatic-images-regex-section"
                 class="chromatic-images-regex-section"
                 aria-labelledby="chromatic-images-regex-heading"

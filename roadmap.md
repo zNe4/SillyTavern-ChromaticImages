@@ -6,11 +6,11 @@
 
 **Phase:** M03 — NanoGPT/Qwen transport and local image primitives.
 
-**Current mission:** M03-E (SillyTavern-local image I/O) implemented and verified, ready for independent review.
+**Current mission:** M03-F (Provider settings and diagnostic UI) implemented and verified, ready for independent review.
 
-**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, M03-C response normalizer (accepted for provable behavior; unverified normalized envelope deferred to M03-G), M03-D1 single-request transport core (accepted), M03-D2A server path architecture decision (accepted; narrow core proxy update selected), M03-D2B1 SillyTavern normalized proxy (implemented and verified locally; committed in local SillyTavern checkout, pending upstream PR), and M03-D2B2 Chromatic Images production dispatch adapter (accepted).
+**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, M03-C response normalizer (accepted for provable behavior; unverified normalized envelope deferred to M03-G), M03-D1 single-request transport core (accepted), M03-D2A server path architecture decision (accepted; narrow core proxy update selected), M03-D2B1 SillyTavern normalized proxy (implemented and verified locally; committed in local SillyTavern checkout, pending upstream PR), M03-D2B2 Chromatic Images production dispatch adapter (accepted), and M03-E SillyTavern-local image I/O (accepted).
 
-**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building, response normalization, pure mocked transport core, production dispatch adapter with capability guard, and local image I/O primitives are implemented. Paid image generation is not enabled.
+**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building, response normalization, pure mocked transport core, production dispatch adapter with capability guard, local image I/O primitives, provider settings schema, credential readiness reader, and connection diagnostics UI are implemented. Paid image generation is not enabled.
 
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
@@ -227,7 +227,7 @@ No NanoGPT and no reference library yet.
 
 ## M03 — NanoGPT/Qwen transport and local image primitives
 
-**Status:** M03-A complete; M03-B accepted; M03-C accepted for currently provable behavior (normalized success-envelope adapter remains deferred); M03-D1 accepted; M03-D2A accepted; M03-D2B1 implemented locally in SillyTavern checkout; M03-D2B2 accepted; M03-E implemented and under independent review.
+**Status:** M03-A complete; M03-B accepted; M03-C accepted for currently provable behavior (normalized success-envelope adapter remains deferred); M03-D1 accepted; M03-D2A accepted; M03-D2B1 implemented locally in SillyTavern checkout; M03-D2B2 accepted; M03-E accepted; M03-F implemented and under independent review.
 
 ### Goal
 
@@ -319,7 +319,7 @@ Implemented scope:
 
 ### M03-E — SillyTavern-local image I/O
 
-**Status: Implemented (ready for independent review).**
+**Status: Accepted.**
 
 Pure and browser-side primitives implemented in `src/images/local-image-io.js` with comprehensive unit test coverage in `tests/local-image-io.test.mjs`.
 
@@ -334,15 +334,19 @@ Implemented scope:
 
 ### M03-F — Provider settings and diagnostic UI
 
-Add only nonsensitive provider/model defaults and diagnostic controls.
+**Status: Complete (ready for independent review).**
 
-Requirements:
+Implements nonsensitive provider settings and non-billable local diagnostic controls without introducing an API key input, secret storage, or billable request paths.
 
-- no Chromatic Images API-key field;
-- credential readiness comes from SillyTavern's existing NanoGPT secret state;
-- zero automatic paid calls;
-- mobile/theme-safe UI;
-- no proposal-card Generate wiring.
+Implemented scope:
+- Persisted settings schema: `extensionSettings.chromatic_images = { resolution: 'auto' }`. Managed via `src/provider-settings.js` (`readProviderSettings` pure reader and `updateProviderResolution` schema-safe mutator dropping unexpected keys).
+- Read-only provider & model metadata rendered in settings panel: NanoGPT, `qwen-image`, 1 output, max 3 references.
+- Credential readiness probe: `checkNanoGptCredentialReadiness()` in `src/providers/nanogpt-readiness.js` inspects SillyTavern's `POST /api/secrets/read` using `getRequestHeaders({ omitContentType: true })`. Enforces a strict 5,000 ms hard deadline (`Promise.race`), fail-closed status matrix (`configured`, `not-configured`, `unavailable`), and zero credential/response logging or exposure.
+- Proxy capability probe: reuses M03-D2B2 `checkNanoGptImagesCapability({ forceCheck: true })`, mapping missing proxy (404) to clear "Update required" status.
+- UI DOM controller: `refreshProviderPanel(panel)` in `src/provider-panel.js` manages `#chromatic-images-resolution-select` and `#chromatic-images-check-readiness-btn`. Employs WeakMap state tracking, single-flight click locking, generation token invalidation, scoped MutationObserver for DOM detachment, neutral cancellation recovery (`Not checked`), and resilient probe error handling.
+- Layout and styling: `settings.html` and `style.css` updated with responsive, SmartTheme-compatible provider and diagnostic sections.
+- Verification: comprehensive unit tests in `tests/provider-settings.test.mjs`, `tests/nanogpt-readiness.test.mjs`, `tests/provider-panel.test.mjs`, and `tests/panel.test.mjs`.
+- Boundaries: zero paid requests, zero calls to `/api/sd/nanogpt/images` POST or `https://api.nano-gpt.com/*`, no proposal-card Generate wiring. M03-G remains the authorized diagnostic generation boundary.
 
 ### M03-G — Explicit diagnostic generation
 

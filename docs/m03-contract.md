@@ -429,7 +429,34 @@ Implemented pure and browser-side local image I/O primitives in `src/images/loca
 
 ### M03-F
 
-Nonsensitive settings/diagnostics may later proceed. Do not add a Chromatic Images API-key field.
+Implemented nonsensitive provider settings and non-billable local diagnostic controls without adding an API key input, duplicate secret storage, or paid calls:
+- **Settings schema & persistence:**
+  - Persisted namespace: `extensionSettings.chromatic_images = { resolution: 'auto' }`.
+  - `readProviderSettings(extensionSettings)`: pure snapshot reader defaulting safely to `{ resolution: 'auto' }` without mutating or saving.
+  - `updateProviderResolution(extensionSettings, newResolution)`: schema-safe controlled mutator that validates against allowed resolutions (`auto`, `1:1`, `4:3`, `3:4`, `16:9`, `9:16`), replaces the namespace with a fresh object containing only `{ resolution: validatedResolution }`, strips unknown fields (e.g. `apiKey`, `prompt`), and saves exactly once per genuine change via `saveSettingsDebounced()`.
+  - Read-only display: Provider is fixed to NanoGPT, model is fixed to `qwen-image`, 1 output per request, maximum 3 reference images.
+- **Credential readiness probe (`src/providers/nanogpt-readiness.js`):**
+  - Route: `POST /api/secrets/read` using `getRequestHeaders({ omitContentType: true })`. Never requests raw key endpoints (`/api/secrets/find` or `/api/secrets/view`).
+  - Timeout: deterministic 5,000 ms hard operation deadline covering dispatch, HTTP response, and JSON body parse via `Promise.race`.
+  - Classification matrix (fail-closed):
+    - `api_key_nanogpt: null` -> `not-configured`
+    - `api_key_nanogpt: []` -> `not-configured`
+    - non-empty array with all `active === false` -> `not-configured`
+    - valid array containing at least one descriptor with `active === true` -> `configured`
+    - omitted `api_key_nanogpt` key -> `unavailable`
+    - non-null, non-array entry -> `unavailable`
+    - malformed descriptor items / non-boolean `active` -> `unavailable`
+    - malformed top-level response or HTTP error -> `unavailable`
+  - Privacy guarantee: returns only safe status strings (`configured`, `not-configured`, `unavailable`) and static error codes; zero credentials, masked values, labels, IDs, or full server responses are ever logged, saved, or exposed.
+- **Proxy capability probe:**
+  - Reuses M03-D2B2 `checkNanoGptImagesCapability({ forceCheck: true })` from `src/providers/nanogpt-image-dispatch.js`.
+  - Maps missing proxy (HTTP 404 / `sillytavern-update-required`) to `"Update required"`.
+- **UI DOM controller (`src/provider-panel.js`):**
+  - Managed elements: `#chromatic-images-resolution-select`, `#chromatic-images-check-readiness-btn`, `#chromatic-images-credential-status-badge`, `#chromatic-images-proxy-status-badge`, and `#chromatic-images-diagnostic-summary`.
+  - Lifecycle: `WeakMap` per-panel state tracking, single-flight click locking, generation token invalidation, and scoped `MutationObserver` on `document.body` to abort in-flight probes if the panel is detached.
+  - Safe error handling: `Promise.all` wrapped safely so individual probe failures never crash the UI or leave the button locked.
+  - Neutral cancellation recovery: aborted probes restore badges to neutral `"Not checked"` state without writing failure summaries.
+- **Boundaries:** Zero paid requests, zero calls to `/api/sd/nanogpt/images` POST or `https://api.nano-gpt.com/*`, no proposal-card Generate wiring. M03-G remains the authorized diagnostic generation boundary.
 
 ### M03-G
 

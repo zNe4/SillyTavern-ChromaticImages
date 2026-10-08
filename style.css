@@ -301,4 +301,177 @@
     font-weight: 600;
 }
 
+/* --- Chromatic Images Provider & Diagnostics Settings (M03-F) --- */
+
+.chromatic-images-provider-section,
+.chromatic-images-diagnostics-section {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    margin: 0.75rem 0;
+    padding: 0.75rem;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    background: color-mix(
+        in srgb,
+        var(--SmartThemeBlurTintColor) 40%,
+        transparent
+    );
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-section-title {
+    margin: 0 0 0.5rem;
+    font-size: 1.05em;
+    font-weight: 700;
+    min-width: 0;
+}
+
+.chromatic-images-section-description {
+    margin: 0.35rem 0 0.75rem;
+    opacity: 0.85;
+    font-size: 0.9em;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-field-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.35rem 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-field-label {
+    min-width: 0;
+    font-size: 0.9em;
+    opacity: 0.9;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-field-static {
+    font-weight: 600;
+    font-size: 0.9em;
+    opacity: 0.95;
+    flex: 0 0 auto;
+}
+
+.chromatic-images-select {
+    box-sizing: border-box;
+    max-width: 100%;
+    min-width: 0;
+    padding: 0.25rem 0.5rem;
+    border-radius: 6px;
+    font-size: 0.9em;
+}
+
+.chromatic-images-status-list {
+    display: grid;
+    gap: 0.4rem;
+    margin: 0.5rem 0;
+    min-width: 0;
+}
+
+.chromatic-images-status-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background: color-mix(
+        in srgb,
+        var(--SmartThemeBlurTintColor) 60%,
+        transparent
+    );
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-status-label {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-status-value {
+    flex: 0 0 auto;
+    font-weight: 700;
+    font-size: 0.9em;
+}
+
+.chromatic-images-status-value[data-credential-status="configured"],
+.chromatic-images-status-value[data-proxy-status="available"] {
+    opacity: 0.95;
+}
+
+.chromatic-images-status-value[data-credential-status="not-configured"],
+.chromatic-images-status-value[data-proxy-status="update-required"] {
+    opacity: 0.95;
+}
+
+.chromatic-images-status-value[data-credential-status="unavailable"],
+.chromatic-images-status-value[data-proxy-status="unavailable"] {
+    opacity: 0.95;
+}
+
+.chromatic-images-diagnostics-summary {
+    margin: 0.5rem 0;
+    font-size: 0.85em;
+    opacity: 0.85;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-diagnostics-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    min-width: 0;
+}
+
+.chromatic-images-diagnostics-run {
+    box-sizing: border-box;
+    width: auto;
+    max-width: 100%;
+    min-width: 0;
+    white-space: nowrap;
+    overflow-wrap: normal;
+    word-break: normal;
+}
+
+.chromatic-images-diagnostics-run:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.chromatic-images-diagnostics-feedback {
+    margin-top: 0.5rem;
+    font-size: 0.85em;
+    overflow-wrap: anywhere;
+}
+
+.chromatic-images-diagnostics-feedback[hidden] {
+    display: none !important;
+}
+
+.chromatic-images-diagnostics-feedback[data-feedback-kind="valid"] {
+    opacity: 0.95;
+    font-weight: 600;
+}
+
+.chromatic-images-diagnostics-feedback[data-feedback-kind="warning"] {
+    opacity: 0.95;
+    font-weight: 600;
+}
+
+.chromatic-images-diagnostics-feedback[data-feedback-kind="error"] {
+    opacity: 0.95;
+    font-weight: 600;
+}
+
 
