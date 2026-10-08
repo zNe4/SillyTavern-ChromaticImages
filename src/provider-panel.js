@@ -491,12 +491,12 @@ export function refreshProviderPanel(panel, deps = {}) {
                     );
                 }
             } finally {
+                if (state.activeDetachmentObserver === detachmentObserver) {
+                    state.activeDetachmentObserver = null;
+                }
                 if (detachmentObserver) {
                     detachmentObserver.disconnect();
                     detachmentObserver = null;
-                }
-                if (state.activeDetachmentObserver === detachmentObserver) {
-                    state.activeDetachmentObserver = null;
                 }
                 if (state.activeAbortController === controller) {
                     state.activeAbortController = null;

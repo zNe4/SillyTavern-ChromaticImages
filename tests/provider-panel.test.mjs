@@ -587,84 +587,142 @@ test('15. Lifecycle invalidation & detachment cleanup: handles detachment, abort
         globalThis.MutationObserver = MockMutationObserver;
         globalThis.document = { body: {} };
 
-        const fake = createFakePanel();
-        fake.isConnected = true;
+        // 1. Normal successful diagnostics disconnect their observer
+        {
+            const fakeNormal = createFakePanel();
+            fakeNormal.isConnected = true;
+            refreshProviderPanel(fakeNormal, {
+                checkNanoGptCredentialReadiness: async () => ({ status: CREDENTIAL_STATUS.CONFIGURED, error: null }),
+                checkNanoGptImagesCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+            });
+            fakeNormal.elements.runBtn.click();
+            await delay();
 
-        let finishOldCred;
-        const oldCredPromise = new Promise((resolve) => { finishOldCred = resolve; });
-        let capturedSignal1 = null;
+            const normalObserver = MockMutationObserver.instances[MockMutationObserver.instances.length - 1];
+            assert.strictEqual(normalObserver.disconnected, true, 'Normal completion disconnects observer');
+            assert.strictEqual(fakeNormal.elements.runBtn.disabled, false);
+            assert.strictEqual(fakeNormal.elements.credentialStatus.textContent, 'Configured');
+        }
 
-        refreshProviderPanel(fake, {
-            checkNanoGptCredentialReadiness: async ({ signal }) => {
-                capturedSignal1 = signal;
-                await oldCredPromise;
-                return { status: CREDENTIAL_STATUS.CONFIGURED, error: null };
-            },
-            checkNanoGptImagesCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
-        });
+        // 2. Cancellation disconnects its observer
+        {
+            const fakeCancel = createFakePanel();
+            fakeCancel.isConnected = true;
+            refreshProviderPanel(fakeCancel, {
+                checkNanoGptCredentialReadiness: async () => ({ status: CREDENTIAL_STATUS.CANCELLED, error: null }),
+                checkNanoGptImagesCapability: async () => ({
+                    supported: false,
+                    cached: false,
+                    status: null,
+                    error: { kind: 'cancelled', message: 'Cancelled' },
+                }),
+            });
+            fakeCancel.elements.runBtn.click();
+            await delay();
 
-        // 1. Diagnostic click starts check
-        fake.elements.runBtn.click();
-        assert.strictEqual(fake.elements.runBtn.disabled, true);
-        assert.strictEqual(fake.elements.runBtn.textContent, 'Checking setup…');
-        assert.strictEqual(fake.elements.credentialStatus.textContent, 'Checking…');
-        assert.strictEqual(capturedSignal1?.aborted, false);
-        assert.strictEqual(MockMutationObserver.instances.length, 1);
-        const observer = MockMutationObserver.instances[0];
+            const cancelObserver = MockMutationObserver.instances[MockMutationObserver.instances.length - 1];
+            assert.strictEqual(cancelObserver.disconnected, true, 'Cancellation disconnects observer');
+            assert.strictEqual(fakeCancel.elements.runBtn.disabled, false);
+            assert.strictEqual(fakeCancel.elements.summary.textContent, 'Readiness check cancelled.');
+        }
 
-        // 2. Panel detaches during pending diagnostic; MutationObserver triggers
-        fake.isConnected = false;
-        observer.trigger();
+        // 3. Detachment, late settlement isolation, and panel re-use
+        {
+            const fake = createFakePanel();
+            fake.isConnected = true;
 
-        // Active AbortSignal becomes aborted
-        assert.strictEqual(capturedSignal1.aborted, true);
-        // Observer cleanup occurs
-        assert.strictEqual(observer.disconnected, true);
+            let finishOldCred;
+            const oldCredPromise = new Promise((resolve) => { finishOldCred = resolve; });
+            let capturedSignal1 = null;
 
-        // 3. Late results from old check settle
-        finishOldCred();
-        await delay();
+            refreshProviderPanel(fake, {
+                checkNanoGptCredentialReadiness: async ({ signal }) => {
+                    capturedSignal1 = signal;
+                    await oldCredPromise;
+                    return { status: CREDENTIAL_STATUS.CONFIGURED, error: null };
+                },
+                checkNanoGptImagesCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+            });
 
-        // Late results do not mutate detached elements
-        assert.strictEqual(fake.elements.credentialStatus.textContent, 'Checking…');
-        assert.strictEqual(fake.elements.proxyStatus.textContent, 'Checking…');
+            // Diagnostic click starts check 1
+            fake.elements.runBtn.click();
+            assert.strictEqual(fake.elements.runBtn.disabled, true);
+            assert.strictEqual(fake.elements.runBtn.textContent, 'Checking setup…');
+            assert.strictEqual(fake.elements.credentialStatus.textContent, 'Checking…');
+            assert.strictEqual(capturedSignal1?.aborted, false);
+            const obs1 = MockMutationObserver.instances[MockMutationObserver.instances.length - 1];
+            assert.strictEqual(obs1.disconnected, false);
 
-        // 4. Same panel is reattached and refreshed
-        fake.isConnected = true;
-        let capturedSignal2 = null;
-        let finishNewCred;
-        const newCredPromise = new Promise((resolve) => { finishNewCred = resolve; });
+            // Panel detaches during pending diagnostic; MutationObserver triggers
+            fake.isConnected = false;
+            obs1.trigger();
 
-        refreshProviderPanel(fake, {
-            checkNanoGptCredentialReadiness: async ({ signal }) => {
-                capturedSignal2 = signal;
-                await newCredPromise;
-                return { status: CREDENTIAL_STATUS.CONFIGURED, error: null };
-            },
-            checkNanoGptImagesCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
-        });
+            // Active AbortSignal becomes aborted and observer is disconnected
+            assert.strictEqual(capturedSignal1.aborted, true);
+            assert.strictEqual(obs1.disconnected, true, 'Detachment disconnects observer');
 
-        // Button does not remain permanently disabled; neutral state restored
-        assert.strictEqual(fake.elements.runBtn.disabled, false);
-        assert.strictEqual(fake.elements.runBtn.textContent, 'Check local setup');
-        assert.strictEqual(fake.elements.credentialStatus.textContent, 'Not checked');
-        assert.strictEqual(fake.elements.proxyStatus.textContent, 'Not checked');
+            // Reattach and refresh panel before old check settles
+            fake.isConnected = true;
+            let capturedSignal2 = null;
+            let finishNewCred;
+            const newCredPromise = new Promise((resolve) => { finishNewCred = resolve; });
 
-        // 5. New diagnostic click successfully starts a new check
-        fake.elements.runBtn.click();
-        assert.strictEqual(fake.elements.runBtn.disabled, true);
-        assert.strictEqual(fake.elements.runBtn.textContent, 'Checking setup…');
-        assert.strictEqual(capturedSignal2?.aborted, false);
+            refreshProviderPanel(fake, {
+                checkNanoGptCredentialReadiness: async ({ signal }) => {
+                    capturedSignal2 = signal;
+                    await newCredPromise;
+                    return { status: CREDENTIAL_STATUS.CONFIGURED, error: null };
+                },
+                checkNanoGptImagesCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+            });
 
-        // 6. Complete new check
-        finishNewCred();
-        await delay();
+            // Button does not remain permanently disabled; neutral state restored
+            assert.strictEqual(fake.elements.runBtn.disabled, false);
+            assert.strictEqual(fake.elements.runBtn.textContent, 'Check local setup');
+            assert.strictEqual(fake.elements.credentialStatus.textContent, 'Not checked');
+            assert.strictEqual(fake.elements.proxyStatus.textContent, 'Not checked');
 
-        // Results of new check rendered successfully
-        assert.strictEqual(fake.elements.credentialStatus.textContent, 'Configured');
-        assert.strictEqual(fake.elements.proxyStatus.textContent, 'Available');
-        assert.strictEqual(fake.elements.runBtn.disabled, false);
-        assert.strictEqual(fake.elements.runBtn.textContent, 'Check local setup');
+            // Start check 2
+            fake.elements.runBtn.click();
+            assert.strictEqual(fake.elements.runBtn.disabled, true);
+            assert.strictEqual(fake.elements.runBtn.textContent, 'Checking setup…');
+            assert.strictEqual(capturedSignal2?.aborted, false);
+            const obs2 = MockMutationObserver.instances[MockMutationObserver.instances.length - 1];
+            assert.strictEqual(obs2.disconnected, false);
+
+            // Settle old check 1 while check 2 is in-flight
+            finishOldCred();
+            await delay();
+
+            // Old operation settling cannot affect check 2 or check 2's observer
+            assert.strictEqual(obs2.disconnected, false, 'Old check settling cannot disconnect newer check observer');
+            assert.strictEqual(fake.elements.runBtn.disabled, true, 'Old check settling cannot reset newer check button');
+            assert.strictEqual(fake.elements.runBtn.textContent, 'Checking setup…');
+
+            // Complete check 2
+            finishNewCred();
+            await delay();
+
+            // Results of check 2 rendered successfully and obs2 is disconnected
+            assert.strictEqual(obs2.disconnected, true, 'Check 2 completion disconnects its observer');
+            assert.strictEqual(fake.elements.credentialStatus.textContent, 'Configured');
+            assert.strictEqual(fake.elements.proxyStatus.textContent, 'Available');
+            assert.strictEqual(fake.elements.runBtn.disabled, false);
+            assert.strictEqual(fake.elements.runBtn.textContent, 'Check local setup');
+
+            // Subsequent diagnostic check 3 on the same panel works and disconnects its observer
+            refreshProviderPanel(fake, {
+                checkNanoGptCredentialReadiness: async () => ({ status: CREDENTIAL_STATUS.CONFIGURED, error: null }),
+                checkNanoGptImagesCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+            });
+            fake.elements.runBtn.click();
+            await delay();
+
+            const obs3 = MockMutationObserver.instances[MockMutationObserver.instances.length - 1];
+            assert.strictEqual(obs3.disconnected, true, 'Check 3 completion disconnects its observer');
+            assert.strictEqual(fake.elements.runBtn.disabled, false);
+            assert.strictEqual(fake.elements.credentialStatus.textContent, 'Configured');
+        }
     } finally {
         globalThis.MutationObserver = origMutationObserver;
         globalThis.document = origDocument;
