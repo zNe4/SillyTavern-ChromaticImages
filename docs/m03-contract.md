@@ -466,7 +466,36 @@ Implemented nonsensitive provider settings and non-billable local diagnostic con
 
 ### M03-G
 
-Diagnostic generation will use the verified production dispatch adapter once authorized. Direct browser keys remain prohibited.
+#### M03-G1 — Compatibility Transport & Server Proxy
+
+Captured vendor evidence (NanoGPT Studio export `schema_version: media-integration-spec/v2`, 2026-10-08) confirmed that the subscription-compatible route for `qwen-image` operates via:
+- Upstream direct host: `POST https://api.nano-gpt.com/api/v1/images/generations`
+- Authentication: `x-api-key` header (server-managed secret; browser extension never handles raw keys)
+- Key parameters:
+  - `model: 'qwen-image'`
+  - `prompt`: trimmed string, 1 to 3,000 UTF-16 code units
+  - `nImages`: fixed integer `1` (unsupported aliases such as `n` strictly rejected)
+  - `resolution`: allowlisted 7-value set (`auto`, `1024x1024`, `512x512`, `768x1024`, `576x1024`, `1024x768`, `1024x576`)
+  - `response_format`: `'b64_json'`
+  - References: mutually exclusive `imageDataUrl` (exactly 1 reference) vs `imageDataUrls` (2 to 3 references); aggregate decoded bytes capped at 30 MiB (31,457,280 bytes); remote URL strings rejected
+- Server proxy contract (SillyTavern `m03-d2b1-nanogpt-proxy` branch):
+  - Routes: `GET /api/sd/nanogpt/images/generations` and `POST /api/sd/nanogpt/images/generations`
+  - Marker: `x-st-nanogpt-proxy: v1-compat`
+  - Upstream request configuration: `redirect: 'error'`, `signal: abortController.signal`, `Content-Length` header forwarded
+  - Safeguards: 50 MB local application payload limit (HTTP 413), 50 MB upstream response ceiling with stream counting via `Transform` (HTTP 502), client disconnect abort forwarding, zero sensitive body logging
+- Client builder (`src/providers/nanogpt-qwen-compat-request.js`):
+  - Pure function `buildQwenImageCompatibilityRequest(options)`
+  - Rejects unknown options, enforces model and prompt bounds, maps references deterministically: 0 refs -> neither, 1 ref -> `imageDataUrl`, 2..3 refs -> `imageDataUrls`
+- Client dispatch adapter (`src/providers/nanogpt-image-dispatch.js`):
+  - `checkNanoGptGenerationsCapability(options)`: checks GET `/api/sd/nanogpt/images/generations`, verifies `v1-compat` marker and `{ ok: true, route: 'nanogpt-images-generations' }`
+  - `clearNanoGptGenerationsCapabilityCache()`: clears isolated session-memory cache `cachedGenerationsCapabilitySupported`
+  - `createNanoGptGenerationsDispatch(dependencies)`: constructs low-level POST dispatch targeting `/api/sd/nanogpt/images/generations`
+  - `sendProductionNanoGptGenerationsRequest(options)`: production service with pre-flight validation, capability checking, remaining timeout budgeting, universal `v1-compat` marker verification wrapping default or custom dispatches, and conservative billing uncertainty preservation
+  - Cache and marker isolation: normalized route (`v1`) and compatibility route (`v1-compat`) maintain completely independent positive capability caches and strictly fail closed if presented with the other route's marker
+
+#### M03-G2 — Diagnostic Image Generation & Settings UI Wiring
+
+Diagnostic image generation execution and Settings UI integration remain deferred to M03-G2 under independent review. No image generation UI or paid calls were added in M03-G1.
 
 ## 19. M03-A gate result
 

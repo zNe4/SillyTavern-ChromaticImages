@@ -2,14 +2,16 @@
  * @file Production dispatch adapter for NanoGPT image generation requests.
  *
  * Connects the pure M03-D1 single-request transport core to the same-origin
- * SillyTavern NanoGPT images proxy route (GET/POST /api/sd/nanogpt/images).
+ * SillyTavern NanoGPT images proxy routes:
+ * 1. Normalized route: GET/POST /api/sd/nanogpt/images (marker: v1)
+ * 2. Subscription-compatible generations route: GET/POST /api/sd/nanogpt/images/generations (marker: v1-compat)
  *
  * Key guarantees:
  * - Zero raw NanoGPT credential ownership, retrieval, or persistence in browser JS.
  * - Single-request dispatch without automatic retries.
  * - Conservative billing uncertainty: all post-dispatch failures preserve uncertainBilling: true.
- * - Pre-flight capability verification with session-memory caching.
- * - Universal proxy marker verification (x-st-nanogpt-proxy: v1) across all dispatches.
+ * - Pre-flight capability verification with isolated session-memory caching.
+ * - Universal proxy marker verification (v1 vs v1-compat) across all dispatches.
  * - Whole-operation timeout budgeting and caller cancellation propagation.
  * - Privacy: zero console logging of RP scene prompts, base64 images, or credentials.
  */
@@ -19,6 +21,9 @@ import { sendNanoGptImageTransportRequest } from './nanogpt-image-transport.js';
 export const NANOGPT_PROXY_ROUTE = '/api/sd/nanogpt/images';
 export const NANOGPT_PROXY_MARKER_HEADER = 'x-st-nanogpt-proxy';
 export const NANOGPT_PROXY_MARKER_VALUE = 'v1';
+
+export const NANOGPT_PROXY_GENERATIONS_ROUTE = '/api/sd/nanogpt/images/generations';
+export const NANOGPT_PROXY_GENERATIONS_MARKER_VALUE = 'v1-compat';
 
 export const CAPABILITY_DEFAULT_TIMEOUT_MS = 5000;
 
@@ -52,11 +57,18 @@ const ALLOWED_CAPABILITY_OPTION_KEYS = new Set([
 ]);
 
 /**
- * Session-memory cache for positive capability check.
+ * Session-memory cache for positive normalized capability check.
  * Never persisted to localStorage, extensionSettings, or chat files.
  * @type {boolean | null}
  */
 let cachedCapabilitySupported = null;
+
+/**
+ * Session-memory cache for positive compatibility generations capability check.
+ * Never persisted to localStorage, extensionSettings, or chat files.
+ * @type {boolean | null}
+ */
+let cachedGenerationsCapabilitySupported = null;
 
 /**
  * Checks whether a value is a plain JavaScript object.
@@ -207,14 +219,16 @@ function validatePreFlightDependenciesAndOptions(options) {
 }
 
 /**
- * Checks whether the current SillyTavern host provides the normalized NanoGPT images proxy.
+ * Shared capability verification core parameterized by route, marker, and expected payload.
  *
- * @param {object} [options]
- * @param {typeof fetch} [options.fetch] Injected fetch implementation.
- * @param {Function} [options.getRequestHeaders] Injected getRequestHeaders function.
- * @param {boolean} [options.forceCheck] If true, bypasses the in-memory cache and re-verifies.
- * @param {AbortSignal} [options.signal] Optional caller AbortSignal.
- * @param {number} [options.timeoutMs] Optional timeout in milliseconds.
+ * @param {object} params
+ * @param {string} params.route
+ * @param {string} params.markerValue
+ * @param {string} params.expectedRoute
+ * @param {string} params.featureDescription
+ * @param {() => boolean | null} params.getCached
+ * @param {(val: boolean | null) => void} params.setCached
+ * @param {object} params.options
  * @returns {Promise<{
  *   supported: boolean,
  *   cached: boolean,
@@ -222,7 +236,15 @@ function validatePreFlightDependenciesAndOptions(options) {
  *   error: { kind: string, message: string } | null,
  * }>}
  */
-export async function checkNanoGptImagesCapability(options = {}) {
+async function checkCapabilityCore({
+    route,
+    markerValue: expectedMarkerValue,
+    expectedRoute,
+    featureDescription,
+    getCached,
+    setCached,
+    options = {},
+}) {
     if (!isPlainObject(options)) {
         return {
             supported: false,
@@ -330,7 +352,7 @@ export async function checkNanoGptImagesCapability(options = {}) {
     }
 
     // Cache hit in current page session
-    if (cachedCapabilitySupported === true && !options.forceCheck) {
+    if (getCached() === true && !options.forceCheck) {
         return {
             supported: true,
             cached: true,
@@ -396,7 +418,7 @@ export async function checkNanoGptImagesCapability(options = {}) {
             const stHeaders = typeof getHeadersFn === 'function' ? getHeadersFn() : {};
             const headers = { ...stHeaders };
 
-            const response = await fetchFn(NANOGPT_PROXY_ROUTE, {
+            const response = await fetchFn(route, {
                 method: 'GET',
                 headers,
                 signal: internalController.signal,
@@ -415,7 +437,7 @@ export async function checkNanoGptImagesCapability(options = {}) {
             }
 
             const markerValue = response?.headers?.get ? response.headers.get(NANOGPT_PROXY_MARKER_HEADER) : null;
-            const isMarked = markerValue === NANOGPT_PROXY_MARKER_VALUE;
+            const isMarked = markerValue === expectedMarkerValue;
 
             if (response.status === 200 && isMarked) {
                 let body;
@@ -433,8 +455,8 @@ export async function checkNanoGptImagesCapability(options = {}) {
                     };
                 }
 
-                if (body && typeof body === 'object' && body.ok === true && body.route === 'nanogpt-images') {
-                    cachedCapabilitySupported = true;
+                if (body && typeof body === 'object' && body.ok === true && body.route === expectedRoute) {
+                    setCached(true);
                     return {
                         supported: true,
                         cached: false,
@@ -461,7 +483,7 @@ export async function checkNanoGptImagesCapability(options = {}) {
                     status: 404,
                     error: {
                         kind: DISPATCH_ERROR_CODES.SILLYTAVERN_UPDATE_REQUIRED,
-                        message: 'SillyTavern update required: this feature requires SillyTavern with normalized NanoGPT image support.',
+                        message: `SillyTavern update required: this feature requires SillyTavern with ${featureDescription}.`,
                     },
                 };
             }
@@ -539,10 +561,73 @@ export async function checkNanoGptImagesCapability(options = {}) {
 }
 
 /**
- * Clears the in-memory capability cache.
+ * Checks whether the current SillyTavern host provides the normalized NanoGPT images proxy.
+ *
+ * @param {object} [options]
+ * @param {typeof fetch} [options.fetch] Injected fetch implementation.
+ * @param {Function} [options.getRequestHeaders] Injected getRequestHeaders function.
+ * @param {boolean} [options.forceCheck] If true, bypasses the in-memory cache and re-verifies.
+ * @param {AbortSignal} [options.signal] Optional caller AbortSignal.
+ * @param {number} [options.timeoutMs] Optional timeout in milliseconds.
+ * @returns {Promise<{
+ *   supported: boolean,
+ *   cached: boolean,
+ *   status: number | null,
+ *   error: { kind: string, message: string } | null,
+ * }>}
+ */
+export async function checkNanoGptImagesCapability(options = {}) {
+    return checkCapabilityCore({
+        route: NANOGPT_PROXY_ROUTE,
+        markerValue: NANOGPT_PROXY_MARKER_VALUE,
+        expectedRoute: 'nanogpt-images',
+        featureDescription: 'normalized NanoGPT image support',
+        getCached: () => cachedCapabilitySupported,
+        setCached: (val) => { cachedCapabilitySupported = val; },
+        options,
+    });
+}
+
+/**
+ * Checks whether the current SillyTavern host provides the NanoGPT compatibility generations image proxy.
+ *
+ * @param {object} [options]
+ * @param {typeof fetch} [options.fetch] Injected fetch implementation.
+ * @param {Function} [options.getRequestHeaders] Injected getRequestHeaders function.
+ * @param {boolean} [options.forceCheck] If true, bypasses the in-memory cache and re-verifies.
+ * @param {AbortSignal} [options.signal] Optional caller AbortSignal.
+ * @param {number} [options.timeoutMs] Optional timeout in milliseconds.
+ * @returns {Promise<{
+ *   supported: boolean,
+ *   cached: boolean,
+ *   status: number | null,
+ *   error: { kind: string, message: string } | null,
+ * }>}
+ */
+export async function checkNanoGptGenerationsCapability(options = {}) {
+    return checkCapabilityCore({
+        route: NANOGPT_PROXY_GENERATIONS_ROUTE,
+        markerValue: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE,
+        expectedRoute: 'nanogpt-images-generations',
+        featureDescription: 'NanoGPT compatibility image generations support',
+        getCached: () => cachedGenerationsCapabilitySupported,
+        setCached: (val) => { cachedGenerationsCapabilitySupported = val; },
+        options,
+    });
+}
+
+/**
+ * Clears the in-memory normalized capability cache.
  */
 export function clearNanoGptImagesCapabilityCache() {
     cachedCapabilitySupported = null;
+}
+
+/**
+ * Clears the in-memory compatibility generations capability cache.
+ */
+export function clearNanoGptGenerationsCapabilityCache() {
+    cachedGenerationsCapabilitySupported = null;
 }
 
 /**
@@ -582,14 +667,51 @@ export function createNanoGptImageDispatch(dependencies = {}) {
 }
 
 /**
- * Dispatches a production NanoGPT image request through SillyTavern's normalized proxy.
+ * Creates a low-level dispatch function targeting POST /api/sd/nanogpt/images/generations.
  *
- * Guarantees:
- * - Pre-flight input, dependency, and capability validation before D1 is called.
- * - Universal marker verification wrapping every dispatch implementation (default or custom).
- * - Single-dispatch execution with conservative billing uncertainty preservation.
+ * @param {object} [dependencies]
+ * @param {typeof fetch} [dependencies.fetch] Injected fetch implementation.
+ * @param {Function} [dependencies.getRequestHeaders] Injected getRequestHeaders function.
+ * @returns {(request: unknown, options?: { signal?: AbortSignal }) => Promise<Response>}
+ */
+export function createNanoGptGenerationsDispatch(dependencies = {}) {
+    if (!isPlainObject(dependencies)) {
+        throw new Error('Dependencies must be a plain object.');
+    }
+
+    const fetchFn = dependencies.fetch || globalThis.fetch;
+    const getHeadersFn = dependencies.getRequestHeaders || globalThis.SillyTavern?.getContext?.()?.getRequestHeaders;
+
+    return async function (request, options) {
+        if (!isPlainObject(request)) {
+            throw new Error('Request payload must be a plain object.');
+        }
+
+        const stHeaders = typeof getHeadersFn === 'function' ? getHeadersFn() : {};
+        const headers = {
+            ...stHeaders,
+            'Content-Type': 'application/json',
+        };
+
+        return fetchFn(NANOGPT_PROXY_GENERATIONS_ROUTE, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(request),
+            signal: options?.signal,
+        });
+    };
+}
+
+/**
+ * Shared production request execution core parameterized by route, marker, and capability/dispatch handlers.
  *
- * @param {object} options
+ * @param {object} params
+ * @param {string} params.route
+ * @param {string} params.markerValue
+ * @param {(opts: any) => Promise<any>} params.checkCapabilityFn
+ * @param {() => void} params.clearCacheFn
+ * @param {(deps: any) => (req: any, opts?: any) => Promise<Response>} params.createDefaultDispatchFn
+ * @param {object} params.options
  * @returns {Promise<{
  *   ok: boolean,
  *   status: number | null,
@@ -599,7 +721,14 @@ export function createNanoGptImageDispatch(dependencies = {}) {
  *   error: { kind: string, message: string } | null,
  * }>}
  */
-export async function sendProductionNanoGptImageRequest(options = {}) {
+async function sendProductionRequestCore({
+    route,
+    markerValue: expectedMarkerValue,
+    checkCapabilityFn,
+    clearCacheFn,
+    createDefaultDispatchFn,
+    options = {},
+}) {
     // 1. Pre-Flight Validation of all inputs and dependencies
     const validation = validatePreFlightDependenciesAndOptions(options);
     if (!validation.ok) {
@@ -638,7 +767,7 @@ export async function sendProductionNanoGptImageRequest(options = {}) {
         capabilityTimeout = Math.min(options.timeoutMs, CAPABILITY_DEFAULT_TIMEOUT_MS);
     }
 
-    const capability = await checkNanoGptImagesCapability({
+    const capability = await checkCapabilityFn({
         fetch: fetchFn,
         getRequestHeaders: getHeadersFn,
         signal: options.signal,
@@ -679,7 +808,7 @@ export async function sendProductionNanoGptImageRequest(options = {}) {
 
     // 5. Build Universal Tracked Dispatch Wrapper
     const baseDispatch = options.dispatch
-        ?? createNanoGptImageDispatch({
+        ?? createDefaultDispatchFn({
             fetch: fetchFn,
             getRequestHeaders: getHeadersFn,
         });
@@ -693,7 +822,7 @@ export async function sendProductionNanoGptImageRequest(options = {}) {
 
         trackingState.lastResponse = {
             status: response?.status ?? null,
-            isMarked: markerValue === NANOGPT_PROXY_MARKER_VALUE,
+            isMarked: markerValue === expectedMarkerValue,
             markerValue,
         };
 
@@ -714,7 +843,7 @@ export async function sendProductionNanoGptImageRequest(options = {}) {
 
         if (!isMarked) {
             // Unmarked response invalidates capability cache and must never be clean success
-            clearNanoGptImagesCapabilityCache();
+            clearCacheFn();
 
             return {
                 ok: false,
@@ -725,12 +854,70 @@ export async function sendProductionNanoGptImageRequest(options = {}) {
                 error: {
                     kind: DISPATCH_ERROR_CODES.PROXY_RESPONSE_UNVERIFIED,
                     message: (d1Result.status === 404 || status === 404)
-                        ? 'SillyTavern route /api/sd/nanogpt/images was not found or missing proxy marker.'
-                        : 'Response from /api/sd/nanogpt/images lacked the required SillyTavern proxy marker header.',
+                        ? `SillyTavern route ${route} was not found or missing proxy marker.`
+                        : `Response from ${route} lacked the required SillyTavern proxy marker header.`,
                 },
             };
         }
     }
 
     return d1Result;
+}
+
+/**
+ * Dispatches a production NanoGPT image request through SillyTavern's normalized proxy.
+ *
+ * Guarantees:
+ * - Pre-flight input, dependency, and capability validation before D1 is called.
+ * - Universal marker verification wrapping every dispatch implementation (default or custom).
+ * - Single-dispatch execution with conservative billing uncertainty preservation.
+ *
+ * @param {object} options
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   status: number | null,
+ *   body: unknown,
+ *   dispatchAttempted: boolean,
+ *   uncertainBilling: boolean,
+ *   error: { kind: string, message: string } | null,
+ * }>}
+ */
+export async function sendProductionNanoGptImageRequest(options = {}) {
+    return sendProductionRequestCore({
+        route: NANOGPT_PROXY_ROUTE,
+        markerValue: NANOGPT_PROXY_MARKER_VALUE,
+        checkCapabilityFn: checkNanoGptImagesCapability,
+        clearCacheFn: clearNanoGptImagesCapabilityCache,
+        createDefaultDispatchFn: createNanoGptImageDispatch,
+        options,
+    });
+}
+
+/**
+ * Dispatches a production NanoGPT image request through SillyTavern's compatibility generations proxy.
+ *
+ * Guarantees:
+ * - Pre-flight input, dependency, and capability validation before D1 is called.
+ * - Universal marker verification (v1-compat) wrapping every dispatch implementation (default or custom).
+ * - Single-dispatch execution with conservative billing uncertainty preservation.
+ *
+ * @param {object} options
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   status: number | null,
+ *   body: unknown,
+ *   dispatchAttempted: boolean,
+ *   uncertainBilling: boolean,
+ *   error: { kind: string, message: string } | null,
+ * }>}
+ */
+export async function sendProductionNanoGptGenerationsRequest(options = {}) {
+    return sendProductionRequestCore({
+        route: NANOGPT_PROXY_GENERATIONS_ROUTE,
+        markerValue: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE,
+        checkCapabilityFn: checkNanoGptGenerationsCapability,
+        clearCacheFn: clearNanoGptGenerationsCapabilityCache,
+        createDefaultDispatchFn: createNanoGptGenerationsDispatch,
+        options,
+    });
 }

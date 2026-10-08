@@ -6,11 +6,11 @@
 
 **Phase:** M03 — NanoGPT/Qwen transport and local image primitives.
 
-**Current mission:** M03-F (Provider settings and diagnostic UI) implemented and verified, ready for independent review.
+**Current mission:** M03-G1 (Compatibility Transport & Server Proxy) implemented and verified, ready for independent review.
 
-**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, M03-C response normalizer (accepted for provable behavior; unverified normalized envelope deferred to M03-G), M03-D1 single-request transport core (accepted), M03-D2A server path architecture decision (accepted; narrow core proxy update selected), M03-D2B1 SillyTavern normalized proxy (implemented and verified locally; committed in local SillyTavern checkout, pending upstream PR), M03-D2B2 Chromatic Images production dispatch adapter (accepted), and M03-E SillyTavern-local image I/O (accepted).
+**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, M03-C response normalizer (accepted for provable behavior; unverified normalized envelope deferred to M03-G), M03-D1 single-request transport core (accepted), M03-D2A server path architecture decision (accepted; narrow core proxy update selected), M03-D2B1 SillyTavern normalized proxy (implemented and verified locally; committed in local SillyTavern checkout, pending upstream PR), M03-D2B2 Chromatic Images production dispatch adapter (accepted), M03-E SillyTavern-local image I/O (accepted), and M03-F Provider settings and diagnostic UI (accepted).
 
-**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building, response normalization, pure mocked transport core, production dispatch adapter with capability guard, local image I/O primitives, provider settings schema, credential readiness reader, and connection diagnostics UI are implemented. Paid image generation is not enabled.
+**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building (normalized and compatibility), response normalization, pure mocked transport core, production dispatch adapters with capability guards (normalized and compatibility), local image I/O primitives, provider settings schema, credential readiness reader, and connection diagnostics UI are implemented. Paid image generation is not enabled.
 
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
@@ -334,7 +334,7 @@ Implemented scope:
 
 ### M03-F — Provider settings and diagnostic UI
 
-**Status: Complete (ready for independent review).**
+**Status: Accepted.**
 
 Implements nonsensitive provider settings and non-billable local diagnostic controls without introducing an API key input, secret storage, or billable request paths.
 
@@ -346,11 +346,45 @@ Implemented scope:
 - UI DOM controller: `refreshProviderPanel(panel)` in `src/provider-panel.js` manages `#chromatic-images-resolution-select` and `#chromatic-images-diagnostics-run`. Employs WeakMap state tracking, single-flight click locking, generation token invalidation, scoped MutationObserver for DOM detachment, neutral cancellation recovery (`Not checked`), and resilient probe error handling.
 - Layout and styling: `settings.html` and `style.css` updated with responsive, SmartTheme-compatible provider and diagnostic sections.
 - Verification: comprehensive unit tests in `tests/provider-settings.test.mjs`, `tests/nanogpt-readiness.test.mjs`, `tests/provider-panel.test.mjs`, and `tests/panel.test.mjs`.
-- Boundaries: zero paid requests, zero calls to `/api/sd/nanogpt/images` POST or `https://api.nano-gpt.com/*`, no proposal-card Generate wiring. M03-G remains the authorized diagnostic generation boundary.
+- Acceptance: passed independent review and all 7 real-browser smoke checks.
 
 ### M03-G — Explicit diagnostic generation
 
-First deliberately billable path, available only after the transport gate is closed.
+Subdivided into M03-G1 (Compatibility transport & server proxy) and M03-G2 (Diagnostic generation UI & paid execution).
+
+#### M03-G1 — Compatibility Transport & Server Proxy
+
+**Status: Complete (ready for independent review).**
+
+Implements a second, strictly allowlisted image generation transport for the subscription-compatible NanoGPT endpoint (`POST /api/v1/images/generations`) via SillyTavern's local image proxy without breaking or altering normalized transport.
+
+Implemented scope:
+- Vendor evidence: NanoGPT Studio export `schema_version: media-integration-spec/v2` (2026-10-08) captured and verified.
+- SillyTavern server proxy (`src/endpoints/stable-diffusion.js` on local branch `m03-d2b1-nanogpt-proxy`):
+  - Routes: `GET` and `POST` at `/api/sd/nanogpt/images/generations`.
+  - Proxy marker: `x-st-nanogpt-proxy: v1-compat`.
+  - Upstream target: `POST https://api.nano-gpt.com/api/v1/images/generations` with `redirect: 'error'`.
+  - Strict payload validation: `model === 'qwen-image'`, trimmed prompt 1..3000 UTF-16 code units, `nImages === 1` (rejects `n` and other aliases), 7 allowed resolutions, `response_format === 'b64_json'`, mutually exclusive `imageDataUrl` (1 reference) vs `imageDataUrls` (2-3 references) with authentic PNG/JPEG/WebP magic bytes and $\le 30$ MiB aggregate decoded bytes.
+  - Safeguards: 50 MB local application payload limit (HTTP 413), 50 MB upstream response ceiling with stream counting via `Transform` (HTTP 502), client disconnect abort propagation, and zero sensitive body logging.
+  - SillyTavern unit test suite: 25 comprehensive tests in `tests/stable-diffusion.test.js` (total 50 suite tests passing).
+- Chromatic Images compatibility request builder (`src/providers/nanogpt-qwen-compat-request.js`):
+  - Pure function `buildQwenImageCompatibilityRequest(options)`.
+  - Maps references to `imageDataUrl` (1 ref) or `imageDataUrls` (2-3 refs), enforces bounds, and validates data URLs.
+  - Unit tests: 10 tests in `tests/nanogpt-qwen-compat-request.test.mjs`.
+- Chromatic Images compatibility dispatch adapter (`src/providers/nanogpt-image-dispatch.js`):
+  - `checkNanoGptGenerationsCapability(options)` with isolated session-memory cache `cachedGenerationsCapabilitySupported`.
+  - `clearNanoGptGenerationsCapabilityCache()` clearing only the compatibility cache.
+  - `createNanoGptGenerationsDispatch(dependencies)` targeting `POST /api/sd/nanogpt/images/generations`.
+  - `sendProductionNanoGptGenerationsRequest(options)` with pre-flight checks, timeout budgeting, and universal `v1-compat` marker verification wrapping default or custom dispatches.
+  - Unit tests: 15 compatibility dispatch tests in `tests/nanogpt-image-dispatch.test.mjs` (total 64 suite tests passing).
+- Isolation: normalized route (`v1`) and compatibility route (`v1-compat`) never share cache state or accept each other's markers.
+- Boundaries: zero paid calls, no diagnostic generation UI, no image generation.
+
+#### M03-G2 — Diagnostic Image Generation & Settings UI Wiring
+
+**Status: Planned (pending independent review).**
+
+First deliberately billable path, available only after M03-G1 independent review approval.
 
 Flow:
 
@@ -358,8 +392,8 @@ Flow:
 explicit diagnostic click
  -> validate
  -> load 0–3 refs
- -> build request
- -> one NanoGPT call
+ -> build compatibility request
+ -> one NanoGPT call via compatibility dispatch
  -> normalize
  -> local upload
  -> show durable local path/preview

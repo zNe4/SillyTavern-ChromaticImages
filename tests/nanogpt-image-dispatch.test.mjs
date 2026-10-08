@@ -5,12 +5,18 @@ import {
     NANOGPT_PROXY_ROUTE,
     NANOGPT_PROXY_MARKER_HEADER,
     NANOGPT_PROXY_MARKER_VALUE,
+    NANOGPT_PROXY_GENERATIONS_ROUTE,
+    NANOGPT_PROXY_GENERATIONS_MARKER_VALUE,
     CAPABILITY_DEFAULT_TIMEOUT_MS,
     DISPATCH_ERROR_CODES,
     checkNanoGptImagesCapability,
     clearNanoGptImagesCapabilityCache,
     createNanoGptImageDispatch,
     sendProductionNanoGptImageRequest,
+    checkNanoGptGenerationsCapability,
+    clearNanoGptGenerationsCapabilityCache,
+    createNanoGptGenerationsDispatch,
+    sendProductionNanoGptGenerationsRequest,
 } from '../src/providers/nanogpt-image-dispatch.js';
 
 import { TRANSPORT_ERROR_CODES } from '../src/providers/nanogpt-image-transport.js';
@@ -1333,3 +1339,413 @@ test('passive import safety: importing module does not make network calls or reg
     // Module is already imported at top of file; verify no global listeners were attached to window or process
     assert.strictEqual(typeof checkNanoGptImagesCapability, 'function');
 });
+
+// -----------------------------------------------------------------------------
+// Compatibility Route & Marker Invariants (M03-G1)
+// -----------------------------------------------------------------------------
+
+test('compatibility constants match SillyTavern proxy contract', () => {
+    assert.strictEqual(NANOGPT_PROXY_GENERATIONS_ROUTE, '/api/sd/nanogpt/images/generations');
+    assert.strictEqual(NANOGPT_PROXY_GENERATIONS_MARKER_VALUE, 'v1-compat');
+    assert.notStrictEqual(NANOGPT_PROXY_GENERATIONS_ROUTE, NANOGPT_PROXY_ROUTE);
+    assert.notStrictEqual(NANOGPT_PROXY_GENERATIONS_MARKER_VALUE, NANOGPT_PROXY_MARKER_VALUE);
+});
+
+test('compatibility module functions are properly exported', () => {
+    assert.strictEqual(typeof checkNanoGptGenerationsCapability, 'function');
+    assert.strictEqual(typeof clearNanoGptGenerationsCapabilityCache, 'function');
+    assert.strictEqual(typeof createNanoGptGenerationsDispatch, 'function');
+    assert.strictEqual(typeof sendProductionNanoGptGenerationsRequest, 'function');
+});
+
+// -----------------------------------------------------------------------------
+// Compatibility Capability Check Tests (M03-G1)
+// -----------------------------------------------------------------------------
+
+test('compatibility capability: succeeds and caches on 200 with v1-compat marker and expected route payload', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+    let fetchCalls = 0;
+    const mockFetch = async (url, init) => {
+        fetchCalls++;
+        assert.strictEqual(url, NANOGPT_PROXY_GENERATIONS_ROUTE);
+        assert.strictEqual(init.method, 'GET');
+        assert.strictEqual(init.headers['X-CSRF-Token'], 'test-csrf-token-12345');
+        return createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+            body: { ok: true, route: 'nanogpt-images-generations' },
+        });
+    };
+
+    const first = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    assert.strictEqual(first.supported, true);
+    assert.strictEqual(first.cached, false);
+    assert.strictEqual(first.status, 200);
+    assert.strictEqual(first.error, null);
+    assert.strictEqual(fetchCalls, 1);
+
+    // Second call hits cache without calling fetch
+    const second = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    assert.strictEqual(second.supported, true);
+    assert.strictEqual(second.cached, true);
+    assert.strictEqual(second.status, 200);
+    assert.strictEqual(second.error, null);
+    assert.strictEqual(fetchCalls, 1);
+
+    // forceCheck bypasses cache
+    const third = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+        forceCheck: true,
+    });
+
+    assert.strictEqual(third.supported, true);
+    assert.strictEqual(third.cached, false);
+    assert.strictEqual(fetchCalls, 2);
+
+    // clearNanoGptGenerationsCapabilityCache resets cache
+    clearNanoGptGenerationsCapabilityCache();
+    const fourth = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+    assert.strictEqual(fourth.cached, false);
+    assert.strictEqual(fetchCalls, 3);
+});
+
+test('compatibility capability: returns sillytavern-update-required on 404 without marker', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+    const mockFetch = async () => createMockResponse({
+        status: 404,
+        headers: {},
+        body: null,
+    });
+
+    const result = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    assert.strictEqual(result.supported, false);
+    assert.strictEqual(result.cached, false);
+    assert.strictEqual(result.status, 404);
+    assert.strictEqual(result.error.kind, DISPATCH_ERROR_CODES.SILLYTAVERN_UPDATE_REQUIRED);
+    assert.match(result.error.message, /NanoGPT compatibility image generations support/);
+});
+
+test('compatibility capability: rejects response with normalized marker v1 instead of v1-compat', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+    const mockFetch = async () => createMockResponse({
+        status: 200,
+        headers: { [NANOGPT_PROXY_MARKER_HEADER]: 'v1' }, // Wrong marker for compat route!
+        body: { ok: true, route: 'nanogpt-images-generations' },
+    });
+
+    const result = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    assert.strictEqual(result.supported, false);
+    assert.strictEqual(result.cached, false);
+    assert.strictEqual(result.status, 200);
+    assert.strictEqual(result.error.kind, DISPATCH_ERROR_CODES.CAPABILITY_MALFORMED_RESPONSE);
+});
+
+test('compatibility capability: rejects response with mismatched route payload', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+    const mockFetch = async () => createMockResponse({
+        status: 200,
+        headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+        body: { ok: true, route: 'nanogpt-images' }, // Wrong route in body!
+    });
+
+    const result = await checkNanoGptGenerationsCapability({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    assert.strictEqual(result.supported, false);
+    assert.strictEqual(result.cached, false);
+    assert.strictEqual(result.status, 200);
+    assert.strictEqual(result.error.kind, DISPATCH_ERROR_CODES.CAPABILITY_MALFORMED_RESPONSE);
+});
+
+test('cache isolation: normalized and compatibility capability caches are completely independent', async () => {
+    clearNanoGptImagesCapabilityCache();
+    clearNanoGptGenerationsCapabilityCache();
+
+    let normalizedCalls = 0;
+    let compatCalls = 0;
+
+    const mockFetch = async (url) => {
+        if (url === NANOGPT_PROXY_ROUTE) {
+            normalizedCalls++;
+            return createMockResponse({
+                status: 200,
+                headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_MARKER_VALUE },
+                body: { ok: true, route: 'nanogpt-images' },
+            });
+        }
+        if (url === NANOGPT_PROXY_GENERATIONS_ROUTE) {
+            compatCalls++;
+            return createMockResponse({
+                status: 200,
+                headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+                body: { ok: true, route: 'nanogpt-images-generations' },
+            });
+        }
+        throw new Error(`Unexpected url ${url}`);
+    };
+
+    // 1. Check normalized route -> populates normalized cache only
+    const norm1 = await checkNanoGptImagesCapability({ fetch: mockFetch, getRequestHeaders: getMockHeaders });
+    assert.strictEqual(norm1.supported, true);
+    assert.strictEqual(norm1.cached, false);
+    assert.strictEqual(normalizedCalls, 1);
+    assert.strictEqual(compatCalls, 0);
+
+    // 2. Compatibility check is NOT cached yet
+    const comp1 = await checkNanoGptGenerationsCapability({ fetch: mockFetch, getRequestHeaders: getMockHeaders });
+    assert.strictEqual(comp1.supported, true);
+    assert.strictEqual(comp1.cached, false);
+    assert.strictEqual(normalizedCalls, 1);
+    assert.strictEqual(compatCalls, 1);
+
+    // 3. Clear normalized cache -> does not clear compatibility cache
+    clearNanoGptImagesCapabilityCache();
+    const comp2 = await checkNanoGptGenerationsCapability({ fetch: mockFetch, getRequestHeaders: getMockHeaders });
+    assert.strictEqual(comp2.cached, true);
+    assert.strictEqual(compatCalls, 1);
+
+    // 4. Normalized is uncached
+    const norm2 = await checkNanoGptImagesCapability({ fetch: mockFetch, getRequestHeaders: getMockHeaders });
+    assert.strictEqual(norm2.cached, false);
+    assert.strictEqual(normalizedCalls, 2);
+
+    // 5. Clear compatibility cache -> does not clear normalized cache
+    clearNanoGptGenerationsCapabilityCache();
+    const norm3 = await checkNanoGptImagesCapability({ fetch: mockFetch, getRequestHeaders: getMockHeaders });
+    assert.strictEqual(norm3.cached, true);
+    assert.strictEqual(normalizedCalls, 2);
+
+    const comp3 = await checkNanoGptGenerationsCapability({ fetch: mockFetch, getRequestHeaders: getMockHeaders });
+    assert.strictEqual(comp3.cached, false);
+    assert.strictEqual(compatCalls, 2);
+});
+
+// -----------------------------------------------------------------------------
+// Compatibility Dispatch & Production Request Tests (M03-G1)
+// -----------------------------------------------------------------------------
+
+test('createNanoGptGenerationsDispatch dispatches POST to generations route with headers and body', async () => {
+    let dispatchedUrl = null;
+    let dispatchedInit = null;
+
+    const mockFetch = async (url, init) => {
+        dispatchedUrl = url;
+        dispatchedInit = init;
+        return createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+            body: { ok: true },
+        });
+    };
+
+    const dispatchFn = createNanoGptGenerationsDispatch({
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    const testPayload = { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: 'auto' };
+    await dispatchFn(testPayload);
+
+    assert.strictEqual(dispatchedUrl, NANOGPT_PROXY_GENERATIONS_ROUTE);
+    assert.strictEqual(dispatchedInit.method, 'POST');
+    assert.strictEqual(dispatchedInit.headers['Content-Type'], 'application/json');
+    assert.strictEqual(dispatchedInit.headers['X-CSRF-Token'], 'test-csrf-token-12345');
+    assert.deepEqual(JSON.parse(dispatchedInit.body), testPayload);
+});
+
+test('sendProductionNanoGptGenerationsRequest: pre-flight validation rejects invalid options and missing deps', async () => {
+    // Non-object options
+    const badRes = await sendProductionNanoGptGenerationsRequest(null);
+    assert.strictEqual(badRes.ok, false);
+    assert.strictEqual(badRes.dispatchAttempted, false);
+    assert.strictEqual(badRes.uncertainBilling, false);
+    assert.strictEqual(badRes.error.kind, DISPATCH_ERROR_CODES.INVALID_DISPATCH_OPTIONS);
+
+    // Missing getRequestHeaders
+    const missingHeadersRes = await sendProductionNanoGptGenerationsRequest({
+        request: { model: 'qwen-image', prompt: 'test' },
+        fetch: async () => {},
+    });
+    assert.strictEqual(missingHeadersRes.ok, false);
+    assert.strictEqual(missingHeadersRes.error.kind, DISPATCH_ERROR_CODES.LOCAL_DEPENDENCY_MISSING);
+});
+
+test('sendProductionNanoGptGenerationsRequest: fails closed with sillytavern-update-required when capability check returns 404', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+    let postAttempted = false;
+
+    const mockFetch = async (url, init) => {
+        if (init?.method === 'GET') {
+            return createMockResponse({ status: 404, headers: {}, body: null });
+        }
+        postAttempted = true;
+        return createMockResponse({ status: 200, headers: {}, body: {} });
+    };
+
+    const result = await sendProductionNanoGptGenerationsRequest({
+        request: { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: 'auto' },
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.dispatchAttempted, false);
+    assert.strictEqual(result.uncertainBilling, false);
+    assert.strictEqual(result.error.kind, DISPATCH_ERROR_CODES.SILLYTAVERN_UPDATE_REQUIRED);
+    assert.strictEqual(postAttempted, false);
+});
+
+test('sendProductionNanoGptGenerationsRequest: dispatches and succeeds when capability and post-dispatch response have v1-compat marker', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+    let getCalled = false;
+    let postCalled = false;
+
+    const mockFetch = async (url, init) => {
+        if (init?.method === 'GET') {
+            getCalled = true;
+            assert.strictEqual(url, NANOGPT_PROXY_GENERATIONS_ROUTE);
+            return createMockResponse({
+                status: 200,
+                headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+                body: { ok: true, route: 'nanogpt-images-generations' },
+            });
+        }
+        if (init?.method === 'POST') {
+            postCalled = true;
+            assert.strictEqual(url, NANOGPT_PROXY_GENERATIONS_ROUTE);
+            return createMockResponse({
+                status: 200,
+                headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+                body: { created: 12345, data: [{ b64_json: 'aW1hZ2UtZGF0YQ==' }] },
+            });
+        }
+        throw new Error(`Unexpected call ${url}`);
+    };
+
+    const result = await sendProductionNanoGptGenerationsRequest({
+        request: { model: 'qwen-image', prompt: 'a beautiful valley', nImages: 1, resolution: '1024x1024', response_format: 'b64_json' },
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.dispatchAttempted, true);
+    assert.strictEqual(result.uncertainBilling, false);
+    assert.strictEqual(getCalled, true);
+    assert.strictEqual(postCalled, true);
+    assert.deepEqual(result.body, { created: 12345, data: [{ b64_json: 'aW1hZ2UtZGF0YQ==' }] });
+});
+
+test('sendProductionNanoGptGenerationsRequest: fails closed with PROXY_RESPONSE_UNVERIFIED if post-dispatch marker is v1 instead of v1-compat', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+
+    const mockFetch = async (url, init) => {
+        if (init?.method === 'GET') {
+            return createMockResponse({
+                status: 200,
+                headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+                body: { ok: true, route: 'nanogpt-images-generations' },
+            });
+        }
+        // POST returns normalized marker 'v1' instead of 'v1-compat'!
+        return createMockResponse({
+            status: 200,
+            headers: { [NANOGPT_PROXY_MARKER_HEADER]: 'v1' },
+            body: { created: 12345, data: [{ b64_json: 'aW1hZ2UtZGF0YQ==' }] },
+        });
+    };
+
+    const result = await sendProductionNanoGptGenerationsRequest({
+        request: { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: 'auto' },
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.dispatchAttempted, true);
+    assert.strictEqual(result.uncertainBilling, true);
+    assert.strictEqual(result.error.kind, DISPATCH_ERROR_CODES.PROXY_RESPONSE_UNVERIFIED);
+});
+
+test('sendProductionNanoGptGenerationsRequest: universal marker verification enforces v1-compat on custom dispatch wrapper', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+
+    const mockFetch = async (url, init) => {
+        if (init?.method === 'GET') {
+            return createMockResponse({
+                status: 200,
+                headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+                body: { ok: true, route: 'nanogpt-images-generations' },
+            });
+        }
+        throw new Error('Default fetch should not be called for POST when custom dispatch is provided');
+    };
+
+    // Custom dispatch that returns response missing v1-compat marker
+    const customDispatch = async () => createMockResponse({
+        status: 200,
+        headers: {}, // No marker!
+        body: { ok: true },
+    });
+
+    const result = await sendProductionNanoGptGenerationsRequest({
+        request: { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: 'auto' },
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+        dispatch: customDispatch,
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.dispatchAttempted, true);
+    assert.strictEqual(result.uncertainBilling, true);
+    assert.strictEqual(result.error.kind, DISPATCH_ERROR_CODES.PROXY_RESPONSE_UNVERIFIED);
+});
+
+test('sendProductionNanoGptGenerationsRequest: post-dispatch network error preserves uncertainBilling: true', async () => {
+    clearNanoGptGenerationsCapabilityCache();
+
+    const mockFetch = async (url, init) => {
+        if (init?.method === 'GET') {
+            return createMockResponse({
+                status: 200,
+                headers: { [NANOGPT_PROXY_MARKER_HEADER]: NANOGPT_PROXY_GENERATIONS_MARKER_VALUE },
+                body: { ok: true, route: 'nanogpt-images-generations' },
+            });
+        }
+        throw new TypeError('Network connection reset by peer');
+    };
+
+    const result = await sendProductionNanoGptGenerationsRequest({
+        request: { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: 'auto' },
+        fetch: mockFetch,
+        getRequestHeaders: getMockHeaders,
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.dispatchAttempted, true);
+    assert.strictEqual(result.uncertainBilling, true);
+    assert.strictEqual(result.error.kind, TRANSPORT_ERROR_CODES.NETWORK_FAILURE);
+});
+
