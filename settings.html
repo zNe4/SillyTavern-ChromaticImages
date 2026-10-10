@@ -167,6 +167,153 @@
                 ></p>
             </section>
             <section
+                id="chromatic-images-diagnostic-section"
+                class="chromatic-images-diagnostic-section"
+                aria-labelledby="chromatic-images-diagnostic-heading"
+            >
+                <h3
+                    id="chromatic-images-diagnostic-heading"
+                    class="chromatic-images-section-title"
+                >
+                    Diagnostic image generation
+                </h3>
+                <p class="chromatic-images-section-description">
+                    Explicitly test NanoGPT image generation using the subscription-compatible Qwen Image route.
+                </p>
+                <p class="chromatic-images-billing-notice">
+                    Qwen Image may use your NanoGPT subscription image allowance when eligible. Otherwise, the published pay-as-you-go price is $0.02 per image. Actual billing depends on your account, quota and API-key settings.
+                </p>
+                <div class="chromatic-images-field-group">
+                    <label
+                        for="chromatic-images-diagnostic-prompt"
+                        class="chromatic-images-field-label"
+                    >
+                        Test prompt
+                    </label>
+                    <textarea
+                        id="chromatic-images-diagnostic-prompt"
+                        class="text_pole chromatic-images-textarea"
+                        maxlength="3000"
+                        rows="3"
+                        placeholder="Enter a prompt to generate a test image…"
+                    ></textarea>
+                </div>
+                <div class="chromatic-images-field-group">
+                    <label
+                        for="chromatic-images-diagnostic-refs"
+                        class="chromatic-images-field-label"
+                    >
+                        Reference images (optional, up to 3)
+                    </label>
+                    <input
+                        id="chromatic-images-diagnostic-refs"
+                        class="chromatic-images-file-input"
+                        type="file"
+                        multiple
+                        accept="image/png,image/jpeg,image/webp"
+                    />
+                    <div
+                        id="chromatic-images-diagnostic-refs-preview"
+                        class="chromatic-images-refs-preview-container"
+                        role="list"
+                        aria-label="Selected reference images"
+                    ></div>
+                </div>
+                <div
+                    id="chromatic-images-diagnostic-status-list"
+                    class="chromatic-images-status-list"
+                    role="list"
+                    aria-label="Diagnostic generation status"
+                >
+                    <div
+                        class="chromatic-images-status-row"
+                        role="listitem"
+                    >
+                        <span class="chromatic-images-status-label">
+                            Compatibility proxy
+                        </span>
+                        <span
+                            id="chromatic-images-diagnostic-compat-status"
+                            class="chromatic-images-status-value"
+                            data-compat-status="not-checked"
+                        >
+                            Not checked
+                        </span>
+                    </div>
+                    <div
+                        class="chromatic-images-status-row"
+                        role="listitem"
+                    >
+                        <span class="chromatic-images-status-label">
+                            Generation phase
+                        </span>
+                        <span
+                            id="chromatic-images-diagnostic-phase"
+                            class="chromatic-images-status-value"
+                            data-diagnostic-phase="idle"
+                        >
+                            Idle
+                        </span>
+                    </div>
+                </div>
+                <p
+                    id="chromatic-images-diagnostic-summary"
+                    class="chromatic-images-diagnostics-summary"
+                    role="status"
+                    aria-live="polite"
+                >
+                    Ready to test generation.
+                </p>
+                <div class="chromatic-images-diagnostics-actions">
+                    <button
+                        id="chromatic-images-diagnostic-generate-btn"
+                        class="menu_button chromatic-images-diagnostics-run"
+                        type="button"
+                        aria-describedby="chromatic-images-diagnostic-summary chromatic-images-diagnostic-feedback"
+                    >
+                        Generate test image
+                    </button>
+                    <button
+                        id="chromatic-images-diagnostic-clear-btn"
+                        class="menu_button chromatic-images-diagnostics-clear"
+                        type="button"
+                        disabled
+                    >
+                        Clear test result
+                    </button>
+                </div>
+                <p
+                    id="chromatic-images-diagnostic-feedback"
+                    class="chromatic-images-feedback chromatic-images-diagnostics-feedback"
+                    role="status"
+                    aria-live="polite"
+                    hidden
+                ></p>
+                <div
+                    id="chromatic-images-diagnostic-result-container"
+                    class="chromatic-images-diagnostic-result-container"
+                    hidden
+                >
+                    <h4 class="chromatic-images-result-title">Generated result</h4>
+                    <div class="chromatic-images-preview-wrapper">
+                        <img
+                            id="chromatic-images-diagnostic-preview"
+                            class="chromatic-images-diagnostic-preview"
+                            alt="Diagnostic generation preview"
+                            src=""
+                            hidden
+                        />
+                    </div>
+                    <div class="chromatic-images-path-wrapper">
+                        <span class="chromatic-images-field-label">Durable local path:</span>
+                        <code
+                            id="chromatic-images-diagnostic-path"
+                            class="chromatic-images-diagnostic-path"
+                        ></code>
+                    </div>
+                </div>
+            </section>
+            <section
                 id="chromatic-images-regex-section"
                 class="chromatic-images-regex-section"
                 aria-labelledby="chromatic-images-regex-heading"

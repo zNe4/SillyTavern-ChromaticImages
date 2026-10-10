@@ -468,3 +468,99 @@ test('I. refreshPanelState refreshes both Regex and Provider UI sections safely 
     }
 });
 
+test('J. refreshPanelState refreshes Regex, Provider, and Diagnostic UI sections safely without network or saves', () => {
+    const origDoc = globalThis.document;
+    const origST = globalThis.SillyTavern;
+
+    try {
+        let saveCalls = 0;
+        const extensionSettings = {
+            regex: [],
+            chromatic_images: { resolution: 'auto' },
+        };
+
+        globalThis.SillyTavern = {
+            getContext() {
+                return {
+                    extensionSettings,
+                    saveSettingsDebounced() {
+                        saveCalls += 1;
+                    },
+                };
+            },
+        };
+
+        const panel = createMockElement(PANEL_ID);
+        panel.drawerToggle = createMockElement(PANEL_DRAWER_TOGGLE_ID, 'button');
+
+        // Regex elements
+        panel.setChild('#chromatic-images-regex-prompt-hygiene-status', createMockElement('chromatic-images-regex-prompt-hygiene-status'));
+        panel.setChild('#chromatic-images-regex-summary', createMockElement('chromatic-images-regex-summary'));
+        panel.setChild('#chromatic-images-regex-repair', createMockElement('chromatic-images-regex-repair', 'button'));
+        panel.setChild('#chromatic-images-regex-feedback', createMockElement('chromatic-images-regex-feedback'));
+
+        // Provider elements
+        const resolutionSelect = createMockElement('chromatic-images-resolution-select', 'select');
+        resolutionSelect.value = 'auto';
+        panel.setChild('#chromatic-images-resolution-select', resolutionSelect);
+        panel.setChild('#chromatic-images-diagnostics-run', createMockElement('chromatic-images-diagnostics-run', 'button'));
+        panel.setChild('#chromatic-images-credential-status', createMockElement('chromatic-images-credential-status'));
+        panel.setChild('#chromatic-images-proxy-status', createMockElement('chromatic-images-proxy-status'));
+        panel.setChild('#chromatic-images-diagnostics-summary', createMockElement('chromatic-images-diagnostics-summary'));
+        panel.setChild('#chromatic-images-diagnostics-feedback', createMockElement('chromatic-images-diagnostics-feedback'));
+
+        // Diagnostic generator elements
+        const diagPrompt = createMockElement('chromatic-images-diagnostic-prompt', 'textarea');
+        const diagRefs = createMockElement('chromatic-images-diagnostic-refs', 'input');
+        const diagRefsPreview = createMockElement('chromatic-images-diagnostic-refs-preview');
+        const diagGenerateBtn = createMockElement('chromatic-images-diagnostic-generate-btn', 'button');
+        const diagClearBtn = createMockElement('chromatic-images-diagnostic-clear-btn', 'button');
+        const diagCompatStatus = createMockElement('chromatic-images-diagnostic-compat-status');
+        const diagPhase = createMockElement('chromatic-images-diagnostic-phase');
+        const diagSummary = createMockElement('chromatic-images-diagnostic-summary');
+        const diagFeedback = createMockElement('chromatic-images-diagnostic-feedback');
+        const diagResultContainer = createMockElement('chromatic-images-diagnostic-result-container');
+        const diagPreview = createMockElement('chromatic-images-diagnostic-preview', 'img');
+        const diagPath = createMockElement('chromatic-images-diagnostic-path', 'code');
+
+        panel.setChild('#chromatic-images-diagnostic-prompt', diagPrompt);
+        panel.setChild('#chromatic-images-diagnostic-refs', diagRefs);
+        panel.setChild('#chromatic-images-diagnostic-refs-preview', diagRefsPreview);
+        panel.setChild('#chromatic-images-diagnostic-generate-btn', diagGenerateBtn);
+        panel.setChild('#chromatic-images-diagnostic-clear-btn', diagClearBtn);
+        panel.setChild('#chromatic-images-diagnostic-compat-status', diagCompatStatus);
+        panel.setChild('#chromatic-images-diagnostic-phase', diagPhase);
+        panel.setChild('#chromatic-images-diagnostic-summary', diagSummary);
+        panel.setChild('#chromatic-images-diagnostic-feedback', diagFeedback);
+        panel.setChild('#chromatic-images-diagnostic-result-container', diagResultContainer);
+        panel.setChild('#chromatic-images-diagnostic-preview', diagPreview);
+        panel.setChild('#chromatic-images-diagnostic-path', diagPath);
+
+        globalThis.document = {
+            getElementById(id) {
+                if (id === PANEL_ID) {
+                    return panel;
+                }
+                return null;
+            },
+        };
+
+        refreshPanelState();
+
+        assert.equal(diagGenerateBtn.disabled, false);
+        assert.equal(diagClearBtn.disabled, true);
+        assert.equal(saveCalls, 0);
+
+        // Repeated refresh does not duplicate listeners
+        refreshPanelState();
+        refreshPanelState();
+
+        assert.equal(diagGenerateBtn.getListeners('click').length, 1);
+        assert.equal(diagClearBtn.getListeners('click').length, 1);
+        assert.equal(diagRefs.getListeners('change').length, 1);
+        assert.equal(saveCalls, 0);
+    } finally {
+        globalThis.document = origDoc;
+        globalThis.SillyTavern = origST;
+    }
+});

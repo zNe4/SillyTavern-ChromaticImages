@@ -6,6 +6,7 @@ import {
 } from './constants.js';
 import { refreshRegexIntegrationControl } from './regex-panel.js';
 import { refreshProviderPanel } from './provider-panel.js';
+import { refreshDiagnosticPanel } from './diagnostic-panel.js';
 
 const registeredAccessibleDrawers = new WeakSet();
 
@@ -86,4 +87,5 @@ export function refreshPanelState() {
     registerDrawerAccessibility(panel);
     refreshRegexIntegrationControl(panel);
     refreshProviderPanel(panel);
+    refreshDiagnosticPanel(panel);
 }

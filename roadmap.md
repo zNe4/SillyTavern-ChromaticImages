@@ -354,7 +354,7 @@ Subdivided into M03-G1 (Compatibility transport & server proxy) and M03-G2 (Diag
 
 #### M03-G1 — Compatibility Transport & Server Proxy
 
-**Status: Complete (ready for independent review).**
+**Status: Accepted.**
 
 Implements a second, strictly allowlisted image generation transport for the subscription-compatible NanoGPT endpoint (`POST /api/v1/images/generations`) via SillyTavern's local image proxy without breaking or altering normalized transport.
 
@@ -383,24 +383,34 @@ Implemented scope:
 
 #### M03-G2 — Diagnostic Image Generation & Settings UI Wiring
 
-**Status: Planned (pending independent review).**
+**Status: Complete (ready for independent review and real smoke checks).**
 
-First deliberately billable path, available only after M03-G1 independent review approval.
+Explicitly user-initiated diagnostic image generator inside the settings drawer using the M03-G1 compatibility proxy (`POST /api/sd/nanogpt/images/generations`, marker `v1-compat`), supporting text prompt, resolution snapshot, 0..3 reference images, preflight dimension inspection, single dispatch, normalization, local upload, preview, billing truthfulness, and safe UI lifecycle management.
 
 Flow:
 
 ~~~text
 explicit diagnostic click
- -> validate
- -> load 0–3 refs
+ -> validate prompt (1..3000 chars)
+ -> snapshot persisted resolution
+ -> preflight 0–3 refs (PNG/JPEG/WebP, 8..16384 px)
+ -> prepare data URLs (<=30 MiB aggregate)
  -> build compatibility request
- -> one NanoGPT call via compatibility dispatch
- -> normalize
- -> local upload
- -> show durable local path/preview
+ -> verify v1-compat proxy capability
+ -> one NanoGPT call via compatibility dispatch (150s deadline)
+ -> normalize response (b64_json, reject remote URLs)
+ -> local upload to /user/images/... (60s deadline)
+ -> show preview & durable local path
 ~~~
 
-Failures never mutate chat and never auto-retry.
+Implemented scope:
+- UI in settings drawer (`settings.html`, `style.css`): Prompt textarea (maxlength 3000, multiline preserved, not saved to settings/chat), file input for 0–3 references (PNG/JPEG/WebP), preview thumbnails with revocation on replacement/detach, persisted resolution snapshot from M03-F select, explicit Generate button, Clear test result button, separated status/phase/error/path elements.
+- Local reference preflight (`src/images/image-preflight.js`): Enforces $[8, 16384]$ px dimension bounds, primary `createImageBitmap` with explicit `bitmap.close()` cleanup, browser-native `Image()` fallback with object URL revocation and listener cleanup, cancellation via `AbortSignal`, zero Node dependencies.
+- Controller lifecycle (`src/diagnostic-panel.js`): WeakMap-backed panel state, single-flight click locking, generation token invalidation, scoped `MutationObserver` detecting panel detachment to abort in-flight work and revoke object URLs, no automatic capability checks or requests on mount/drawer/chat/refresh.
+- Dispatch & upload: Single provider dispatch with 150s operation deadline, compatibility proxy marker `v1-compat` verification, response normalization via `normalizeNanoGptImageResponse()`, remote URL rejection with billing uncertainty, durable local upload via `uploadGeneratedImageBase64()` with 60s deadline.
+- Truthful billing & privacy: Transparent billing notice (subscription allowance or $0.02 pay-as-you-go), conservative billing uncertainty on any post-dispatch failure ("The request was attempted; quota or account balance may have been affected"), zero logging or attribute reflection of raw errors, prompts, base64 images, or credentials.
+- Safe lifecycle & chat isolation: Drawer collapse/reopen retains preview; Clear result clears DOM state without deleting saved file; zero chat message modification or proposal card alteration.
+- Test coverage (`tests/image-preflight.test.mjs`, `tests/diagnostic-panel.test.mjs`, `tests/panel.test.mjs`): 42 new unit tests, 669/669 passing across the test suite.
 
 ### M03-H — Integration and closeout
 

@@ -54,3 +54,63 @@ export const DIAGNOSTICS_SUMMARY_ID =
 
 export const DIAGNOSTICS_FEEDBACK_ID =
     'chromatic-images-diagnostics-feedback';
+
+export const COMPAT_STATUS = Object.freeze({
+    NOT_CHECKED: 'not-checked',
+    CHECKING: 'checking',
+    AVAILABLE: 'available',
+    UPDATE_REQUIRED: 'update-required',
+    UNAVAILABLE: 'unavailable',
+    CANCELLED: 'cancelled',
+});
+
+export const DIAGNOSTIC_PHASE = Object.freeze({
+    IDLE: 'idle',
+    VALIDATING: 'validating',
+    PREPARING_REFERENCES: 'preparing-references',
+    CHECKING_COMPATIBILITY: 'checking-compatibility',
+    GENERATING: 'generating',
+    SAVING_LOCALLY: 'saving-locally',
+    COMPLETE: 'complete',
+    FAILED: 'failed',
+    CANCELLED: 'cancelled',
+});
+
+export const DIAGNOSTIC_SECTION_ID =
+    'chromatic-images-diagnostic-section';
+
+export const DIAGNOSTIC_PROMPT_ID =
+    'chromatic-images-diagnostic-prompt';
+
+export const DIAGNOSTIC_REFS_ID =
+    'chromatic-images-diagnostic-refs';
+
+export const DIAGNOSTIC_REFS_PREVIEW_ID =
+    'chromatic-images-diagnostic-refs-preview';
+
+export const DIAGNOSTIC_GENERATE_BUTTON_ID =
+    'chromatic-images-diagnostic-generate-btn';
+
+export const DIAGNOSTIC_CLEAR_BUTTON_ID =
+    'chromatic-images-diagnostic-clear-btn';
+
+export const DIAGNOSTIC_COMPAT_STATUS_ID =
+    'chromatic-images-diagnostic-compat-status';
+
+export const DIAGNOSTIC_PHASE_ID =
+    'chromatic-images-diagnostic-phase';
+
+export const DIAGNOSTIC_SUMMARY_ID =
+    'chromatic-images-diagnostic-summary';
+
+export const DIAGNOSTIC_FEEDBACK_ID =
+    'chromatic-images-diagnostic-feedback';
+
+export const DIAGNOSTIC_RESULT_CONTAINER_ID =
+    'chromatic-images-diagnostic-result-container';
+
+export const DIAGNOSTIC_PREVIEW_ID =
+    'chromatic-images-diagnostic-preview';
+
+export const DIAGNOSTIC_PATH_ID =
+    'chromatic-images-diagnostic-path';

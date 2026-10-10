@@ -492,10 +492,30 @@ Captured vendor evidence (NanoGPT Studio export `schema_version: media-integrati
   - `createNanoGptGenerationsDispatch(dependencies)`: constructs low-level POST dispatch targeting `/api/sd/nanogpt/images/generations`
   - `sendProductionNanoGptGenerationsRequest(options)`: production service with pre-flight validation, capability checking, remaining timeout budgeting, universal `v1-compat` marker verification wrapping default or custom dispatches, and conservative billing uncertainty preservation
   - Cache and lifecycle guarantees: caller pre-abort precedes positive capability cache hits, failed forced rechecks invalidate prior positive cache state for both routes, sequential operation counter prevents late-resolving stale operations from mutating cache, internal and caller abort listeners are cleanly cleaned up in `finally`, static error messages on invalid options, and normalized route (`v1`) and compatibility route (`v1-compat`) maintain completely independent positive capability caches and strictly fail closed if presented with the other route's marker
+  - Status: M03-G1 is fully accepted following independent review.
 
 #### M03-G2 — Diagnostic Image Generation & Settings UI Wiring
 
-Diagnostic image generation execution and Settings UI integration remain deferred to M03-G2 under independent review. No image generation UI or paid calls were added in M03-G1.
+**Status: Implemented, awaiting independent review and live smoke.**
+
+Adds an explicitly user-initiated diagnostic image generator inside Chromatic Images' existing settings drawer.
+
+Key architectural and runtime properties:
+- **Baseline:** Client test suite passes 669/669 tests on Node.js 22 and 24 (627 baseline + 42 new M03-G2 tests). SillyTavern local compatibility proxy patch passes 63/63 tests.
+- **Route distinction:**
+  - Normalized route: `POST /api/sd/nanogpt/images` (marker: `x-st-nanogpt-proxy: v1`), targeting NanoGPT `POST /api/v1/images` with `input_references`.
+  - Compatibility route: `POST /api/sd/nanogpt/images/generations` (marker: `x-st-nanogpt-proxy: v1-compat`), targeting NanoGPT `POST /api/v1/images/generations` with `imageDataUrl` (1 ref) or `imageDataUrls` (2-3 refs). Supports NanoGPT subscription image allowance.
+- **Server proxy deadline:** SillyTavern compatibility proxy enforces a 120-second upstream operation deadline (`DEFAULT_NANOGPT_GENERATIONS_TIMEOUT_MS = 120000`) before returning HTTP 504.
+- **Browser-side generation timeout:** 150 seconds whole-dispatch budget (`DEFAULT_GENERATION_TIMEOUT_MS = 150000`), giving adequate time for server-side timeout and transfer overhead.
+- **Browser-side upload timeout:** 60 seconds budget (`DEFAULT_UPLOAD_TIMEOUT_MS = 60000`).
+- **No automatic generation:** Zero capability checks or generation calls on mount, drawer expansion, chat switch, resolution changes, or panel refresh. Generation requires an explicit click on `#chromatic-images-diagnostic-generate-btn`.
+- **Preflight dimension validation (`src/images/image-preflight.js`):** Enforces $8 \le \text{width/height} \le 16384$ px for all reference images prior to base64 conversion or network calls. Primary decoder `createImageBitmap()` closes bitmap handles on every exit path; browser-native `Image()` fallback ensures object URL revocation and listener cleanup.
+- **Single provider dispatch:** Exactly one provider POST per Generate click. Zero automatic retries under any circumstance.
+- **Response normalization & remote URL rejection:** Transport body normalized via `normalizeNanoGptImageResponse()` with `source: 'openai-compatible'`. Remote URL results fail closed with privacy-safe error notice, preserving billing uncertainty.
+- **Durable local output:** Successful base64 uploads through `uploadGeneratedImageBase64()` to `/user/images/...`. Preview `src` and durable path display use the validated local path.
+- **Chat isolation & no chat modification:** Diagnostic images are saved to SillyTavern storage but do NOT alter chat messages, write `CI_IMAGE` records, or generate `CI_RESULT` records.
+- **Billing truthfulness:** Interface displays clear notice that generation may use subscription allowance or incur $0.02 pay-as-you-go charge. All failures after dispatch preserve billing uncertainty notice.
+- **Lifecycle & detachment handling:** WeakMap-backed panel state, single-flight locking, generation token invalidation, scoped MutationObserver detecting detachment to abort in-flight work and revoke object URLs. Clear button removes preview without deleting image on disk. Drawer collapse and reopen retains preview without refetch.
 
 ## 19. M03-A gate result
 
