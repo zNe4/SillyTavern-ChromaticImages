@@ -156,6 +156,89 @@ function setPhaseAttr(element, phaseValue) {
 }
 
 /**
+ * Revokes all tracked thumbnail object URLs and clears the set.
+ *
+ * @param {object} state
+ */
+function revokeAllThumbnails(state) {
+    const revokeFn =
+        state.deps?.revokeObjectURL ?? globalThis.URL?.revokeObjectURL;
+    if (typeof revokeFn === 'function') {
+        for (const url of state.objectUrls) {
+            try {
+                revokeFn(url);
+            } catch {
+                // ignore
+            }
+        }
+    }
+    state.objectUrls.clear();
+}
+
+/**
+ * Handles panel detachment from the DOM:
+ * 1. Aborts active generation if running.
+ * 2. Revokes all thumbnail object URLs.
+ * 3. Disconnects and cleans up the detachment observer.
+ *
+ * @param {ParentNode} panel
+ * @param {object} state
+ */
+function handlePanelDetachment(panel, state) {
+    if (state.isGenerating) {
+        state.generationToken += 1;
+        state.isGenerating = false;
+        if (state.activeAbortController) {
+            state.activeAbortController.abort();
+            state.activeAbortController = null;
+        }
+    }
+
+    revokeAllThumbnails(state);
+
+    if (state.detachmentObserver) {
+        state.detachmentObserver.disconnect();
+        state.detachmentObserver = null;
+    }
+}
+
+/**
+ * Ensures a single MutationObserver is active on document.body to monitor
+ * panel detachment across both idle and active generation states.
+ *
+ * @param {ParentNode} panel
+ * @param {object} state
+ */
+function ensureDetachmentObserver(panel, state) {
+    if (state.detachmentObserver) {
+        return;
+    }
+
+    const ObserverCtor =
+        state.deps?.MutationObserver ??
+        (typeof MutationObserver === 'function' ? MutationObserver : null);
+
+    const doc =
+        state.deps?.document ??
+        (typeof document !== 'undefined' ? document : null);
+
+    if (!ObserverCtor || !doc?.body) {
+        return;
+    }
+
+    state.detachmentObserver = new ObserverCtor(() => {
+        if (!isPanelAttached(panel)) {
+            handlePanelDetachment(panel, state);
+        }
+    });
+
+    state.detachmentObserver.observe(doc.body, {
+        childList: true,
+        subtree: true,
+    });
+}
+
+/**
  * Controller entrypoint for Diagnostic Image Generation UI.
  *
  * @param {ParentNode|null|undefined} panel Root panel element.
@@ -177,6 +260,8 @@ function setPhaseAttr(element, phaseValue) {
  *   extensionSettings?: object,
  *   generationTimeoutMs?: number,
  *   uploadTimeoutMs?: number,
+ *   MutationObserver?: typeof MutationObserver,
+ *   document?: any,
  * }} [deps={}] Injected dependencies for testing.
  */
 export function refreshDiagnosticPanel(panel, deps = {}) {
@@ -231,7 +316,7 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
             isGenerating: false,
             generationToken: 0,
             activeAbortController: null,
-            activeDetachmentObserver: null,
+            detachmentObserver: null,
             objectUrls: new Set(),
             hasResult: false,
             deps,
@@ -239,6 +324,10 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
         panelStateMap.set(panel, state);
     } else {
         state.deps = deps;
+    }
+
+    if (isPanelAttached(panel)) {
+        ensureDetachmentObserver(panel, state);
     }
 
     const getExtSettings = () =>
@@ -260,22 +349,13 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
     if (!state.listenerAttached) {
         // Reference file selection thumbnail preview handler
         refsInput.addEventListener('change', () => {
-            const revokeFn =
-                state.deps.revokeObjectURL ?? globalThis.URL?.revokeObjectURL;
+            ensureDetachmentObserver(panel, state);
+
             const createUrlFn =
                 state.deps.createObjectURL ?? globalThis.URL?.createObjectURL;
 
             // Revoke prior thumbnail URLs
-            if (typeof revokeFn === 'function') {
-                for (const url of state.objectUrls) {
-                    try {
-                        revokeFn(url);
-                    } catch {
-                        // ignore
-                    }
-                }
-            }
-            state.objectUrls.clear();
+            revokeAllThumbnails(state);
 
             refsPreviewEl.textContent = '';
 
@@ -290,10 +370,14 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
                 clearFeedback(feedbackEl);
             }
 
+            const doc =
+                state.deps?.document ??
+                (typeof document !== 'undefined' ? document : null);
+
             for (let i = 0; i < Math.min(files.length, QWEN_IMAGE_MAX_REFERENCES); i++) {
                 const file = files[i];
-                if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
-                    const thumbWrapper = document.createElement('div');
+                if (typeof doc?.createElement === 'function') {
+                    const thumbWrapper = doc.createElement('div');
                     thumbWrapper.className = 'chromatic-images-ref-thumb-wrapper';
 
                     if (typeof createUrlFn === 'function') {
@@ -306,7 +390,7 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
 
                         if (thumbUrl) {
                             state.objectUrls.add(thumbUrl);
-                            const img = document.createElement('img');
+                            const img = doc.createElement('img');
                             img.className = 'chromatic-images-ref-thumb';
                             img.src = thumbUrl;
                             img.alt = file.name || `Reference ${i + 1}`;
@@ -314,7 +398,7 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
                         }
                     }
 
-                    const nameSpan = document.createElement('span');
+                    const nameSpan = doc.createElement('span');
                     nameSpan.className = 'chromatic-images-ref-thumb-name';
                     nameSpan.textContent = file.name || `ref-${i + 1}`;
                     thumbWrapper.appendChild(nameSpan);
@@ -342,62 +426,22 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
             const controller = new AbortController();
             state.activeAbortController = controller;
 
-            // Scoped detachment observer
-            let detachmentObserver = null;
-            if (
-                typeof MutationObserver === 'function' &&
-                typeof document !== 'undefined' &&
-                document.body
-            ) {
-                detachmentObserver = new MutationObserver(() => {
-                    if (!isPanelAttached(panel)) {
-                        if (state.generationToken === currentGeneration) {
-                            state.generationToken += 1;
-                            state.isGenerating = false;
-                            if (state.activeAbortController === controller) {
-                                state.activeAbortController = null;
-                            }
-                            if (
-                                state.activeDetachmentObserver ===
-                                detachmentObserver
-                            ) {
-                                state.activeDetachmentObserver = null;
-                            }
-                        }
-                        controller.abort();
-
-                        const revokeFn =
-                            state.deps.revokeObjectURL ??
-                            globalThis.URL?.revokeObjectURL;
-                        if (typeof revokeFn === 'function') {
-                            for (const url of state.objectUrls) {
-                                try {
-                                    revokeFn(url);
-                                } catch {
-                                    // ignore
-                                }
-                            }
-                        }
-                        state.objectUrls.clear();
-
-                        if (detachmentObserver) {
-                            detachmentObserver.disconnect();
-                            detachmentObserver = null;
-                        }
-                    }
-                });
-                detachmentObserver.observe(document.body, {
-                    childList: true,
-                    subtree: true,
-                });
-                state.activeDetachmentObserver = detachmentObserver;
-            }
+            ensureDetachmentObserver(panel, state);
 
             // In-flight UI setup
             generateBtn.disabled = true;
             generateBtn.textContent = 'Generating…';
             clearBtn.disabled = true;
             clearFeedback(feedbackEl);
+
+            // Clear prior diagnostic result display at start of new generation attempt
+            previewImg.src = '';
+            previewImg.hidden = true;
+            pathCode.textContent = '';
+            resultContainer.hidden = true;
+            state.hasResult = false;
+
+            let dispatchAttempted = false;
 
             const handleCancellation = (wasDispatched = false) => {
                 phaseEl.textContent = 'Cancelled';
@@ -719,6 +763,8 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
                 summaryEl.textContent =
                     'Generating test image via NanoGPT (up to 150s)…';
 
+                dispatchAttempted = true;
+
                 const sendGenerationsFn =
                     state.deps.sendProductionNanoGptGenerationsRequest ??
                     sendProductionNanoGptGenerationsRequest;
@@ -825,16 +871,72 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
                 const uploadFn =
                     state.deps.uploadGeneratedImageBase64 ??
                     uploadGeneratedImageBase64;
-                const uploadTimeoutMs =
-                    state.deps.uploadTimeoutMs ?? DEFAULT_UPLOAD_TIMEOUT_MS;
 
-                const uploadResult = await uploadFn({
-                    image: normResult.image.data,
-                    signal: controller.signal,
-                    maxBytes: 31457280,
-                    fetch: state.deps.fetch,
-                    getRequestHeaders: state.deps.getRequestHeaders,
-                });
+                const rawUploadTimeout = state.deps.uploadTimeoutMs;
+                const uploadTimeoutMs =
+                    typeof rawUploadTimeout === 'number' &&
+                    Number.isFinite(rawUploadTimeout) &&
+                    rawUploadTimeout > 0
+                        ? rawUploadTimeout
+                        : DEFAULT_UPLOAD_TIMEOUT_MS;
+
+                const uploadController = new AbortController();
+                let uploadTimer = null;
+                let uploadTimedOut = false;
+
+                const onParentAbort = () => {
+                    uploadController.abort();
+                };
+
+                if (controller.signal.aborted) {
+                    uploadController.abort();
+                } else {
+                    controller.signal.addEventListener('abort', onParentAbort, {
+                        once: true,
+                    });
+                }
+
+                let uploadResult = null;
+                try {
+                    const timeoutPromise = new Promise((resolve) => {
+                        uploadTimer = setTimeout(() => {
+                            uploadTimedOut = true;
+                            uploadController.abort();
+                            resolve({ timedOut: true });
+                        }, uploadTimeoutMs);
+                    });
+
+                    const executionPromise = (async () => {
+                        const res = await uploadFn({
+                            image: normResult.image.data,
+                            signal: uploadController.signal,
+                            maxBytes: 31457280,
+                            fetch: state.deps.fetch,
+                            getRequestHeaders: state.deps.getRequestHeaders,
+                        });
+                        return { timedOut: false, res };
+                    })();
+
+                    const winner = await Promise.race([
+                        executionPromise,
+                        timeoutPromise,
+                    ]);
+                    if (winner.timedOut) {
+                        uploadResult = {
+                            ok: false,
+                            path: null,
+                            errors: ['timeout'],
+                        };
+                    } else {
+                        uploadResult = winner.res;
+                    }
+                } finally {
+                    if (uploadTimer !== null) {
+                        clearTimeout(uploadTimer);
+                        uploadTimer = null;
+                    }
+                    controller.signal.removeEventListener('abort', onParentAbort);
+                }
 
                 if (
                     state.generationToken !== currentGeneration ||
@@ -843,10 +945,22 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
                     return;
                 }
 
-                if (!uploadResult.ok) {
+                if (uploadTimedOut) {
+                    phaseEl.textContent = 'Failed';
+                    setPhaseAttr(phaseEl, DIAGNOSTIC_PHASE.FAILED);
+                    summaryEl.textContent = 'Local image upload timed out.';
+                    showFeedback(
+                        feedbackEl,
+                        'Image generation succeeded, but saving the image to SillyTavern timed out after 60 seconds and could not be confirmed. A file may still have been written locally. Your quota or account balance may have been affected.',
+                        'error',
+                    );
+                    return;
+                }
+
+                if (!uploadResult || !uploadResult.ok) {
                     if (
                         controller.signal.aborted ||
-                        uploadResult.errors.includes('cancelled')
+                        uploadResult?.errors?.includes('cancelled')
                     ) {
                         handleCancellation(true);
                         return;
@@ -857,7 +971,7 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
                     summaryEl.textContent = 'Local image upload failed.';
                     showFeedback(
                         feedbackEl,
-                        'Image generation succeeded, but saving the image to SillyTavern failed. Your quota or account balance may have been affected.',
+                        'Image generation succeeded, but saving the image to SillyTavern could not be confirmed. A file may still have been written locally. Your quota or account balance may have been affected.',
                         'error',
                     );
                     return;
@@ -877,14 +991,45 @@ export function refreshDiagnosticPanel(panel, deps = {}) {
                 resultContainer.hidden = false;
 
                 state.hasResult = true;
+            } catch (err) {
+                if (
+                    state.generationToken !== currentGeneration ||
+                    !isPanelAttached(panel)
+                ) {
+                    return;
+                }
+
+                const isAbort =
+                    controller.signal.aborted ||
+                    err?.name === 'AbortError' ||
+                    err?.kind === 'cancelled';
+
+                if (isAbort) {
+                    handleCancellation(dispatchAttempted);
+                    return;
+                }
+
+                phaseEl.textContent = 'Failed';
+                setPhaseAttr(phaseEl, DIAGNOSTIC_PHASE.FAILED);
+
+                if (dispatchAttempted) {
+                    summaryEl.textContent =
+                        'Diagnostic generation failed unexpectedly.';
+                    showFeedback(
+                        feedbackEl,
+                        'An unexpected error occurred during generation or image saving. The generation request was attempted; quota or account balance may have been affected.',
+                        'error',
+                    );
+                } else {
+                    summaryEl.textContent =
+                        'Diagnostic operation failed unexpectedly.';
+                    showFeedback(
+                        feedbackEl,
+                        'An unexpected error occurred during validation or capability check. Generation request was not sent.',
+                        'error',
+                    );
+                }
             } finally {
-                if (state.activeDetachmentObserver === detachmentObserver) {
-                    state.activeDetachmentObserver = null;
-                }
-                if (detachmentObserver) {
-                    detachmentObserver.disconnect();
-                    detachmentObserver = null;
-                }
                 if (state.activeAbortController === controller) {
                     state.activeAbortController = null;
                 }

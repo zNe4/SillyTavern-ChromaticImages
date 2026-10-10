@@ -877,7 +877,7 @@ test('19. Provider generation succeeds but local upload fails: reports upload er
     assert.strictEqual(fake.elements.phase.textContent, 'Failed');
     assert.strictEqual(fake.elements.previewImg.hidden, true);
     assert.strictEqual(fake.elements.resultContainer.hidden, true);
-    assert.match(fake.elements.feedback.textContent, /Image generation succeeded, but saving the image to SillyTavern failed/i);
+    assert.match(fake.elements.feedback.textContent, /saving the image to SillyTavern could not be confirmed/i);
     assert.match(fake.elements.feedback.textContent, /quota or (?:account )?balance may have been affected/i);
 });
 
@@ -1086,4 +1086,531 @@ test('24. settings.html template contains all required diagnostic elements and a
     assert.match(html, /maxlength="3000"/);
     assert.match(html, /role="status"/);
     assert.match(html, /aria-live="polite"/);
+});
+
+test('25. Upload deadline expires: reports timeout failure with confirmed quota notice and ignores late upload result', async () => {
+    const fake = createFakeDiagnosticPanel({ initialPrompt: 'Upload timeout test' });
+
+    let lateResolve;
+    const latePromise = new Promise((resolve) => {
+        lateResolve = resolve;
+    });
+
+    let capturedUploadSignal = null;
+
+    refreshDiagnosticPanel(fake, {
+        uploadTimeoutMs: 20, // Short timeout for testing
+        checkNanoGptGenerationsCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+        sendProductionNanoGptGenerationsRequest: async () => ({
+            ok: true,
+            status: 200,
+            body: { data: [{ b64_json: 'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAGElEQVQImWNkYPjPQC5gZBgFIzcwjEIMAA54AAM92q1FAAAAAElFTkSuQmCC' }] },
+            dispatchAttempted: true,
+            uncertainBilling: false,
+            error: null,
+        }),
+        uploadGeneratedImageBase64: async ({ signal }) => {
+            capturedUploadSignal = signal;
+            await latePromise;
+            return {
+                ok: true,
+                path: '/user/images/ci_late.png',
+                format: 'png',
+                byteLength: 68,
+                status: 200,
+                errors: [],
+            };
+        },
+    });
+
+    fake.elements.generateBtn.click();
+    await delay(50); // Wait for upload deadline (20ms) to trigger
+
+    assert.strictEqual(fake.elements.phase.textContent, 'Failed');
+    assert.strictEqual(fake.elements.summary.textContent, 'Local image upload timed out.');
+    assert.match(fake.elements.feedback.textContent, /saving the image to SillyTavern timed out after 60 seconds and could not be confirmed/i);
+    assert.match(fake.elements.feedback.textContent, /A file may still have been written locally/i);
+    assert.match(fake.elements.feedback.textContent, /quota or (?:account )?balance may have been affected/i);
+    assert.strictEqual(fake.elements.previewImg.hidden, true);
+    assert.strictEqual(fake.elements.resultContainer.hidden, true);
+    assert.strictEqual(fake.elements.generateBtn.disabled, false);
+    assert.strictEqual(capturedUploadSignal?.aborted, true, 'Upload abort controller must be aborted on timeout');
+
+    // Late resolution must be ignored
+    lateResolve();
+    await delay(10);
+
+    assert.strictEqual(fake.elements.previewImg.src, '');
+    assert.strictEqual(fake.elements.previewImg.hidden, true);
+    assert.strictEqual(fake.elements.pathCode.textContent, '');
+    assert.strictEqual(fake.elements.resultContainer.hidden, true);
+});
+
+test('26. Injected invalid uploadTimeoutMs falls back to DEFAULT_UPLOAD_TIMEOUT_MS safely without throwing', async () => {
+    const fake = createFakeDiagnosticPanel({ initialPrompt: 'Invalid timeout test' });
+
+    let uploadCalled = false;
+    refreshDiagnosticPanel(fake, {
+        uploadTimeoutMs: -100, // Invalid negative timeout
+        checkNanoGptGenerationsCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+        sendProductionNanoGptGenerationsRequest: async () => ({
+            ok: true,
+            status: 200,
+            body: { data: [{ b64_json: 'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAGElEQVQImWNkYPjPQC5gZBgFIzcwjEIMAA54AAM92q1FAAAAAElFTkSuQmCC' }] },
+            dispatchAttempted: true,
+            uncertainBilling: false,
+            error: null,
+        }),
+        uploadGeneratedImageBase64: async () => {
+            uploadCalled = true;
+            return {
+                ok: true,
+                path: '/user/images/ci_valid.png',
+                format: 'png',
+                byteLength: 68,
+                status: 200,
+                errors: [],
+            };
+        },
+    });
+
+    fake.elements.generateBtn.click();
+    await delay();
+
+    assert.strictEqual(uploadCalled, true);
+    assert.strictEqual(fake.elements.phase.textContent, 'Complete');
+    assert.strictEqual(fake.elements.previewImg.src, '/user/images/ci_valid.png');
+});
+
+test('27. Caller cancellation propagates to upload and aborts uploadController', async () => {
+    const fake = createFakeDiagnosticPanel({ initialPrompt: 'Upload cancellation test' });
+
+    let capturedUploadSignal = null;
+    let finishUpload;
+    const uploadPromise = new Promise((resolve) => {
+        finishUpload = resolve;
+    });
+
+    refreshDiagnosticPanel(fake, {
+        checkNanoGptGenerationsCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+        sendProductionNanoGptGenerationsRequest: async () => ({
+            ok: true,
+            status: 200,
+            body: { data: [{ b64_json: 'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAGElEQVQImWNkYPjPQC5gZBgFIzcwjEIMAA54AAM92q1FAAAAAElFTkSuQmCC' }] },
+            dispatchAttempted: true,
+            uncertainBilling: false,
+            error: null,
+        }),
+        uploadGeneratedImageBase64: async ({ signal }) => {
+            capturedUploadSignal = signal;
+            await uploadPromise;
+            return {
+                ok: false,
+                path: null,
+                errors: ['cancelled'],
+            };
+        },
+    });
+
+    fake.elements.generateBtn.click();
+    await delay();
+
+    assert.strictEqual(capturedUploadSignal?.aborted, false);
+
+    finishUpload();
+    await delay();
+});
+
+const SENSITIVE_SENTINEL = 'SENSITIVE_LEAK_SENTINEL_CREDENTIAL_98765';
+
+function assertNoSensitiveLeak(panel) {
+    const texts = [
+        panel.elements.summary.textContent,
+        panel.elements.feedback.textContent,
+        panel.elements.phase.textContent,
+        panel.elements.compatStatus.textContent,
+        panel.elements.pathCode.textContent,
+    ];
+    for (const t of texts) {
+        assert.doesNotMatch(t, new RegExp(SENSITIVE_SENTINEL), 'Sensitive sentinel must never appear in DOM text');
+    }
+}
+
+test('28. Unexpected exception during reference dimension inspection produces safe static error without calling provider', async () => {
+    const fake = createFakeDiagnosticPanel({ initialPrompt: 'Dim inspect error' });
+    fake.elements.refsInput.change([createFakeFile('r.png', 100)]);
+
+    let generateCalls = 0;
+    refreshDiagnosticPanel(fake, {
+        inspectImageDimensions: async () => {
+            throw new Error(SENSITIVE_SENTINEL);
+        },
+        sendProductionNanoGptGenerationsRequest: async () => {
+            generateCalls += 1;
+            return { ok: true };
+        },
+    });
+
+    fake.elements.generateBtn.click();
+    await delay();
+
+    assert.strictEqual(generateCalls, 0, 'Provider must not be called on pre-dispatch exception');
+    assert.strictEqual(fake.elements.phase.textContent, 'Failed');
+    assert.match(fake.elements.feedback.textContent, /Generation request was not sent/i);
+    assertNoSensitiveLeak(fake);
+    assert.strictEqual(fake.elements.generateBtn.disabled, false);
+});
+
+test('29. Unexpected exception during reference preparation produces safe static error without calling provider', async () => {
+    const fake = createFakeDiagnosticPanel({ initialPrompt: 'Ref prep error' });
+    fake.elements.refsInput.change([createFakeFile('r.png', 100)]);
+
+    let generateCalls = 0;
+    refreshDiagnosticPanel(fake, {
+        inspectImageDimensions: async () => ({ ok: true, width: 512, height: 512, errors: [] }),
+        prepareImageReferences: async () => {
+            throw new Error(SENSITIVE_SENTINEL);
+        },
+        sendProductionNanoGptGenerationsRequest: async () => {
+            generateCalls += 1;
+            return { ok: true };
+        },
+    });
+
+    fake.elements.generateBtn.click();
+    await delay();
+
+    assert.strictEqual(generateCalls, 0, 'Provider must not be called on pre-dispatch exception');
+    assert.strictEqual(fake.elements.phase.textContent, 'Failed');
+    assert.match(fake.elements.feedback.textContent, /Generation request was not sent/i);
+    assertNoSensitiveLeak(fake);
+    assert.strictEqual(fake.elements.generateBtn.disabled, false);
+});
+
+test('30. Unexpected exception during compatibility capability check produces safe static error without calling provider', async () => {
+    const fake = createFakeDiagnosticPanel({ initialPrompt: 'Capability check error' });
+
+    let generateCalls = 0;
+    refreshDiagnosticPanel(fake, {
+        checkNanoGptGenerationsCapability: async () => {
+            throw new Error(SENSITIVE_SENTINEL);
+        },
+        sendProductionNanoGptGenerationsRequest: async () => {
+            generateCalls += 1;
+            return { ok: true };
+        },
+    });
+
+    fake.elements.generateBtn.click();
+    await delay();
+
+    assert.strictEqual(generateCalls, 0, 'Provider must not be called on pre-dispatch exception');
+    assert.strictEqual(fake.elements.phase.textContent, 'Failed');
+    assert.match(fake.elements.feedback.textContent, /Generation request was not sent/i);
+    assertNoSensitiveLeak(fake);
+    assert.strictEqual(fake.elements.generateBtn.disabled, false);
+});
+
+test('31. Unexpected exception during provider dispatch preserves billing uncertainty feedback without leaking sentinel', async () => {
+    const fake = createFakeDiagnosticPanel({ initialPrompt: 'Provider dispatch error' });
+
+    refreshDiagnosticPanel(fake, {
+        checkNanoGptGenerationsCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+        sendProductionNanoGptGenerationsRequest: async () => {
+            throw new Error(SENSITIVE_SENTINEL);
+        },
+    });
+
+    fake.elements.generateBtn.click();
+    await delay();
+
+    assert.strictEqual(fake.elements.phase.textContent, 'Failed');
+    assert.match(fake.elements.feedback.textContent, /quota or (?:account )?balance may have been affected/i);
+    assertNoSensitiveLeak(fake);
+    assert.strictEqual(fake.elements.generateBtn.disabled, false);
+});
+
+test('32. Unexpected exception during response normalization preserves billing uncertainty feedback without leaking sentinel', async () => {
+    const fake = createFakeDiagnosticPanel({ initialPrompt: 'Normalize error' });
+
+    refreshDiagnosticPanel(fake, {
+        checkNanoGptGenerationsCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+        sendProductionNanoGptGenerationsRequest: async () => ({
+            ok: true,
+            status: 200,
+            body: { some: 'response' },
+            dispatchAttempted: true,
+            uncertainBilling: false,
+            error: null,
+        }),
+        normalizeNanoGptImageResponse: () => {
+            throw new Error(SENSITIVE_SENTINEL);
+        },
+    });
+
+    fake.elements.generateBtn.click();
+    await delay();
+
+    assert.strictEqual(fake.elements.phase.textContent, 'Failed');
+    assert.match(fake.elements.feedback.textContent, /quota or (?:account )?balance may have been affected/i);
+    assertNoSensitiveLeak(fake);
+    assert.strictEqual(fake.elements.generateBtn.disabled, false);
+});
+
+test('33. Unexpected exception during local image upload preserves billing uncertainty feedback without leaking sentinel', async () => {
+    const fake = createFakeDiagnosticPanel({ initialPrompt: 'Upload error' });
+
+    refreshDiagnosticPanel(fake, {
+        checkNanoGptGenerationsCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+        sendProductionNanoGptGenerationsRequest: async () => ({
+            ok: true,
+            status: 200,
+            body: { data: [{ b64_json: 'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAGElEQVQImWNkYPjPQC5gZBgFIzcwjEIMAA54AAM92q1FAAAAAElFTkSuQmCC' }] },
+            dispatchAttempted: true,
+            uncertainBilling: false,
+            error: null,
+        }),
+        uploadGeneratedImageBase64: async () => {
+            throw new Error(SENSITIVE_SENTINEL);
+        },
+    });
+
+    fake.elements.generateBtn.click();
+    await delay();
+
+    assert.strictEqual(fake.elements.phase.textContent, 'Failed');
+    assert.match(fake.elements.feedback.textContent, /quota or (?:account )?balance may have been affected/i);
+    assertNoSensitiveLeak(fake);
+    assert.strictEqual(fake.elements.generateBtn.disabled, false);
+});
+
+test('34. File selection followed by idle panel detachment revokes thumbnail object URLs', () => {
+    class MockMutationObserver {
+        static instances = [];
+        constructor(callback) {
+            this.callback = callback;
+            this.disconnected = false;
+            MockMutationObserver.instances.push(this);
+        }
+        observe() {}
+        disconnect() {
+            this.disconnected = true;
+        }
+        trigger() {
+            if (!this.disconnected) this.callback([], this);
+        }
+    }
+
+    const revoked = [];
+    const fake = createFakeDiagnosticPanel();
+    fake.isConnected = true;
+
+    refreshDiagnosticPanel(fake, {
+        MutationObserver: MockMutationObserver,
+        document: {
+            body: {},
+            createElement: () => ({ appendChild() {} }),
+        },
+        createObjectURL: () => 'blob:thumb-idle-1',
+        revokeObjectURL: (url) => {
+            revoked.push(url);
+        },
+    });
+
+    // Select a file while idle
+    fake.elements.refsInput.change([createFakeFile('idle.png', 100)]);
+
+    assert.strictEqual(revoked.length, 0, 'No thumbnails revoked prior to detachment');
+    const obs = MockMutationObserver.instances[MockMutationObserver.instances.length - 1];
+    assert.strictEqual(obs.disconnected, false);
+
+    // Detach panel while idle
+    fake.isConnected = false;
+    obs.trigger();
+
+    assert.strictEqual(revoked.includes('blob:thumb-idle-1'), true, 'Idle thumbnail URL must be revoked on detachment');
+    assert.strictEqual(obs.disconnected, true, 'Observer must disconnect on detachment');
+});
+
+test('35. Repeated file selection revokes prior URLs while maintaining new ones', () => {
+    const revoked = [];
+    let counter = 0;
+    const fake = createFakeDiagnosticPanel();
+    fake.isConnected = true;
+
+    refreshDiagnosticPanel(fake, {
+        document: {
+            body: {},
+            createElement: () => ({ appendChild() {} }),
+        },
+        createObjectURL: () => `blob:thumb-${++counter}`,
+        revokeObjectURL: (url) => {
+            revoked.push(url);
+        },
+    });
+
+    fake.elements.refsInput.change([createFakeFile('1.png', 100)]);
+    assert.strictEqual(revoked.length, 0);
+
+    fake.elements.refsInput.change([createFakeFile('2.png', 100)]);
+    assert.strictEqual(revoked.includes('blob:thumb-1'), true, 'First thumbnail revoked when new files selected');
+    assert.strictEqual(revoked.includes('blob:thumb-2'), false, 'New thumbnail URL not revoked');
+});
+
+test('36. Drawer collapse without detachment does not revoke thumbnails', () => {
+    class MockMutationObserver {
+        static instances = [];
+        constructor(callback) {
+            this.callback = callback;
+            this.disconnected = false;
+            MockMutationObserver.instances.push(this);
+        }
+        observe() {}
+        disconnect() {
+            this.disconnected = true;
+        }
+        trigger() {
+            if (!this.disconnected) this.callback([], this);
+        }
+    }
+
+    const revoked = [];
+    const fake = createFakeDiagnosticPanel();
+    fake.isConnected = true;
+
+    refreshDiagnosticPanel(fake, {
+        MutationObserver: MockMutationObserver,
+        document: {
+            body: {},
+            createElement: () => ({ appendChild() {} }),
+        },
+        createObjectURL: () => 'blob:thumb-preserved',
+        revokeObjectURL: (url) => {
+            revoked.push(url);
+        },
+    });
+
+    fake.elements.refsInput.change([createFakeFile('drawer.png', 100)]);
+
+    const obs = MockMutationObserver.instances[MockMutationObserver.instances.length - 1];
+
+    // Trigger observer while still connected (e.g. drawer collapsed, class mutated)
+    fake.isConnected = true;
+    obs.trigger();
+
+    assert.strictEqual(revoked.includes('blob:thumb-preserved'), false, 'Thumbnails must not be revoked when drawer collapses without detachment');
+    assert.strictEqual(obs.disconnected, false, 'Observer must remain connected while panel is in DOM');
+});
+
+test('37. Repeated panel refresh does not accumulate duplicate MutationObservers', () => {
+    class MockMutationObserver {
+        static instances = [];
+        constructor(callback) {
+            this.callback = callback;
+            this.disconnected = false;
+            MockMutationObserver.instances.push(this);
+        }
+        observe() {}
+        disconnect() {
+            this.disconnected = true;
+        }
+    }
+
+    const fake = createFakeDiagnosticPanel();
+    fake.isConnected = true;
+
+    const deps = {
+        MutationObserver: MockMutationObserver,
+        document: {
+            body: {},
+        },
+    };
+
+    refreshDiagnosticPanel(fake, deps);
+    refreshDiagnosticPanel(fake, deps);
+    refreshDiagnosticPanel(fake, deps);
+    refreshDiagnosticPanel(fake, deps);
+    refreshDiagnosticPanel(fake, deps);
+
+    assert.strictEqual(MockMutationObserver.instances.length, 1, 'Only exactly 1 observer must be created across repeated refreshes');
+});
+
+test('38. Stale result presentation: starting generation B clears result A, failure in B does not leave A visible, no delete sent for A', async () => {
+    const fake = createFakeDiagnosticPanel({ initialPrompt: 'Initial prompt A' });
+
+    let generationCallCount = 0;
+    let deleteCalls = 0;
+
+    const makeDeps = (succeeds) => ({
+        checkNanoGptGenerationsCapability: async () => ({ supported: true, cached: false, status: 200, error: null }),
+        sendProductionNanoGptGenerationsRequest: async () => {
+            generationCallCount += 1;
+            if (succeeds) {
+                return {
+                    ok: true,
+                    status: 200,
+                    body: { data: [{ b64_json: 'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAGElEQVQImWNkYPjPQC5gZBgFIzcwjEIMAA54AAM92q1FAAAAAElFTkSuQmCC' }] },
+                    dispatchAttempted: true,
+                    uncertainBilling: false,
+                    error: null,
+                };
+            }
+            return {
+                ok: false,
+                status: 500,
+                body: null,
+                dispatchAttempted: true,
+                uncertainBilling: true,
+                error: { kind: 'provider-http-error', message: 'Failed' },
+            };
+        },
+        uploadGeneratedImageBase64: async () => ({
+            ok: true,
+            path: '/user/images/ci_image_A.png',
+            format: 'png',
+            byteLength: 68,
+            status: 200,
+            errors: [],
+        }),
+    });
+
+    // 1. Generate image A successfully
+    refreshDiagnosticPanel(fake, makeDeps(true));
+    fake.elements.generateBtn.click();
+    await delay();
+
+    assert.strictEqual(fake.elements.previewImg.src, '/user/images/ci_image_A.png');
+    assert.strictEqual(fake.elements.previewImg.hidden, false);
+    assert.strictEqual(fake.elements.pathCode.textContent, '/user/images/ci_image_A.png');
+    assert.strictEqual(fake.elements.resultContainer.hidden, false);
+    assert.strictEqual(fake.elements.clearBtn.disabled, false);
+
+    // 2. Start generation B (configured to fail)
+    refreshDiagnosticPanel(fake, makeDeps(false));
+    fake.elements.promptInput.value = 'Second prompt B';
+
+    // Click generate B
+    fake.elements.generateBtn.click();
+
+    // 3. Confirm image A is immediately no longer displayed as active result
+    assert.strictEqual(fake.elements.previewImg.src, '', 'Preview src must be cleared immediately when B starts');
+    assert.strictEqual(fake.elements.previewImg.hidden, true, 'Preview must be hidden when B starts');
+    assert.strictEqual(fake.elements.pathCode.textContent, '', 'Path code must be empty when B starts');
+    assert.strictEqual(fake.elements.resultContainer.hidden, true, 'Result container must be hidden when B starts');
+    assert.strictEqual(fake.elements.clearBtn.disabled, true, 'Clear button must be disabled while B is in flight');
+
+    // 4. Wait for B to fail
+    await delay();
+
+    // 5. Confirm B reports failure without displaying image A
+    assert.strictEqual(fake.elements.phase.textContent, 'Failed');
+    assert.strictEqual(fake.elements.previewImg.src, '', 'Failed attempt B must not restore image A preview');
+    assert.strictEqual(fake.elements.previewImg.hidden, true);
+    assert.strictEqual(fake.elements.pathCode.textContent, '');
+    assert.strictEqual(fake.elements.resultContainer.hidden, true);
+    assert.strictEqual(fake.elements.clearBtn.disabled, true, 'Clear button remains disabled when no active result');
+
+    // 6. Confirm no delete request was sent for image A
+    assert.strictEqual(deleteCalls, 0, 'No delete request was sent for image A');
+    assert.strictEqual(generationCallCount, 2, 'Exactly two generation calls made');
 });
