@@ -4,7 +4,7 @@
 
 It belongs to the planned **Chromatic** family of SillyTavern extensions alongside Chromatic Dialogue.
 
-> **Project status:** M02 is complete and M03 image-engine work is in progress. Proposal parsing, inline proposal UI, durable result recognition, message lifecycle reconstruction, and managed prompt hygiene are implemented. Paid image generation is not enabled yet.
+> **Project status:** M01 and M02 are complete. M03 provider transport, local image primitives, and diagnostic generation work have passed all verification gates (M03-A through M03-H). Explicit, settings-only diagnostic image generation is verified and functional via SillyTavern's local compatibility proxy. Automatic roleplay image generation remains disabled; proposal-card Generate wiring remains deferred to M05, and character identity and trusted reference library management are planned for M04.
 
 ## Product goal
 
@@ -280,17 +280,31 @@ The first provider remains deliberately narrow:
 
 - Provider: **NanoGPT**
 - MVP model: **`qwen-image`**
-- New-integration target: NanoGPT's normalized Image API, `POST https://api.nano-gpt.com/api/v1/images`
-- Reference input: `input_references`
 - Project reference limit: **3**
 - Initial output count: **1**
-- Credentials: reuse SillyTavern's existing server-side NanoGPT secret; never persist a raw key in Chromatic Images settings
+- Credentials: reuse SillyTavern's existing server-side NanoGPT secret (`SECRET_KEYS.NANOGPT`); never persist a raw key in Chromatic Images settings or browser storage
+- Privacy guarantee: server-side proxies never log RP prompts, base64 images, or credentials; browser code never leaks sensitive payloads
 
-M03-A found that current SillyTavern already has a NanoGPT image proxy and server-side secret, but the stock image proxy logs its complete request body at DEBUG and targets NanoGPT's older native image route. Chromatic Images therefore must not use that endpoint unchanged for reference-image generation.
+M03 implemented two distinct same-origin SillyTavern server proxy routes:
 
-The preferred transport is a privacy-safe same-origin SillyTavern server proxy that retains the existing NanoGPT secret and forwards the normalized Image API without logging prompts or base64 references. See `docs/m03-contract.md` for the evidence and transport gate.
+### 1. Subscription-compatible generations API (Active diagnostic backend)
 
-Model-specific controls such as guidance, inference steps, negative prompt, seed, and exact resolution choices must be taken from NanoGPT's current model metadata rather than assumed globally.
+- **Route:** `POST /api/sd/nanogpt/images/generations` (capability: `GET /api/sd/nanogpt/images/generations`)
+- **Proxy marker header:** `x-st-nanogpt-proxy: v1-compat`
+- **Upstream destination:** `POST https://api.nano-gpt.com/api/v1/images/generations` with `response_format: 'b64_json'`
+- **Reference input:** mutually exclusive `imageDataUrl` (exactly 1 reference) vs `imageDataUrls` (2 to 3 references)
+- **Status:** Powers the active diagnostic image generator in the extension settings drawer. Real end-to-end generation is verified across 0, 1, 2, and 3 reference images, with local upload to `/user/images/...`.
+- **Prerequisite:** Currently requires SillyTavern with the local compatibility proxy patch (`m03-d2b1-nanogpt-proxy` branch). This route is not yet merged upstream into stock SillyTavern.
+
+### 2. Normalized Image API (Standardized target)
+
+- **Route:** `POST /api/sd/nanogpt/images` (capability: `GET /api/sd/nanogpt/images`)
+- **Proxy marker header:** `x-st-nanogpt-proxy: v1`
+- **Upstream destination:** `POST https://api.nano-gpt.com/api/v1/images`
+- **Reference input:** `input_references` (array of data URLs)
+- **Status:** Pure request building (`buildQwenImageRequest`) and transport dispatch adapters are implemented and verified locally. Because vendor OpenAPI documentation does not specify a normative success envelope, response normalization for this route remains deferred and strictly fail-closed (`unverified-normalized-response-contract`).
+
+M03-A found that stock SillyTavern's existing `/api/sd/nanogpt/generate` route logged its complete request body at DEBUG and targeted an older native route. Both Chromatic Images routes bypass that legacy route and communicate through privacy-safe, zero-body-logging proxies.
 
 ## Persistence principles
 
@@ -346,7 +360,7 @@ Chromatic Images follows Chromatic Dialogue's engineering style:
 - safe chat-switch and stale-state handling;
 - responsive/mobile-first UI.
 
-The target minimum SillyTavern version is **1.18.0**.
+The target minimum SillyTavern version is **1.18.0**. Live diagnostic generation currently requires SillyTavern running with the local compatibility proxy patch (`m03-d2b1-nanogpt-proxy` branch), as the `v1-compat` route is not yet merged upstream into stock SillyTavern.
 
 ### Pinned Chromatic Dialogue donor
 

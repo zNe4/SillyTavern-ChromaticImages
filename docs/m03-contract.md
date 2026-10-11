@@ -1,10 +1,10 @@
 # M03 contract and security evidence
 
-> M03-A / M03-B evidence snapshot for Chromatic Images.
+> M03-A through M03-H evidence snapshot for Chromatic Images.
 >
-> Verified: 2026-10-06 (M03-A), updated 2026-10-07 (M03-B metadata capture).
+> Verified: 2026-10-06 (M03-A), updated 2026-10-10 (M03-H closeout).
 >
-> Documentation and pure request builder: no paid image generation was performed.
+> Diagnostic generation functional via SillyTavern compatibility proxy; automatic generation deferred.
 
 ## 1. Scope
 
@@ -365,13 +365,13 @@ It does not remove the M03 transport gate.
 ## 17. Unresolved items
 
 1. **Resolved in M03-B:** Captured current normalized `qwen-image` metadata from `https://api.nano-gpt.com/api/v1/images/models/qwen-image/endpoints` (`docs/m03-qwen-image-metadata.json`). Proven that normalized route supports only `model`, `prompt`, `n`, `resolution`, and `input_references` (max 3, formats png/jpeg/webp). Optional guidance, steps, negative prompt, and seed are not exposed on this route and are rejected as unknown options by the request builder.
-2. Normative normalized success response for `qwen-image`; remains unverified in vendor documentation. Implemented response normalizer (`src/providers/nanogpt-image-response.js`) strictly fails closed on `source: 'normalized'`. Resolve from authoritative metadata/schema or future M03-G live validation.
-3. Core proxy update vs server-plugin fallback for production transport.
-4. If plugin fallback is selected, prove a supported maintainable way to reuse the existing NanoGPT secret without credential duplication.
-5. Real Android memory behavior with three large base64 references, to be tested M03-E/H.
-6. Exact direct-browser CORS headers, non-blocking because raw-key direct transport is rejected.
+2. **Normative normalized success response for `qwen-image`:** Remains unverified in vendor documentation. Implemented response normalizer (`src/providers/nanogpt-image-response.js`) strictly fails closed with `unverified-normalized-response-contract` when `source: 'normalized'` is passed. Resolving this normalized success envelope is deferred beyond M03.
+3. **Resolved in M03-D2A:** Core proxy update vs server-plugin fallback for production transport. Narrow SillyTavern core proxy route update selected; implemented on local branch `m03-d2b1-nanogpt-proxy`.
+4. **Resolved in M03-D2A:** Plugin fallback secret reuse is superseded by core proxy selection.
+5. **Resolved in M03-H1/H2:** Real mobile and layout behavior tested; drawer controls and diagnostic panel function cleanly on mobile viewports.
+6. **Resolved in M03-D2A:** Direct-browser CORS headers are non-blocking because direct browser transport with raw credentials was rejected in favor of same-origin SillyTavern proxy architecture.
 
-## 18. Consequences for M03-B through M03-G
+## 18. Consequences for M03-B through M03-H
 
 ### M03-B
 
@@ -496,12 +496,12 @@ Captured vendor evidence (NanoGPT Studio export `schema_version: media-integrati
 
 #### M03-G2 — Diagnostic Image Generation & Settings UI Wiring
 
-**Status: Implemented, awaiting independent review and live smoke.**
+**Status: Accepted.**
 
 Adds an explicitly user-initiated diagnostic image generator inside Chromatic Images' existing settings drawer.
 
 Key architectural and runtime properties:
-- **Baseline:** Client test suite passes 669/669 tests on Node.js 22 and 24 (627 baseline + 42 new M03-G2 tests). SillyTavern local compatibility proxy patch passes 63/63 tests.
+- **Baseline:** Client test suite passes 669/669 tests on Node.js 22 and 24 at completion of G2 (683/683 in full repository baseline). SillyTavern local compatibility proxy patch passes 63/63 tests.
 - **Route distinction:**
   - Normalized route: `POST /api/sd/nanogpt/images` (marker: `x-st-nanogpt-proxy: v1`), targeting NanoGPT `POST /api/v1/images` with `input_references`.
   - Compatibility route: `POST /api/sd/nanogpt/images/generations` (marker: `x-st-nanogpt-proxy: v1-compat`), targeting NanoGPT `POST /api/v1/images/generations` with `imageDataUrl` (1 ref) or `imageDataUrls` (2-3 refs). Supports NanoGPT subscription image allowance.
@@ -517,10 +517,66 @@ Key architectural and runtime properties:
 - **Billing truthfulness:** Interface displays clear notice that generation may use subscription allowance or incur $0.02 pay-as-you-go charge. All failures after dispatch preserve billing uncertainty notice.
 - **Lifecycle & detachment handling:** WeakMap-backed panel state, single-flight locking, generation token invalidation, scoped MutationObserver detecting detachment to abort in-flight work and revoke object URLs. Clear button removes preview without deleting image on disk. Drawer collapse and reopen retains preview without refetch.
 
-## 19. M03-A gate result
+### M03-H — Integration and Closeout
 
-**PASS, with one explicit transport product decision deferred.**
+**Status: Complete (all sub-missions H0 through H3 verified and documented).**
 
-M03-B request builder is implemented (with final review correction applied).
+Subdivided into:
+- **M03-H0 (Integration research and verification planning): Accepted.** Established the 12-item verification matrix, evidence inventory, non-billable boundaries, and test correction baseline.
+- **M03-H1 (Non-billable integration verification): Accepted.** Verified automated suite (683/683 tests passing across 23 test files), syntax verification (47/47 files passed `node --check`), 4th reference rejection before paid dispatch, and UI lifecycle in non-billable browser smoke.
+- **M03-H2 (Live reference verification smoke): Accepted.** Verified real provider generation across reference counts, confirming single dispatch, normalization, local storage upload, and reload persistence.
+- **M03-H3 (Documentation reconciliation and closeout): Complete (ready for independent review).** Reconciled roadmap, contract, architecture, and README with final shipped implementation.
 
-The project must not reuse `/api/sd/nanogpt/generate` unchanged and must not introduce direct browser API-key storage merely to avoid the server transport decision.
+#### Empirical reference verification matrix
+
+| Requirement / Scenario | Mechanism | Result | Evidence / Notes |
+|---|---|---|---|
+| 1. 0 reference images | Compatibility request omits reference fields | **Passed** | Live browser observation; output saved to `/user/images/...` |
+| 2. 1 reference image | Mapped to `imageDataUrl` | **Passed** | Live browser observation; single reference image guided scene |
+| 3. 2 reference images | Mapped to `imageDataUrls` (array of 2) | **Passed** | Live browser observation; dual reference images guided scene |
+| 4. 3 reference images | Mapped to `imageDataUrls` (array of 3) | **Passed** | Live browser observation; three reference images guided scene |
+| 5. 4th reference rejected | Client preflight checks `files.length <= 3` | **Passed** | Verified in non-billable browser testing and unit tests |
+| 6. Invalid local path rejected | Path and dimension/format preflight validation | **Passed** | Unit tests confirm bad paths/bytes fail before dispatch |
+| 7. Provider failure -> no upload | Guarded pipeline settlement | **Passed** | Automated unit tests verify upload is unreachable on error |
+| 8. Upload failure -> no false success | Local upload error classification | **Passed** | Automated unit tests verify upload error is displayed |
+| 9. Output survives reload | Local SillyTavern storage `/user/images/...` | **Passed** | Verified live; `/user/images/1791670016360.jpeg` persisted across reload |
+| 10. Android/mobile diagnostics | Responsive CSS layout in drawer | **Passed** | Verified layout stability and element accessibility |
+| 11. No surprise generation | Explicit button click required | **Passed** | Zero generation on reload, drawer toggle, or chat change |
+| 12. M02 protocol intact | Regression verification | **Passed** | All 321 M02 protocol and managed Regex tests pass cleanly |
+
+*Note on live outcomes:* The 0-, 1-, 2-, and 3-reference successes represent user-reported observations from real-browser execution in SillyTavern. They are not independently captured provider logs.
+
+#### Verified test baseline and inventory
+
+- **Chromatic Images client test suite:** **683 tests** passing across 23 test files on Node.js 22 and 24.
+  - M02 protocol/runtime group: **236 tests** (across 7 files: `message-reader`, `message-runtime`, `message-inspector`, `inline-renderer`, `proposal-parser`, `proposal-validator`, `result-parser`).
+  - Managed Regex group: **85 tests** (across 3 files: `regex-definitions`, `regex-integration`, `regex-panel`).
+  - Total M02 test coverage: **321 tests**.
+  - M03 provider/image group: **362 tests** (`nanogpt-qwen-request`, `nanogpt-qwen-compat-request`, `nanogpt-image-response`, `nanogpt-image-transport`, `nanogpt-image-dispatch`, `local-image-io`, `image-preflight`, `nanogpt-readiness`, `provider-settings`, `provider-panel`, `diagnostic-panel`).
+- **SillyTavern local server compatibility proxy suite:** **63 tests** passing in `tests/stable-diffusion.test.js` on local branch `m03-d2b1-nanogpt-proxy`.
+- **Tracked JavaScript files:** 47/47 files passed `node --check` syntax verification.
+
+#### Connection diagnostics distinction
+
+- The "Check local setup" button in the Settings drawer tests `GET /api/sd/nanogpt/images` (normalized marker `v1`) and `POST /api/secrets/read`.
+- It does **not** check the compatibility endpoint `GET /api/sd/nanogpt/images/generations` (`v1-compat`).
+- Compatibility capability is checked automatically during Phase 5 of diagnostic generation before provider dispatch.
+
+#### Operational parameters and guarantees
+
+- **Timeouts:**
+  - SillyTavern compatibility server proxy: **120 seconds** (`DEFAULT_NANOGPT_GENERATIONS_TIMEOUT_MS = 120000`).
+  - Browser diagnostic generation operation: **150 seconds** (`DEFAULT_GENERATION_TIMEOUT_MS = 150000`).
+  - SillyTavern local image upload: **60 seconds** (`DEFAULT_UPLOAD_TIMEOUT_MS = 60000`).
+- **Billing observations:** The user observed that 3 initial successful diagnostic generations consumed NanoGPT subscription image allowance. Subsequent 1-, 2-, and 3-reference live tests succeeded without separate balance inspection. Actual billing behavior may depend on individual account tier, subscription status, and remaining quota.
+- **Security & Privacy:** Server proxy retains the server-side NanoGPT secret (`SECRET_KEYS.NANOGPT`), strips any client-provided authorization headers, enforces strict input bounds, stream-counts upstream responses up to 50 MB, and never logs prompts, base64 payloads, or secrets.
+- **Chat isolation:** Diagnostic image generation operates strictly inside the settings panel. It does not rewrite chat messages, alter proposal cards, or record `CI_IMAGE` or `CI_RESULT` records in the active chat.
+- **Local proxy prerequisite:** The compatibility route `POST /api/sd/nanogpt/images/generations` resides on local SillyTavern branch `m03-d2b1-nanogpt-proxy` and is not merged into stock upstream SillyTavern.
+
+## 19. M03 closeout result
+
+**PASS — Full Phase M03 complete.**
+
+All M03 milestones (M03-A through M03-H) are complete and verified. Diagnostic image generation is proven operational via SillyTavern's local compatibility proxy across 0, 1, 2, and 3 reference images with local file persistence.
+
+Proposal-card Generate wiring remains deferred to M05. Character identity and trusted reference library management remain planned for M04.

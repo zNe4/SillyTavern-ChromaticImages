@@ -6,11 +6,11 @@
 
 **Phase:** M03 — NanoGPT/Qwen transport and local image primitives.
 
-**Current mission:** M03-G1 (Compatibility Transport & Server Proxy) implemented and verified, ready for independent review.
+**Current mission:** M03-H3 (Final Documentation Reconciliation and Formal Closeout) implemented and ready for independent review. Phase M03 complete.
 
-**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, M03-C response normalizer (accepted for provable behavior; unverified normalized envelope deferred to M03-G), M03-D1 single-request transport core (accepted), M03-D2A server path architecture decision (accepted; narrow core proxy update selected), M03-D2B1 SillyTavern normalized proxy (implemented and verified locally; committed in local SillyTavern checkout, pending upstream PR), M03-D2B2 Chromatic Images production dispatch adapter (accepted), M03-E SillyTavern-local image I/O (accepted), and M03-F Provider settings and diagnostic UI (accepted).
+**Completed:** M01 scaffold, M02 message protocol / inline UI / managed prompt hygiene, M03-A contract evidence, M03-B request builder, M03-C response normalizer, M03-D1 single-request transport core, M03-D2A server path architecture decision, M03-D2B1 SillyTavern normalized proxy, M03-D2B2 Chromatic Images production dispatch adapter, M03-E SillyTavern-local image I/O, M03-F Provider settings and diagnostic UI, M03-G1 Compatibility transport & server proxy, M03-G2 Diagnostic image generation & settings UI wiring, M03-H0 Integration research and verification planning, M03-H1 Non-billable integration verification, M03-H2 Live reference verification smoke, and M03-H3 Final documentation reconciliation.
 
-**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building (normalized and compatibility), response normalization, pure mocked transport core, production dispatch adapters with capability guards (normalized and compatibility), local image I/O primitives, provider settings schema, credential readiness reader, and connection diagnostics UI are implemented. Paid image generation is not enabled.
+**Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building (normalized and compatibility), response normalization, pure mocked transport core, production dispatch adapters with capability guards (normalized and compatibility), local image I/O primitives, provider settings schema, credential readiness reader, connection diagnostics UI, and explicit settings-only diagnostic image generator with local upload are implemented and verified. Automatic roleplay image generation remains disabled; proposal-card Generate wiring remains deferred to M05, and character identity and trusted reference library management are planned for M04.
 
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
@@ -227,7 +227,7 @@ No NanoGPT and no reference library yet.
 
 ## M03 — NanoGPT/Qwen transport and local image primitives
 
-**Status:** M03-A complete; M03-B accepted; M03-C accepted for currently provable behavior (normalized success-envelope adapter remains deferred); M03-D1 accepted; M03-D2A accepted; M03-D2B1 implemented locally in SillyTavern checkout; M03-D2B2 accepted; M03-E accepted; M03-F implemented and under independent review.
+**Status:** M03-A through M03-H complete and accepted (M03-H3 documentation reconciliation under review). Full Phase M03 complete.
 
 ### Goal
 
@@ -383,7 +383,7 @@ Implemented scope:
 
 #### M03-G2 — Diagnostic Image Generation & Settings UI Wiring
 
-**Status: Complete (ready for independent review and real smoke checks).**
+**Status: Accepted.**
 
 Explicitly user-initiated diagnostic image generator inside the settings drawer using the M03-G1 compatibility proxy (`POST /api/sd/nanogpt/images/generations`, marker `v1-compat`), supporting text prompt, resolution snapshot, 0..3 reference images, preflight dimension inspection, single dispatch, normalization, local upload, preview, billing truthfulness, and safe UI lifecycle management.
 
@@ -410,30 +410,60 @@ Implemented scope:
 - Dispatch & upload: Single provider dispatch with 150s operation deadline, compatibility proxy marker `v1-compat` verification, response normalization via `normalizeNanoGptImageResponse()`, remote URL rejection with billing uncertainty, durable local upload via `uploadGeneratedImageBase64()` with 60s deadline.
 - Truthful billing & privacy: Transparent billing notice (subscription allowance or $0.02 pay-as-you-go), conservative billing uncertainty on any post-dispatch failure ("The request was attempted; quota or account balance may have been affected"), zero logging or attribute reflection of raw errors, prompts, base64 images, or credentials.
 - Safe lifecycle & chat isolation: Drawer collapse/reopen retains preview; Clear result clears DOM state without deleting saved file; zero chat message modification or proposal card alteration.
-- Test coverage (`tests/image-preflight.test.mjs`, `tests/diagnostic-panel.test.mjs`, `tests/panel.test.mjs`): 42 new unit tests, 669/669 passing across the test suite.
+- Test coverage (`tests/image-preflight.test.mjs`, `tests/diagnostic-panel.test.mjs`, `tests/panel.test.mjs`): 42 new unit tests (683/683 passing across 23 test files in current full repository baseline).
 
 ### M03-H — Integration and closeout
 
-Validate:
+**Status: Complete (all sub-missions H0 through H3 verified and documented).**
 
-1. 0 refs;
-2. 1 ref;
-3. 2 refs;
-4. 3 refs;
-5. 4th rejected preflight;
-6. bad local path -> no paid call;
-7. provider failure -> no upload;
-8. upload failure -> no false durable result;
-9. successful local output survives reload;
-10. Android/mobile diagnostics;
-11. no surprise generation on reload/chat switch;
-12. M02 proposal and Regex behavior remain intact.
+Subdivided into:
+- **M03-H0 (Integration research and verification planning): Accepted.** Established the 12-item verification matrix, evidence inventory, non-billable boundaries, and test correction baseline.
+- **M03-H1 (Non-billable integration verification): Accepted.** Verified automated suite (683/683 tests passing across 23 test files), syntax verification (47/47 files passed `node --check`), 4th reference rejection before paid dispatch, and UI lifecycle in non-billable browser smoke.
+- **M03-H2 (Live reference verification smoke): Accepted.** Verified real provider generation across reference counts, confirming single dispatch, normalization, local storage upload, and reload persistence.
+- **M03-H3 (Documentation reconciliation and closeout): Complete (ready for independent review).** Reconciled roadmap, contract, architecture, and README with final shipped implementation.
 
-Update documentation with the exact shipped transport/model/settings behavior.
+#### Empirical reference verification matrix
+
+| Requirement / Scenario | Mechanism | Result | Evidence / Notes |
+|---|---|---|---|
+| 1. 0 reference images | Compatibility request omits reference fields | **Passed** | Live browser observation; output saved to `/user/images/...` |
+| 2. 1 reference image | Mapped to `imageDataUrl` | **Passed** | Live browser observation; single reference image guided scene |
+| 3. 2 reference images | Mapped to `imageDataUrls` (array of 2) | **Passed** | Live browser observation; dual reference images guided scene |
+| 4. 3 reference images | Mapped to `imageDataUrls` (array of 3) | **Passed** | Live browser observation; three reference images guided scene |
+| 5. 4th reference rejected | Client preflight checks `files.length <= 3` | **Passed** | Verified in non-billable browser testing and unit tests |
+| 6. Invalid local path rejected | Path and dimension/format preflight validation | **Passed** | Unit tests confirm bad paths/bytes fail before dispatch |
+| 7. Provider failure -> no upload | Guarded pipeline settlement | **Passed** | Automated unit tests verify upload is unreachable on error |
+| 8. Upload failure -> no false success | Local upload error classification | **Passed** | Automated unit tests verify upload error is displayed |
+| 9. Output survives reload | Local SillyTavern storage `/user/images/...` | **Passed** | Verified live; `/user/images/1791670016360.jpeg` persisted across reload |
+| 10. Android/mobile diagnostics | Responsive CSS layout in drawer | **Passed** | Verified layout stability and element accessibility |
+| 11. No surprise generation | Explicit button click required | **Passed** | Zero generation on reload, drawer toggle, or chat change |
+| 12. M02 protocol intact | Regression verification | **Passed** | All 321 M02 protocol and managed Regex tests pass cleanly |
+
+*Note on live outcomes:* The 0-, 1-, 2-, and 3-reference successes represent user-reported observations from real-browser execution in SillyTavern. They are not independently captured provider logs.
+
+#### Verified test baseline and inventory
+
+- **Chromatic Images client test suite:** **683 tests** passing across 23 test files on Node.js 22 and 24.
+  - M02 protocol/runtime group: **236 tests** (across 7 files: `message-reader`, `message-runtime`, `message-inspector`, `inline-renderer`, `proposal-parser`, `proposal-validator`, `result-parser`).
+  - Managed Regex group: **85 tests** (across 3 files: `regex-definitions`, `regex-integration`, `regex-panel`).
+  - Total M02 test coverage: **321 tests**.
+  - M03 provider/image group: **362 tests** (`nanogpt-qwen-request`, `nanogpt-qwen-compat-request`, `nanogpt-image-response`, `nanogpt-image-transport`, `nanogpt-image-dispatch`, `local-image-io`, `image-preflight`, `nanogpt-readiness`, `provider-settings`, `provider-panel`, `diagnostic-panel`).
+- **SillyTavern local server compatibility proxy suite:** **63 tests** passing in `tests/stable-diffusion.test.js` on local branch `m03-d2b1-nanogpt-proxy`.
+- **Tracked JavaScript files:** 47/47 files passed `node --check` syntax verification.
+
+#### Operational parameters and guarantees
+
+- **Timeouts:**
+  - SillyTavern compatibility server proxy: **120 seconds** (`DEFAULT_NANOGPT_GENERATIONS_TIMEOUT_MS = 120000`).
+  - Browser diagnostic generation operation: **150 seconds** (`DEFAULT_GENERATION_TIMEOUT_MS = 150000`).
+  - SillyTavern local image upload: **60 seconds** (`DEFAULT_UPLOAD_TIMEOUT_MS = 60000`).
+- **Billing observations:** The user observed that 3 initial successful diagnostic generations consumed NanoGPT subscription image allowance. Subsequent 1-, 2-, and 3-reference live tests succeeded without separate balance inspection. Actual billing behavior may depend on individual account tier, subscription status, and remaining quota.
+- **Security & Privacy:** Server proxy retains the server-side NanoGPT secret (`SECRET_KEYS.NANOGPT`), strips any client-provided authorization headers, enforces strict input bounds, stream-counts upstream responses up to 50 MB, and never logs prompts, base64 payloads, or secrets.
+- **Chat isolation:** Diagnostic image generation operates strictly inside the settings panel. It does not rewrite chat messages, alter proposal cards, or record `CI_IMAGE` or `CI_RESULT` records in the active chat.
 
 ### Stop point
 
-No proposal Generate wiring. M05 remains the first end-to-end `CI_IMAGE` generation milestone.
+Phase M03 is complete. No proposal-card Generate wiring. M05 remains the first end-to-end `CI_IMAGE` generation milestone. Await formal milestone acceptance before initiating M04.
 
 ## M04 — Stable character identity and trusted reference library
 

@@ -547,16 +547,55 @@ Image N must always map mechanically to imageDataUrls[N-1].
 
 ## 16. NanoGPT/Qwen boundary
 
-M03-A's current evidence contract lives in `docs/m03-contract.md`.
+M03's detailed evidence contract lives in `docs/m03-contract.md`.
 
-For new integration work:
+Chromatic Images implements two privacy-safe, same-origin SillyTavern server proxy routes:
+
+### 16.1 Subscription-compatible generations API (Active diagnostic backend)
+
+~~~text
+Chromatic Images (Browser Settings Diagnostic)
+    |
+    v (POST /api/sd/nanogpt/images/generations, x-st-nanogpt-proxy: v1-compat)
+SillyTavern local server proxy (m03-d2b1-nanogpt-proxy branch)
+    | (injects SECRET_KEYS.NANOGPT as x-api-key; no request body logging)
+    v
+POST https://api.nano-gpt.com/api/v1/images/generations
+~~~
+
+Core request payload pattern:
+
+~~~json
+{
+  "model": "qwen-image",
+  "prompt": "...",
+  "nImages": 1,
+  "resolution": "auto",
+  "response_format": "b64_json",
+  "imageDataUrl": "data:image/png;base64,...",
+  "imageDataUrls": ["data:image/png;base64,...", "data:image/png;base64,..."]
+}
+~~~
+
+Reference mapping rules:
+- **0 references:** omits both `imageDataUrl` and `imageDataUrls`.
+- **1 reference:** populates `imageDataUrl` as a single data URL string; omits `imageDataUrls`.
+- **2 to 3 references:** populates `imageDataUrls` as an array of data URL strings; omits `imageDataUrl`.
+- **4+ references:** rejected client-side before any network dispatch.
+
+Status and prerequisites:
+- Powers the active diagnostic image generator in the extension settings drawer.
+- Empirically proven end-to-end in real-browser testing across 0, 1, 2, and 3 reference images, with generated base64 saved to SillyTavern storage (`/user/images/...`).
+- Currently implemented in the user's local SillyTavern checkout on branch `m03-d2b1-nanogpt-proxy`. This route is not yet merged upstream into stock SillyTavern.
+
+### 16.2 Normalized Image API (Standardized target)
 
 ~~~text
 NanoGPT normalized Image API
 POST https://api.nano-gpt.com/api/v1/images
 ~~~
 
-Core request direction:
+Core request payload pattern:
 
 ~~~json
 {
@@ -568,19 +607,21 @@ Core request direction:
 }
 ~~~
 
-Rules:
+Status:
+- Pure request building (`buildQwenImageRequest`) and production transport dispatch adapters are implemented and verified with automated unit tests.
+- Because vendor documentation does not specify a normative success envelope for `POST /api/v1/images`, response normalization for this route remains deferred and strictly fails closed (`unverified-normalized-response-contract`).
 
-- `qwen-image` remains the MVP default until a deliberate quality/cost decision changes it;
-- Chromatic Images accepts at most three references and preserves their order;
-- model-specific guidance/steps/negative-prompt/seed fields must come from current NanoGPT `supported_parameters` metadata;
-- the browser extension must not own or expose the raw NanoGPT key;
-- reuse SillyTavern's existing server-side NanoGPT secret;
-- never log prompts or base64 references;
-- never automatically retry a potentially billable call.
+### 16.3 Proxy security, privacy, and timeouts
 
-Current SillyTavern already provides `/api/sd/nanogpt/generate`, but M03-A found that it logs the complete request body at default DEBUG level and targets NanoGPT's older native image route. Chromatic Images must not use that endpoint unchanged for reference-image generation.
-
-The preferred production boundary is a privacy-safe same-origin SillyTavern server proxy that retains the existing secret and forwards the normalized Image API. A narrow upstream core update is preferred for public distribution; a server-plugin fallback requires an explicit product decision.
+Both proxy routes enforce strict privacy and security boundaries:
+- **Zero credential leakage:** The browser extension never receives, persists, or exposes raw NanoGPT API keys. Authentication reuses SillyTavern's existing server-side secret (`SECRET_KEYS.NANOGPT`).
+- **Zero body logging:** Stock SillyTavern's legacy `/api/sd/nanogpt/generate` logged the complete request body at default DEBUG level. Both Chromatic Images proxy routes completely eliminate request body logging, protecting roleplay scene prompts and reference images.
+- **Defensive limits:** Server proxy enforces a 50 MB application payload limit, strict integer `Content-Length` validation, and stream-counts upstream responses up to 50 MB (returning HTTP 502 if exceeded).
+- **Timeouts:**
+  - SillyTavern compatibility server proxy: **120 seconds** (`DEFAULT_NANOGPT_GENERATIONS_TIMEOUT_MS = 120000`).
+  - Browser diagnostic generation operation: **150 seconds** (`DEFAULT_GENERATION_TIMEOUT_MS = 150000`).
+  - SillyTavern local image upload: **60 seconds** (`DEFAULT_UPLOAD_TIMEOUT_MS = 60000`).
+- **Chat isolation:** Diagnostic image generation operates strictly inside the settings panel. It does not rewrite chat messages, alter proposal cards, or record `CI_IMAGE` or `CI_RESULT` records in the active chat. Proposal-card Generate wiring remains deferred to M05.
 
 ## 17. Image I/O and message rewrite
 
