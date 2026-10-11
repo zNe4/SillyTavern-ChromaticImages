@@ -271,7 +271,9 @@ CURRENT SCENE
 ...
 ~~~
 
-The extension must keep Image N aligned with imageDataUrls[N-1].
+Reference ordering and character-identity mappings are strictly preserved:
+- Exactly one reference maps to `imageDataUrl` (representing Image 1).
+- Two or three references map to `imageDataUrls[N-1]`, preserving their order.
 
 
 ## Initial image backend
