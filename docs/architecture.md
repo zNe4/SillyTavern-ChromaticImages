@@ -540,7 +540,9 @@ CURRENT SCENE
 
 If an outfit/reference set is intentionally selected, its trusted design evidence may be described accordingly.
 
-Image N must always map mechanically to imageDataUrls[N-1].
+Reference ordering and character-identity mappings are strictly preserved:
+- When exactly 1 reference is provided, it maps to `imageDataUrl` (representing Image 1).
+- When 2 to 3 references are provided, Image N ($N \in \{1, 2, 3\}$) maps mechanically to `imageDataUrls[N-1]`.
 
 ---
 
@@ -563,7 +565,33 @@ SillyTavern local server proxy (m03-d2b1-nanogpt-proxy branch)
 POST https://api.nano-gpt.com/api/v1/images/generations
 ~~~
 
-Core request payload pattern:
+Base request structure (common fields):
+
+~~~json
+{
+  "model": "qwen-image",
+  "prompt": "...",
+  "nImages": 1,
+  "resolution": "auto",
+  "response_format": "b64_json"
+}
+~~~
+
+Reference-field variants (**mutually exclusive** — `imageDataUrl` and `imageDataUrls` must never be combined):
+
+**Variant 1 — 0 reference images (neither reference field present):**
+
+~~~json
+{
+  "model": "qwen-image",
+  "prompt": "...",
+  "nImages": 1,
+  "resolution": "auto",
+  "response_format": "b64_json"
+}
+~~~
+
+**Variant 2 — 1 reference image (only `imageDataUrl` present; `imageDataUrls` omitted):**
 
 ~~~json
 {
@@ -572,15 +600,31 @@ Core request payload pattern:
   "nImages": 1,
   "resolution": "auto",
   "response_format": "b64_json",
-  "imageDataUrl": "data:image/png;base64,...",
-  "imageDataUrls": ["data:image/png;base64,...", "data:image/png;base64,..."]
+  "imageDataUrl": "data:image/png;base64,..."
 }
 ~~~
 
-Reference mapping rules:
+**Variant 3 — 2 to 3 reference images (only `imageDataUrls` array present; `imageDataUrl` omitted):**
+
+~~~json
+{
+  "model": "qwen-image",
+  "prompt": "...",
+  "nImages": 1,
+  "resolution": "auto",
+  "response_format": "b64_json",
+  "imageDataUrls": [
+    "data:image/png;base64,...",
+    "data:image/png;base64,..."
+  ]
+}
+~~~
+
+Reference mapping and validation rules:
 - **0 references:** omits both `imageDataUrl` and `imageDataUrls`.
-- **1 reference:** populates `imageDataUrl` as a single data URL string; omits `imageDataUrls`.
-- **2 to 3 references:** populates `imageDataUrls` as an array of data URL strings; omits `imageDataUrl`.
+- **1 reference:** populates only `imageDataUrl` as a single data URL string; omits `imageDataUrls`.
+- **2 to 3 references:** populates only `imageDataUrls` as an array of data URL strings (preserving reference ordering); omits `imageDataUrl`.
+- **Mutual exclusivity:** `imageDataUrl` and `imageDataUrls` must never appear together in the same request. Combining them, providing empty arrays, or supplying invalid data formats is strictly rejected by the request builder and proxy validation.
 - **4+ references:** rejected client-side before any network dispatch.
 
 Status and prerequisites:

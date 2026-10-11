@@ -4,7 +4,7 @@
 
 It belongs to the planned **Chromatic** family of SillyTavern extensions alongside Chromatic Dialogue.
 
-> **Project status:** M01 and M02 are complete. M03 provider transport, local image primitives, and diagnostic generation work have passed all verification gates (M03-A through M03-H). Explicit, settings-only diagnostic image generation is verified and functional via SillyTavern's local compatibility proxy. Automatic roleplay image generation remains disabled; proposal-card Generate wiring remains deferred to M05, and character identity and trusted reference library management are planned for M04.
+> **Project status:** M01 and M02 are complete. M03 implementation and integration verification milestones (M03-A through M03-H2) are accepted; M03-H3 documentation reconciliation is complete and submitted for independent review. Explicit, settings-only diagnostic image generation is verified and functional via SillyTavern's local compatibility proxy. Automatic roleplay image generation remains disabled; proposal-card Generate wiring remains deferred to M05, and character identity and trusted reference library management are planned for M04.
 
 ## Product goal
 
