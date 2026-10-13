@@ -399,6 +399,12 @@ describe('SillyTavern patch installer preflight (D01-P3A)', async () => {
       const indexBeforeSha = computeSha256(indexBeforeBuf);
       const indexBeforeMtime = fs.statSync(indexFile).mtimeMs;
 
+      const refsBeforeRes = runGit(repoDir, ['for-each-ref', '--format=%(refname)|%(objectname)']);
+      const refsBeforeOut = refsBeforeRes.stdout;
+
+      const headBeforeRes = runGit(repoDir, ['rev-parse', 'HEAD']);
+      const headBeforeOut = headBeforeRes.stdout;
+
       const statusBeforeRes = runGit(repoDir, ['status', '--porcelain=v1']);
       const statusBeforeOut = statusBeforeRes.stdout;
 
@@ -415,6 +421,12 @@ describe('SillyTavern patch installer preflight (D01-P3A)', async () => {
       const indexAfterSha = computeSha256(indexAfterBuf);
       const indexAfterMtime = fs.statSync(indexFile).mtimeMs;
 
+      const refsAfterRes = runGit(repoDir, ['for-each-ref', '--format=%(refname)|%(objectname)']);
+      const refsAfterOut = refsAfterRes.stdout;
+
+      const headAfterRes = runGit(repoDir, ['rev-parse', 'HEAD']);
+      const headAfterOut = headAfterRes.stdout;
+
       const statusAfterRes = runGit(repoDir, ['status', '--porcelain=v1']);
       const statusAfterOut = statusAfterRes.stdout;
 
@@ -425,7 +437,16 @@ describe('SillyTavern patch installer preflight (D01-P3A)', async () => {
       assert.equal(indexAfterSha, indexBeforeSha, '.git/index SHA-256 must remain identical');
       assert.equal(indexAfterMtime, indexBeforeMtime, '.git/index mtime must remain unchanged');
 
+      assert.equal(refsAfterOut, refsBeforeOut, 'Git refs must remain identical');
+      assert.equal(headAfterOut, headBeforeOut, 'HEAD commit must remain identical');
+
       assert.equal(statusAfterOut, statusBeforeOut, 'git status --porcelain must remain bit-for-bit identical');
+
+      // Assert no Git lockfiles, temporary files, or installer metadata exist
+      assert.equal(fs.existsSync(path.join(repoDir, '.git/index.lock')), false, 'No index.lock file must exist');
+      assert.equal(fs.existsSync(path.join(repoDir, '.git/HEAD.lock')), false, 'No HEAD.lock file must exist');
+      assert.equal(fs.existsSync(path.join(repoDir, '.ci-patch')), false, 'No .ci-patch metadata must exist');
+      assert.equal(fs.existsSync(path.join(repoDir, 'src/endpoints/stable-diffusion.js.bak')), false, 'No .bak backup file must exist');
     });
 
     test('CLI JSON output matches schema', async () => {
@@ -452,25 +473,38 @@ describe('SillyTavern patch installer preflight (D01-P3A)', async () => {
   });
 
   describe('Tier 3: Authentic Pinned-Release Checkout Integration Tests', () => {
-    const localStPath = '/home/zzzne4/SillyTavern';
+    const configuredTestRepo = process.env.SILLYTAVERN_TEST_REPO
+      ? path.resolve(process.env.SILLYTAVERN_TEST_REPO)
+      : null;
     let localCommitAvailable = false;
+    let validatedRepoPath = null;
 
-    try {
-      if (fs.existsSync(localStPath)) {
-        const res = runGit(localStPath, ['rev-parse', '--verify', manifest.releaseCommit]);
-        localCommitAvailable = res.status === 0 && res.stdout.trim() === manifest.releaseCommit;
+    if (configuredTestRepo) {
+      try {
+        if (fs.existsSync(configuredTestRepo) && fs.statSync(configuredTestRepo).isDirectory()) {
+          const isWorktree = runGit(configuredTestRepo, ['rev-parse', '--is-inside-work-tree']);
+          if (isWorktree.status === 0 && isWorktree.stdout.trim() === 'true') {
+            const commitCheck = runGit(configuredTestRepo, ['rev-parse', '--verify', manifest.releaseCommit]);
+            if (commitCheck.status === 0 && commitCheck.stdout.trim() === manifest.releaseCommit) {
+              localCommitAvailable = true;
+              validatedRepoPath = configuredTestRepo;
+            }
+          }
+        }
+      } catch {
+        localCommitAvailable = false;
       }
-    } catch {
-      localCommitAvailable = false;
     }
 
     if (!localCommitAvailable) {
       test('skipped: authentic pinned commit 06bde939f is not available locally', (t) => {
-        t.skip('Local SillyTavern checkout at 06bde939f not found; skipping Tier 3 authentic integration');
+        t.skip(
+          'SILLYTAVERN_TEST_REPO is not set or does not contain commit 06bde939f; skipping Tier 3 authentic integration'
+        );
       });
     } else {
       test('verifies active user SillyTavern installation non-destructively as unsupported-revision', async () => {
-        const res = await inspectTargetInstallation({ targetDir: localStPath });
+        const res = await inspectTargetInstallation({ targetDir: validatedRepoPath });
         assert.equal(res.status, 'unsupported-revision');
         assert.equal(res.ok, true);
         assert.equal(res.isReleaseCommit, false);
@@ -480,7 +514,7 @@ describe('SillyTavern patch installer preflight (D01-P3A)', async () => {
         const tempCloneDir = createTempDir('st-authentic-clone-');
 
         // Create independent clone of local SillyTavern (no worktree shared metadata)
-        execFileSync('git', ['clone', '--no-hardlinks', '-q', localStPath, tempCloneDir]);
+        execFileSync('git', ['clone', '--no-hardlinks', '-q', validatedRepoPath, tempCloneDir]);
         execFileSync('git', ['checkout', '-q', manifest.releaseCommit], { cwd: tempCloneDir });
 
         const runtimePatchPath = path.resolve(

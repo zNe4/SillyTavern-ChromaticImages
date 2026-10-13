@@ -293,9 +293,6 @@ export function classifyTargetState(observations, manifest) {
  * Perform full read-only inspection of a target SillyTavern installation.
  * @param {object} options
  * @param {string} options.targetDir - Path to SillyTavern repository
- * @param {object} [options._internalManifest] - Manifest override for unit test injection only
- * @param {string} [options._internalPatchPath] - Patch path override for unit test injection only
- * @param {object} [options._gitOps] - Git operations module override for testing
  * @returns {Promise<{
  *   ok: boolean,
  *   status: string,
@@ -321,28 +318,27 @@ export function classifyTargetState(observations, manifest) {
  * }>}
  */
 export async function inspectTargetInstallation(options = {}) {
-  const gitOps = options._gitOps || defaultGitOps;
+  const gitOps = defaultGitOps;
   const rawTargetDir = options.targetDir || '';
 
-  // 1. Verify distribution package manifest
-  let manifest = options._internalManifest || null;
+  // 1. Verify distribution package manifest exclusively from bundled package
+  let manifest = null;
   let packageValid = false;
   const packageErrors = [];
-  let runtimePatchPath = options._internalPatchPath || null;
+  let runtimePatchPath = null;
 
-  if (manifest) {
+  const pkgResult = await verifyPatchManifest(BUNDLED_MANIFEST_PATH);
+  if (pkgResult.ok) {
+    manifest = pkgResult.manifest;
     packageValid = true;
+    runtimePatchPath = path.resolve(
+      path.dirname(BUNDLED_MANIFEST_PATH),
+      manifest.patches.runtime.patchFile
+    );
   } else {
-    const pkgResult = await verifyPatchManifest(BUNDLED_MANIFEST_PATH);
-    if (pkgResult.ok) {
-      manifest = pkgResult.manifest;
-      packageValid = true;
-      runtimePatchPath = path.resolve(path.dirname(BUNDLED_MANIFEST_PATH), manifest.patches.runtime.patchFile);
-    } else {
-      packageValid = false;
-      packageErrors.push(...pkgResult.errors);
-      manifest = pkgResult.manifest;
-    }
+    packageValid = false;
+    packageErrors.push(...pkgResult.errors);
+    manifest = pkgResult.manifest;
   }
 
   const targetRelFile = manifest?.patches?.runtime?.targetFile || 'src/endpoints/stable-diffusion.js';
@@ -547,7 +543,7 @@ export async function inspectTargetInstallation(options = {}) {
  * }>}
  */
 export async function checkInstallationPreflight(options = {}) {
-  const gitOps = options._gitOps || defaultGitOps;
+  const gitOps = defaultGitOps;
   const inspection = await inspectTargetInstallation(options);
 
   // If already installed:
