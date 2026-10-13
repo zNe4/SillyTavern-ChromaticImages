@@ -12,6 +12,8 @@
 
 **Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building (normalized and compatibility), response normalization, pure mocked transport core, production dispatch adapters with capability guards (normalized and compatibility), local image I/O primitives, provider settings schema, credential readiness reader, connection diagnostics UI, and explicit settings-only diagnostic image generator with local upload are implemented and verified. Automatic roleplay image generation remains disabled; proposal-card Generate wiring remains deferred to M05, and character identity and trusted reference library management are planned for M04.
 
+**Distribution track (D01):** D01-P1 (release compatibility research) and D01-P2A (proxy hardening) accepted. D01-P2B (distribution artifacts, compatibility manifest, and offline verification tooling) implemented and submitted for independent review. D01-P3 (installer) deferred.
+
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
 **Workflow:** work directly in the canonical local checkout; no separate `-aistudio` sandbox is required.

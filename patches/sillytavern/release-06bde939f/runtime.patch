@@ -1,0 +1,901 @@
+diff --git a/src/endpoints/stable-diffusion.js b/src/endpoints/stable-diffusion.js
+index 077c2f961..e8bcfb652 100644
+--- a/src/endpoints/stable-diffusion.js
++++ b/src/endpoints/stable-diffusion.js
+@@ -1,5 +1,8 @@
+ import fs from 'node:fs';
+ import path from 'node:path';
++import { Buffer } from 'node:buffer';
++import { Transform } from 'node:stream';
++import { pipeline } from 'node:stream/promises';
+ 
+ import express from 'express';
+ import fetch from 'node-fetch';
+@@ -1436,8 +1439,6 @@ nanogpt.post('/generate', async (request, response) => {
+             return response.sendStatus(400);
+         }
+ 
+-        console.debug('NanoGPT request:', request.body);
+-
+         const result = await fetch('https://nano-gpt.com/api/generate-image', {
+             method: 'POST',
+             body: JSON.stringify(request.body),
+@@ -1468,6 +1469,878 @@ nanogpt.post('/generate', async (request, response) => {
+     }
+ });
+ 
++const MAX_NANOGPT_APPLICATION_BYTES = 50 * 1024 * 1024; // 50 MB local safety ceiling
++const NANOGPT_PROXY_MARKER_HEADER = 'x-st-nanogpt-proxy';
++const NANOGPT_PROXY_MARKER_VALUE = 'v1';
++
++/**
++ * Validates whether an item in input_references is a valid reference.
++ * Supported forms:
++ * 1. Non-empty trimmed string URL or data URL
++ * 2. Plain object { type: 'image_url', image_url: { url: string } } with non-empty trimmed url
++ * @param {any} ref
++ * @returns {boolean}
++ */
++function isValidNanoGptInputReference(ref) {
++    if (typeof ref === 'string') {
++        return ref.trim().length > 0;
++    }
++    if (typeof ref === 'object' && ref !== null && !Array.isArray(ref)) {
++        if (ref.type !== 'image_url') {
++            return false;
++        }
++        const imgUrl = ref.image_url;
++        if (typeof imgUrl !== 'object' || imgUrl === null || Array.isArray(imgUrl)) {
++            return false;
++        }
++        return typeof imgUrl.url === 'string' && imgUrl.url.trim().length > 0;
++    }
++    return false;
++}
++
++const MAX_NANOGPT_UPSTREAM_RESPONSE_BYTES = 50 * 1024 * 1024; // 50 MB
++
++export const DEFAULT_NANOGPT_IMAGES_TIMEOUT_MS = 120000;
++let nanogptImagesTimeoutMs = DEFAULT_NANOGPT_IMAGES_TIMEOUT_MS;
++
++/**
++ * Sets the operation deadline for NanoGPT normalized image generation requests.
++ * Used for test injection; default is 120 seconds.
++ * @param {number} timeoutMs
++ */
++export function setNanoGptImagesTimeoutMs(timeoutMs) {
++    if (typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0) {
++        nanogptImagesTimeoutMs = timeoutMs;
++    }
++}
++
++/**
++ * Resets the operation deadline for NanoGPT normalized image generation requests to default.
++ */
++export function resetNanoGptImagesTimeoutMs() {
++    nanogptImagesTimeoutMs = DEFAULT_NANOGPT_IMAGES_TIMEOUT_MS;
++}
++
++/**
++ * Safely disposes or destroys an upstream response body stream.
++ * @param {any} res
++ */
++function disposeUpstreamBody(res) {
++    if (!res?.body) return;
++    try {
++        if (typeof res.body.destroy === 'function') {
++            res.body.destroy();
++        } else if (typeof res.body.cancel === 'function') {
++            res.body.cancel().catch?.(() => {});
++        }
++    } catch {
++        // Ignore disposal errors
++    }
++}
++
++nanogpt.get('/images', (request, response) => {
++    response.setHeader(NANOGPT_PROXY_MARKER_HEADER, NANOGPT_PROXY_MARKER_VALUE);
++    return response.status(200).json({ ok: true, route: 'nanogpt-images' });
++});
++
++nanogpt.post('/images', async (request, response) => {
++    response.setHeader(NANOGPT_PROXY_MARKER_HEADER, NANOGPT_PROXY_MARKER_VALUE);
++
++    try {
++        const key = readSecret(request.user?.directories, SECRET_KEYS.NANOGPT);
++
++        if (!key) {
++            console.warn('NanoGPT key not found.');
++            return response.status(400).send({ error: 'NanoGPT key not configured.' });
++        }
++
++        const body = request.body;
++        if (typeof body !== 'object' || body === null || Array.isArray(body)) {
++            return response.status(400).send({ error: 'Request body must be a plain JSON object.' });
++        }
++
++        if (typeof body.model !== 'string' || !/^[a-zA-Z0-9_\-./]+$/.test(body.model) || body.model.length > 128) {
++            return response.status(400).send({ error: 'Invalid or missing model parameter.' });
++        }
++
++        if (body.prompt !== undefined && (typeof body.prompt !== 'string' || body.prompt.length > 10000)) {
++            return response.status(400).send({ error: 'Prompt must be a string of at most 10,000 characters.' });
++        }
++
++        if (body.n !== undefined && (!Number.isInteger(body.n) || body.n < 1 || body.n > 10)) {
++            return response.status(400).send({ error: 'n must be an integer between 1 and 10.' });
++        }
++
++        if (body.input_references !== undefined) {
++            if (!Array.isArray(body.input_references) || body.input_references.length > 16) {
++                return response.status(400).send({ error: 'input_references must be an array of at most 16 items.' });
++            }
++            for (const ref of body.input_references) {
++                if (!isValidNanoGptInputReference(ref)) {
++                    return response.status(400).send({ error: 'input_references items must be non-empty URL strings or valid image_url objects.' });
++                }
++            }
++        }
++
++        if (body.stream === true || body.provider !== undefined) {
++            return response.status(400).send({ error: 'stream and provider options are not supported.' });
++        }
++
++        const serializedBody = JSON.stringify(body);
++        const payloadBytes = Buffer.byteLength(serializedBody, 'utf8');
++        if (payloadBytes > MAX_NANOGPT_APPLICATION_BYTES) {
++            return response.status(413).send({ error: 'Payload exceeds 50 MB application limit.' });
++        }
++
++        const abortController = new AbortController();
++        let timedOut = false;
++        let clientDisconnected = false;
++        let isTerminated = false;
++        let activeUpstreamResponse = null;
++
++        const isOperationActive = () => {
++            if (isTerminated || timedOut || clientDisconnected) {
++                return false;
++            }
++            if (abortController.signal.aborted) {
++                return false;
++            }
++            if (response.destroyed || !response.writable) {
++                return false;
++            }
++            return true;
++        };
++
++        const canSendResponseHeaders = () => {
++            if (clientDisconnected) {
++                return false;
++            }
++            if (response.headersSent || response.writableEnded || response.writableFinished || response.destroyed || !response.writable) {
++                return false;
++            }
++            return true;
++        };
++
++        const onResponseClose = () => {
++            if (!response.writableFinished) {
++                clientDisconnected = true;
++                isTerminated = true;
++                abortController.abort();
++                disposeUpstreamBody(activeUpstreamResponse);
++            }
++        };
++        response.once('close', onResponseClose);
++
++        let deadlineTimer = null;
++        const deadlinePromise = new Promise((_, reject) => {
++            deadlineTimer = setTimeout(() => {
++                timedOut = true;
++                isTerminated = true;
++                abortController.abort();
++                disposeUpstreamBody(activeUpstreamResponse);
++                const timeoutErr = new Error('Upstream operation timed out.');
++                timeoutErr.code = 'ERR_UPSTREAM_TIMEOUT';
++                reject(timeoutErr);
++            }, nanogptImagesTimeoutMs);
++        });
++        deadlinePromise.catch(() => {});
++
++        try {
++            const upstreamTask = (async () => {
++                let upstreamResponse;
++                try {
++                    upstreamResponse = await fetch('https://api.nano-gpt.com/api/v1/images', {
++                        method: 'POST',
++                        body: serializedBody,
++                        headers: {
++                            'x-api-key': key,
++                            'Content-Type': 'application/json',
++                            'Content-Length': String(payloadBytes),
++                        },
++                        redirect: 'error',
++                        signal: abortController.signal,
++                    });
++                } catch (fetchErr) {
++                    if (!isOperationActive()) {
++                        return;
++                    }
++                    throw fetchErr;
++                }
++
++                activeUpstreamResponse = upstreamResponse;
++
++                if (!isOperationActive()) {
++                    disposeUpstreamBody(upstreamResponse);
++                    return;
++                }
++
++                // Non-2xx responses sanitized: preserve status, return static message, dispose body
++                const is2xx = upstreamResponse.status >= 200 && upstreamResponse.status < 300;
++                if (!is2xx) {
++                    disposeUpstreamBody(upstreamResponse);
++                    if (!canSendResponseHeaders()) {
++                        return;
++                    }
++                    console.error('NanoGPT proxy: upstream transport failure.');
++                    const safeStatus = Number.isInteger(upstreamResponse.status) && upstreamResponse.status >= 400 && upstreamResponse.status <= 599
++                        ? upstreamResponse.status
++                        : 502;
++                    return response.status(safeStatus).json({ error: 'Upstream image generation failed.' });
++                }
++
++                const rawContentLength = typeof upstreamResponse.headers?.get === 'function'
++                    ? upstreamResponse.headers.get('content-length')
++                    : upstreamResponse.headers?.['content-length'];
++                if (typeof rawContentLength === 'string') {
++                    const trimmedCl = rawContentLength.trim();
++                    if (!/^\d+$/.test(trimmedCl)) {
++                        disposeUpstreamBody(upstreamResponse);
++                        if (!canSendResponseHeaders()) {
++                            return;
++                        }
++                        console.error('NanoGPT proxy: upstream transport failure.');
++                        return response.status(502).json({ error: 'Upstream response exceeded size limit.' });
++                    }
++                    const declaredBytes = Number(trimmedCl);
++                    if (!Number.isSafeInteger(declaredBytes) || declaredBytes > MAX_NANOGPT_UPSTREAM_RESPONSE_BYTES) {
++                        disposeUpstreamBody(upstreamResponse);
++                        if (!canSendResponseHeaders()) {
++                            return;
++                        }
++                        console.error('NanoGPT proxy: response size exceeded.');
++                        return response.status(502).json({ error: 'Upstream response exceeded size limit.' });
++                    }
++                }
++
++                if (!canSendResponseHeaders()) {
++                    disposeUpstreamBody(upstreamResponse);
++                    return;
++                }
++
++                response.status(upstreamResponse.status);
++                const contentType = typeof upstreamResponse.headers?.get === 'function'
++                    ? upstreamResponse.headers.get('content-type')
++                    : upstreamResponse.headers?.['content-type'];
++                if (contentType) {
++                    response.setHeader('Content-Type', contentType);
++                }
++
++                if (upstreamResponse.body) {
++                    let receivedBytes = 0;
++                    const byteLimitStream = new Transform({
++                        transform(chunk, encoding, callback) {
++                            receivedBytes += chunk.length;
++                            if (receivedBytes > MAX_NANOGPT_UPSTREAM_RESPONSE_BYTES) {
++                                const limitErr = new Error('Upstream response exceeded size limit.');
++                                limitErr.code = 'ERR_RESPONSE_LIMIT_EXCEEDED';
++                                callback(limitErr);
++                                return;
++                            }
++                            callback(null, chunk);
++                        },
++                    });
++
++                    try {
++                        await pipeline(upstreamResponse.body, byteLimitStream, response);
++                    } catch (pipeErr) {
++                        disposeUpstreamBody(upstreamResponse);
++
++                        if (pipeErr?.code === 'ERR_RESPONSE_LIMIT_EXCEEDED') {
++                            console.error('NanoGPT proxy: response size exceeded.');
++                            if (canSendResponseHeaders()) {
++                                return response.status(502).json({ error: 'Upstream response exceeded size limit.' });
++                            }
++                            if (!response.destroyed) {
++                                response.destroy();
++                            }
++                            return;
++                        }
++
++                        if (timedOut) {
++                            console.error('NanoGPT proxy: upstream timeout.');
++                            if (canSendResponseHeaders()) {
++                                return response.status(504).json({ error: 'Upstream operation timed out.' });
++                            }
++                            if (!response.destroyed) {
++                                response.destroy();
++                            }
++                            return;
++                        }
++
++                        if (pipeErr?.name === 'AbortError' || pipeErr?.code === 'ERR_STREAM_PREMATURE_CLOSE') {
++                            if (!response.destroyed) {
++                                response.destroy();
++                            }
++                            return;
++                        }
++
++                        console.error('NanoGPT proxy: upstream stream failure.');
++                        if (canSendResponseHeaders()) {
++                            return response.status(500).json({ error: 'NanoGPT transport failed.' });
++                        }
++                        if (!response.destroyed) {
++                            response.destroy();
++                        }
++                        return;
++                    }
++                } else {
++                    if (isOperationActive() && !response.writableEnded) {
++                        response.end();
++                    }
++                }
++            })();
++
++            upstreamTask.catch(() => {});
++
++            await Promise.race([upstreamTask, deadlinePromise]);
++        } catch (error) {
++            disposeUpstreamBody(activeUpstreamResponse);
++
++            if (timedOut || error?.code === 'ERR_UPSTREAM_TIMEOUT') {
++                console.error('NanoGPT proxy: upstream timeout.');
++                if (canSendResponseHeaders()) {
++                    return response.status(504).json({ error: 'Upstream operation timed out.' });
++                }
++                if (!response.destroyed) {
++                    response.destroy();
++                }
++                return;
++            }
++
++            if (clientDisconnected || error?.name === 'AbortError' || error?.code === 'ERR_STREAM_PREMATURE_CLOSE') {
++                if (!response.destroyed) {
++                    response.destroy();
++                }
++                return;
++            }
++
++            console.error('NanoGPT proxy: upstream transport failure.');
++            if (canSendResponseHeaders()) {
++                return response.status(500).json({ error: 'NanoGPT transport failed.' });
++            }
++            if (!response.destroyed) {
++                response.destroy();
++            }
++        } finally {
++            isTerminated = true;
++            if (deadlineTimer !== null) {
++                clearTimeout(deadlineTimer);
++            }
++            response.removeListener('close', onResponseClose);
++            disposeUpstreamBody(activeUpstreamResponse);
++        }
++    } catch {
++        console.error('NanoGPT proxy: upstream transport failure.');
++        if (!response.headersSent && !response.destroyed && response.writable) {
++            return response.status(500).json({ error: 'NanoGPT transport failed.' });
++        }
++    }
++});
++
++const NANOGPT_PROXY_GENERATIONS_MARKER_VALUE = 'v1-compat';
++const MAX_NANOGPT_REFERENCE_BYTES = 31457280; // 30 MiB
++const QWEN_IMAGE_ALLOWED_RESOLUTIONS = new Set([
++    'auto',
++    '1024x1024',
++    '512x512',
++    '768x1024',
++    '576x1024',
++    '1024x768',
++    '1024x576',
++]);
++const QWEN_COMPAT_ALLOWED_KEYS = new Set([
++    'model',
++    'prompt',
++    'nImages',
++    'resolution',
++    'response_format',
++    'imageDataUrl',
++    'imageDataUrls',
++]);
++
++/**
++ * Validates a data URL reference string for MIME prefix, base64 syntax,
++ * decoded byte length, and authentic image magic bytes.
++ * Returns decoded byte length if valid, or null if invalid.
++ * @param {any} dataUrl
++ * @returns {number | null}
++ */
++function validateNanoGptDataUrl(dataUrl) {
++    if (typeof dataUrl !== 'string') {
++        return null;
++    }
++
++    let mime = null;
++    let base64Part = null;
++    if (dataUrl.startsWith('data:image/png;base64,')) {
++        mime = 'png';
++        base64Part = dataUrl.slice('data:image/png;base64,'.length);
++    } else if (dataUrl.startsWith('data:image/jpeg;base64,')) {
++        mime = 'jpeg';
++        base64Part = dataUrl.slice('data:image/jpeg;base64,'.length);
++    } else if (dataUrl.startsWith('data:image/webp;base64,')) {
++        mime = 'webp';
++        base64Part = dataUrl.slice('data:image/webp;base64,'.length);
++    } else {
++        return null;
++    }
++
++    if (base64Part.length === 0 || base64Part.length % 4 !== 0) {
++        return null;
++    }
++
++    let padding = 0;
++    if (base64Part.endsWith('==')) {
++        padding = 2;
++    } else if (base64Part.endsWith('=')) {
++        padding = 1;
++    }
++    const decodedBytes = Math.floor((base64Part.length / 4) * 3) - padding;
++    if (decodedBytes === 0 || decodedBytes > MAX_NANOGPT_REFERENCE_BYTES) {
++        return null;
++    }
++
++    if (/[^A-Za-z0-9+/=]/.test(base64Part)) {
++        return null;
++    }
++
++    const equalIndex = base64Part.indexOf('=');
++    if (equalIndex !== -1) {
++        if (equalIndex < base64Part.length - 2) {
++            return null;
++        }
++        if (equalIndex === base64Part.length - 2 && base64Part[base64Part.length - 1] !== '=') {
++            return null;
++        }
++    }
++
++    // Inspect magic bytes via prefix decode (first 24 base64 chars = 18 decoded bytes)
++    const prefixSlice = base64Part.slice(0, 24);
++    let prefixBuf;
++    try {
++        prefixBuf = Buffer.from(prefixSlice, 'base64');
++    } catch {
++        return null;
++    }
++
++    if (mime === 'png') {
++        if (
++            prefixBuf.length < 8 ||
++            prefixBuf[0] !== 0x89 ||
++            prefixBuf[1] !== 0x50 ||
++            prefixBuf[2] !== 0x4e ||
++            prefixBuf[3] !== 0x47 ||
++            prefixBuf[4] !== 0x0d ||
++            prefixBuf[5] !== 0x0a ||
++            prefixBuf[6] !== 0x1a ||
++            prefixBuf[7] !== 0x0a
++        ) {
++            return null;
++        }
++    } else if (mime === 'jpeg') {
++        if (
++            prefixBuf.length < 3 ||
++            prefixBuf[0] !== 0xff ||
++            prefixBuf[1] !== 0xd8 ||
++            prefixBuf[2] !== 0xff
++        ) {
++            return null;
++        }
++    } else if (mime === 'webp') {
++        if (
++            prefixBuf.length < 12 ||
++            prefixBuf[0] !== 0x52 ||
++            prefixBuf[1] !== 0x49 ||
++            prefixBuf[2] !== 0x46 ||
++            prefixBuf[3] !== 0x46 ||
++            prefixBuf[8] !== 0x57 ||
++            prefixBuf[9] !== 0x45 ||
++            prefixBuf[10] !== 0x42 ||
++            prefixBuf[11] !== 0x50
++        ) {
++            return null;
++        }
++    }
++
++    return decodedBytes;
++}
++
++export const DEFAULT_NANOGPT_GENERATIONS_TIMEOUT_MS = 120000;
++let nanogptGenerationsTimeoutMs = DEFAULT_NANOGPT_GENERATIONS_TIMEOUT_MS;
++
++/**
++ * Sets the operation deadline for NanoGPT compatibility image generation requests.
++ * Used for test injection; default is 120 seconds.
++ * @param {number} timeoutMs
++ */
++export function setNanoGptGenerationsTimeoutMs(timeoutMs) {
++    if (typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0) {
++        nanogptGenerationsTimeoutMs = timeoutMs;
++    }
++}
++
++/**
++ * Resets the operation deadline for NanoGPT compatibility image generation requests to default.
++ */
++export function resetNanoGptGenerationsTimeoutMs() {
++    nanogptGenerationsTimeoutMs = DEFAULT_NANOGPT_GENERATIONS_TIMEOUT_MS;
++}
++
++nanogpt.get('/images/generations', (request, response) => {
++    response.setHeader(NANOGPT_PROXY_MARKER_HEADER, NANOGPT_PROXY_GENERATIONS_MARKER_VALUE);
++    return response.status(200).json({ ok: true, route: 'nanogpt-images-generations' });
++});
++
++nanogpt.post('/images/generations', async (request, response) => {
++    response.setHeader(NANOGPT_PROXY_MARKER_HEADER, NANOGPT_PROXY_GENERATIONS_MARKER_VALUE);
++
++    try {
++        const key = readSecret(request.user?.directories, SECRET_KEYS.NANOGPT);
++
++        if (!key) {
++            console.warn('NanoGPT key not found.');
++            return response.status(400).send({ error: 'NanoGPT key not configured.' });
++        }
++
++        const body = request.body;
++        if (typeof body !== 'object' || body === null || Array.isArray(body)) {
++            return response.status(400).send({ error: 'Request body must be a plain JSON object.' });
++        }
++
++        for (const k of Object.keys(body)) {
++            if (!QWEN_COMPAT_ALLOWED_KEYS.has(k)) {
++                return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++            }
++        }
++
++        if (body.model !== 'qwen-image') {
++            return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++        }
++
++        if (typeof body.prompt !== 'string') {
++            return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++        }
++        const trimmedPrompt = body.prompt.trim();
++        if (trimmedPrompt.length === 0 || trimmedPrompt.length > 3000) {
++            return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++        }
++
++        if (!Number.isInteger(body.nImages) || body.nImages !== 1) {
++            return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++        }
++
++        if (typeof body.resolution !== 'string' || !QWEN_IMAGE_ALLOWED_RESOLUTIONS.has(body.resolution)) {
++            return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++        }
++
++        if (body.response_format !== undefined && body.response_format !== 'b64_json') {
++            return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++        }
++
++        const serializedBody = JSON.stringify(body);
++        const payloadBytes = Buffer.byteLength(serializedBody, 'utf8');
++        if (payloadBytes > MAX_NANOGPT_APPLICATION_BYTES) {
++            return response.status(413).send({ error: 'Payload exceeds 50 MB application limit.' });
++        }
++
++        const hasSingle = body.imageDataUrl !== undefined;
++        const hasMulti = body.imageDataUrls !== undefined;
++
++        if (hasSingle && hasMulti) {
++            return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++        }
++
++        let totalReferenceBytes = 0;
++        if (hasSingle) {
++            const bytes = validateNanoGptDataUrl(body.imageDataUrl);
++            if (bytes === null) {
++                return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++            }
++            totalReferenceBytes = bytes;
++        } else if (hasMulti) {
++            if (!Array.isArray(body.imageDataUrls) || body.imageDataUrls.length < 2 || body.imageDataUrls.length > 3) {
++                return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++            }
++            for (const ref of body.imageDataUrls) {
++                const bytes = validateNanoGptDataUrl(ref);
++                if (bytes === null) {
++                    return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++                }
++                totalReferenceBytes += bytes;
++            }
++        }
++
++        if (totalReferenceBytes > MAX_NANOGPT_REFERENCE_BYTES) {
++            return response.status(400).send({ error: 'Invalid or unsupported request field.' });
++        }
++
++        const abortController = new AbortController();
++        let timedOut = false;
++        let clientDisconnected = false;
++        let isTerminated = false;
++        let activeUpstreamResponse = null;
++
++        const disposeUpstreamBody = (res) => {
++            if (!res?.body) return;
++            try {
++                if (typeof res.body.destroy === 'function') {
++                    res.body.destroy();
++                } else if (typeof res.body.cancel === 'function') {
++                    res.body.cancel().catch?.(() => {});
++                }
++            } catch {
++                // Ignore disposal errors
++            }
++        };
++
++        const isOperationActive = () => {
++            if (isTerminated || timedOut || clientDisconnected) {
++                return false;
++            }
++            if (abortController.signal.aborted) {
++                return false;
++            }
++            if (response.headersSent || response.writableEnded || response.writableFinished || response.destroyed || !response.writable) {
++                return false;
++            }
++            return true;
++        };
++
++        const onResponseClose = () => {
++            if (!response.writableFinished) {
++                clientDisconnected = true;
++                isTerminated = true;
++                abortController.abort();
++                disposeUpstreamBody(activeUpstreamResponse);
++            }
++        };
++        response.once('close', onResponseClose);
++
++        let deadlineTimer = null;
++        const deadlinePromise = new Promise((_, reject) => {
++            deadlineTimer = setTimeout(() => {
++                timedOut = true;
++                isTerminated = true;
++                abortController.abort();
++                disposeUpstreamBody(activeUpstreamResponse);
++                const timeoutErr = new Error('Upstream operation timed out.');
++                timeoutErr.code = 'ERR_UPSTREAM_TIMEOUT';
++                reject(timeoutErr);
++            }, nanogptGenerationsTimeoutMs);
++        });
++        deadlinePromise.catch(() => {});
++
++        try {
++            const upstreamTask = (async () => {
++                let upstreamResponse;
++                try {
++                    upstreamResponse = await fetch('https://api.nano-gpt.com/api/v1/images/generations', {
++                        method: 'POST',
++                        body: serializedBody,
++                        headers: {
++                            'x-api-key': key,
++                            'Content-Type': 'application/json',
++                            'Content-Length': String(payloadBytes),
++                        },
++                        redirect: 'error',
++                        signal: abortController.signal,
++                    });
++                } catch (fetchErr) {
++                    if (!isOperationActive()) {
++                        return;
++                    }
++                    throw fetchErr;
++                }
++
++                activeUpstreamResponse = upstreamResponse;
++
++                // Terminal check immediately after awaiting upstream fetch
++                if (!isOperationActive()) {
++                    disposeUpstreamBody(upstreamResponse);
++                    return;
++                }
++
++                // Non-2xx responses sanitized: preserve status, return static message, dispose body
++                const is2xx = upstreamResponse.status >= 200 && upstreamResponse.status < 300;
++                if (!is2xx) {
++                    disposeUpstreamBody(upstreamResponse);
++                    if (!isOperationActive()) {
++                        return;
++                    }
++                    console.error('NanoGPT proxy: upstream transport failure.');
++                    const safeStatus = Number.isInteger(upstreamResponse.status) && upstreamResponse.status >= 400 && upstreamResponse.status <= 599
++                        ? upstreamResponse.status
++                        : 502;
++                    if (!response.headersSent && !response.destroyed && response.writable) {
++                        return response.status(safeStatus).json({ error: 'Upstream image generation failed.' });
++                    }
++                    return;
++                }
++
++                const rawContentLength = typeof upstreamResponse.headers?.get === 'function'
++                    ? upstreamResponse.headers.get('content-length')
++                    : upstreamResponse.headers?.['content-length'];
++                if (typeof rawContentLength === 'string') {
++                    const trimmedCl = rawContentLength.trim();
++                    if (!/^\d+$/.test(trimmedCl)) {
++                        disposeUpstreamBody(upstreamResponse);
++                        if (!isOperationActive()) {
++                            return;
++                        }
++                        console.error('NanoGPT proxy: upstream transport failure.');
++                        if (!response.headersSent && !response.destroyed && response.writable) {
++                            return response.status(502).json({ error: 'Upstream response exceeded size limit.' });
++                        }
++                        return;
++                    }
++                    const declaredBytes = Number(trimmedCl);
++                    if (!Number.isSafeInteger(declaredBytes) || declaredBytes > MAX_NANOGPT_UPSTREAM_RESPONSE_BYTES) {
++                        disposeUpstreamBody(upstreamResponse);
++                        if (!isOperationActive()) {
++                            return;
++                        }
++                        console.error('NanoGPT proxy: response size exceeded.');
++                        if (!response.headersSent && !response.destroyed && response.writable) {
++                            return response.status(502).json({ error: 'Upstream response exceeded size limit.' });
++                        }
++                        return;
++                    }
++                }
++
++                // Terminal check before writing status and headers or beginning downstream streaming
++                if (!isOperationActive()) {
++                    disposeUpstreamBody(upstreamResponse);
++                    return;
++                }
++
++                response.status(upstreamResponse.status);
++                const contentType = typeof upstreamResponse.headers?.get === 'function'
++                    ? upstreamResponse.headers.get('content-type')
++                    : upstreamResponse.headers?.['content-type'];
++                if (contentType) {
++                    response.setHeader('Content-Type', contentType);
++                }
++
++                if (upstreamResponse.body) {
++                    let receivedBytes = 0;
++                    const byteLimitStream = new Transform({
++                        transform(chunk, encoding, callback) {
++                            receivedBytes += chunk.length;
++                            if (receivedBytes > MAX_NANOGPT_UPSTREAM_RESPONSE_BYTES) {
++                                const limitErr = new Error('Upstream response exceeded size limit.');
++                                limitErr.code = 'ERR_RESPONSE_LIMIT_EXCEEDED';
++                                callback(limitErr);
++                                return;
++                            }
++                            callback(null, chunk);
++                        },
++                    });
++
++                    try {
++                        await pipeline(upstreamResponse.body, byteLimitStream, response);
++                    } catch (pipeErr) {
++                        disposeUpstreamBody(upstreamResponse);
++
++                        if (!isOperationActive()) {
++                            if (!response.destroyed) {
++                                response.destroy();
++                            }
++                            return;
++                        }
++
++                        if (pipeErr.code === 'ERR_RESPONSE_LIMIT_EXCEEDED') {
++                            console.error('NanoGPT proxy: response size exceeded.');
++                            if (!response.headersSent && !response.destroyed && response.writable) {
++                                return response.status(502).json({ error: 'Upstream response exceeded size limit.' });
++                            }
++                            if (!response.destroyed) {
++                                response.destroy();
++                            }
++                            return;
++                        }
++
++                        if (timedOut) {
++                            console.error('NanoGPT proxy: upstream timeout.');
++                            if (!response.headersSent && !response.destroyed && response.writable) {
++                                return response.status(504).json({ error: 'Upstream operation timed out.' });
++                            }
++                            if (!response.destroyed) {
++                                response.destroy();
++                            }
++                            return;
++                        }
++
++                        if (clientDisconnected || pipeErr.name === 'AbortError' || pipeErr.code === 'ERR_STREAM_PREMATURE_CLOSE') {
++                            if (!response.destroyed) {
++                                response.destroy();
++                            }
++                            return;
++                        }
++
++                        console.error('NanoGPT proxy: upstream stream failure.');
++                        if (!response.headersSent && !response.destroyed && response.writable) {
++                            return response.status(500).json({ error: 'NanoGPT transport failed.' });
++                        }
++                        if (!response.destroyed) {
++                            response.destroy();
++                        }
++                        return;
++                    }
++                } else {
++                    if (isOperationActive()) {
++                        response.end();
++                    }
++                }
++            })();
++
++            upstreamTask.catch(() => {});
++
++            await Promise.race([upstreamTask, deadlinePromise]);
++        } catch (error) {
++            isTerminated = true;
++            disposeUpstreamBody(activeUpstreamResponse);
++
++            if (timedOut || error.code === 'ERR_UPSTREAM_TIMEOUT') {
++                console.error('NanoGPT proxy: upstream timeout.');
++                if (!response.headersSent && !response.destroyed && response.writable) {
++                    return response.status(504).json({ error: 'Upstream operation timed out.' });
++                }
++                if (!response.destroyed) {
++                    response.destroy();
++                }
++                return;
++            }
++
++            if (clientDisconnected || error.name === 'AbortError' || error.code === 'ERR_STREAM_PREMATURE_CLOSE') {
++                if (!response.destroyed) {
++                    response.destroy();
++                }
++                return;
++            }
++
++            console.error('NanoGPT proxy: upstream transport failure.');
++            if (!response.headersSent && !response.destroyed && response.writable) {
++                return response.status(500).json({ error: 'NanoGPT transport failed.' });
++            }
++            if (!response.destroyed) {
++                response.destroy();
++            }
++        } finally {
++            isTerminated = true;
++            if (deadlineTimer !== null) {
++                clearTimeout(deadlineTimer);
++            }
++            response.removeListener('close', onResponseClose);
++            disposeUpstreamBody(activeUpstreamResponse);
++        }
++    } catch {
++        console.error('NanoGPT proxy: upstream transport failure.');
++        if (!response.headersSent && !response.destroyed && response.writable) {
++            return response.status(500).json({ error: 'NanoGPT transport failed.' });
++        }
++    }
++});
++
+ const bfl = express.Router();
+ 
+ bfl.post('/generate', async (request, response) => {

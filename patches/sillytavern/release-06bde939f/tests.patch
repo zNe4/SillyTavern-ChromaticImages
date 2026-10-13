@@ -1,0 +1,2233 @@
+diff --git a/tests/stable-diffusion.test.js b/tests/stable-diffusion.test.js
+index 6a33571d8..3bd7bab70 100644
+--- a/tests/stable-diffusion.test.js
++++ b/tests/stable-diffusion.test.js
+@@ -1,10 +1,13 @@
+ import { afterAll, beforeAll, beforeEach, describe, expect, jest, test } from '@jest/globals';
+ 
+ const fetchMock = jest.fn();
++const readSecretMock = jest.fn();
+ jest.unstable_mockModule('node-fetch', () => ({ default: fetchMock }));
+ jest.unstable_mockModule('../src/endpoints/secrets.js', () => ({
+-    readSecret: jest.fn(),
+-    SECRET_KEYS: {},
++    readSecret: readSecretMock,
++    SECRET_KEYS: {
++        NANOGPT: 'api_key_nanogpt',
++    },
+ }));
+ 
+ describe('ComfyUI generation', () => {
+@@ -111,3 +114,2212 @@ describe('ComfyUI generation', () => {
+         expect(await response.text()).toContain('did not return any recognizable outputs');
+     });
+ });
++
++describe('NanoGPT generation proxy', () => {
++    /** @type {import('node:http').Server} */
++    let server;
++    let baseUrl;
++    let setNanoGptImagesTimeoutMs;
++    let resetNanoGptImagesTimeoutMs;
++
++    function createDeferred() {
++        let resolve;
++        let reject;
++        const promise = new Promise((res, rej) => {
++            resolve = res;
++            reject = rej;
++        });
++        return { promise, resolve, reject };
++    }
++
++    function createHugeStream(Readable, chunk, count, onDestroy) {
++        let chunkCount = 0;
++        return new Readable({
++            read() {
++                if (chunkCount < count) {
++                    chunkCount++;
++                    this.push(chunk);
++                } else {
++                    this.push(null);
++                }
++            },
++            destroy(err, cb) {
++                if (onDestroy) {
++                    onDestroy();
++                }
++                cb(err);
++            },
++        });
++    }
++
++    function createStalledStream(Readable, initialChunk, onDestroy) {
++        let chunkPushed = false;
++        return new Readable({
++            read() {
++                if (!chunkPushed) {
++                    chunkPushed = true;
++                    this.push(initialChunk);
++                }
++            },
++            destroy(err, cb) {
++                if (onDestroy) {
++                    onDestroy();
++                }
++                cb(err);
++            },
++        });
++    }
++
++    beforeAll(async () => {
++        const { default: express } = await import('express');
++        const {
++            router,
++            setNanoGptImagesTimeoutMs: setMs,
++            resetNanoGptImagesTimeoutMs: resetMs,
++        } = await import('../src/endpoints/stable-diffusion.js');
++        setNanoGptImagesTimeoutMs = setMs;
++        resetNanoGptImagesTimeoutMs = resetMs;
++        const app = express();
++        app.use(express.json({ limit: '100mb' }));
++        app.use((request, response, next) => {
++            request.user = { directories: { root: '/tmp' } };
++            next();
++        });
++        app.use(router);
++        server = app.listen(0, '127.0.0.1');
++        await new Promise(resolve => server.once('listening', resolve));
++        const address = server.address();
++        baseUrl = `http://127.0.0.1:${address.port}`;
++    });
++
++    beforeEach(() => {
++        fetchMock.mockReset();
++        readSecretMock.mockReset();
++        readSecretMock.mockReturnValue('test-nanogpt-key');
++    });
++
++    afterEach(() => {
++        if (resetNanoGptImagesTimeoutMs) {
++            resetNanoGptImagesTimeoutMs();
++        }
++    });
++
++    afterAll(async () => {
++        await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
++    });
++
++    test('GET /nanogpt/images returns 200 with proxy marker and zero provider calls', async () => {
++        const response = await fetch(`${baseUrl}/nanogpt/images`);
++        expect(response.status).toBe(200);
++        expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++        const data = await response.json();
++        expect(data).toEqual({ ok: true, route: 'nanogpt-images' });
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images returns 400 when NanoGPT key is not configured', async () => {
++        readSecretMock.mockReturnValue(null);
++        const response = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', prompt: 'test prompt' }),
++        });
++        expect(response.status).toBe(400);
++        expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++        const data = await response.json();
++        expect(data).toEqual({ error: 'NanoGPT key not configured.' });
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images rejects non-object or array body with 400', async () => {
++        const resArray = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify([1, 2, 3]),
++        });
++        expect(resArray.status).toBe(400);
++        expect(resArray.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++        expect(await resArray.json()).toEqual({ error: 'Request body must be a plain JSON object.' });
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images rejects missing or invalid model with 400', async () => {
++        const resMissing = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ prompt: 'hello' }),
++        });
++        expect(resMissing.status).toBe(400);
++        expect(resMissing.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++        expect(await resMissing.json()).toEqual({ error: 'Invalid or missing model parameter.' });
++
++        const resInvalid = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'bad model name with spaces!' }),
++        });
++        expect(resInvalid.status).toBe(400);
++        expect(await resInvalid.json()).toEqual({ error: 'Invalid or missing model parameter.' });
++
++        const resTooLong = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'a'.repeat(129) }),
++        });
++        expect(resTooLong.status).toBe(400);
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images rejects invalid prompt type or oversized prompt with 400', async () => {
++        const resNotString = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', prompt: 12345 }),
++        });
++        expect(resNotString.status).toBe(400);
++        expect(await resNotString.json()).toEqual({ error: 'Prompt must be a string of at most 10,000 characters.' });
++
++        const resTooLong = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', prompt: 'x'.repeat(10001) }),
++        });
++        expect(resTooLong.status).toBe(400);
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images rejects invalid n parameter with 400', async () => {
++        for (const badN of [0, 11, 1.5, '2']) {
++            const res = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ model: 'qwen-image', n: badN }),
++            });
++            expect(res.status).toBe(400);
++            expect(await res.json()).toEqual({ error: 'n must be an integer between 1 and 10.' });
++        }
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images rejects invalid input_references shapes with 400', async () => {
++        const invalidReferences = [
++            '',
++            '   ',
++            {},
++            { type: 'image_url' },
++            { type: 'wrong', image_url: { url: 'https://example.com/a.png' } },
++            { type: 'image_url', image_url: null },
++            { type: 'image_url', image_url: { url: '' } },
++            { type: 'image_url', image_url: { url: '   ' } },
++            { type: 'image_url', image_url: { url: 123 } },
++            123,
++            null,
++            ['nested-array'],
++        ];
++
++        for (const badRef of invalidReferences) {
++            const res = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ model: 'qwen-image', input_references: [badRef] }),
++            });
++            expect(res.status).toBe(400);
++            expect(res.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++            expect(await res.json()).toEqual({ error: 'input_references items must be non-empty URL strings or valid image_url objects.' });
++        }
++
++        const resNotArray = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', input_references: 'not-an-array' }),
++        });
++        expect(resNotArray.status).toBe(400);
++        expect(await resNotArray.json()).toEqual({ error: 'input_references must be an array of at most 16 items.' });
++
++        const resTooMany = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', input_references: Array(17).fill('http://example.com/1.png') }),
++        });
++        expect(resTooMany.status).toBe(400);
++        expect(await resTooMany.json()).toEqual({ error: 'input_references must be an array of at most 16 items.' });
++
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images accepts valid string and image_url object references', async () => {
++        const { Readable } = await import('node:stream');
++        fetchMock.mockImplementation(async () => ({
++            status: 200,
++            headers: new Map([['content-type', 'application/json']]),
++            body: Readable.from([JSON.stringify({ ok: true })]),
++        }));
++
++        const validReferenceSets = [
++            ['https://example.com/photo.jpg'],
++            ['data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='],
++            [{ type: 'image_url', image_url: { url: 'https://example.com/photo.jpg' } }],
++            [
++                'https://example.com/1.png',
++                'data:image/jpeg;base64,/9j/4AAQSkZJRg==',
++                { type: 'image_url', image_url: { url: 'https://example.com/2.png' } },
++            ],
++        ];
++
++        for (const refs of validReferenceSets) {
++            const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ model: 'qwen-image', input_references: refs }),
++            });
++            expect(response.status).toBe(200);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++            expect(await response.json()).toEqual({ ok: true });
++        }
++        expect(fetchMock).toHaveBeenCalledTimes(validReferenceSets.length);
++    });
++
++    test('POST /nanogpt/images rejects unsupported stream and provider options with 400', async () => {
++        const resStream = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', stream: true }),
++        });
++        expect(resStream.status).toBe(400);
++        expect(await resStream.json()).toEqual({ error: 'stream and provider options are not supported.' });
++
++        const resProvider = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', provider: { order: ['foo'] } }),
++        });
++        expect(resProvider.status).toBe(400);
++        expect(await resProvider.json()).toEqual({ error: 'stream and provider options are not supported.' });
++
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images rejects payload exceeding 50 MB with 413', async () => {
++        const largeRef = 'data:image/png;base64,' + 'A'.repeat(50 * 1024 * 1024 + 10);
++        const response = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', input_references: [largeRef] }),
++        });
++        expect(response.status).toBe(413);
++        expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++        expect(await response.json()).toEqual({ error: 'Payload exceeds 50 MB application limit.' });
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images dispatches to upstream with auth and preserves 200 response stream', async () => {
++        const { Readable } = await import('node:stream');
++        const upstreamData = { id: 'img-123', images: [{ url: 'https://example.com/out.png' }] };
++        fetchMock.mockImplementationOnce(async (url, init) => {
++            expect(url).toBe('https://api.nano-gpt.com/api/v1/images');
++            expect(init.method).toBe('POST');
++            expect(init.headers['x-api-key']).toBe('test-nanogpt-key');
++            expect(init.headers['Content-Type']).toBe('application/json');
++            expect(Number(init.headers['Content-Length'])).toBeGreaterThan(0);
++            const parsed = JSON.parse(init.body);
++            expect(parsed.model).toBe('qwen-image');
++            expect(parsed.prompt).toBe('a painting of mountains');
++            expect(parsed.resolution).toBe('1024x1024');
++
++            return {
++                status: 200,
++                headers: new Map([['content-type', 'application/json; charset=utf-8']]),
++                body: Readable.from([JSON.stringify(upstreamData)]),
++            };
++        });
++
++        const response = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({
++                model: 'qwen-image',
++                prompt: 'a painting of mountains',
++                resolution: '1024x1024',
++            }),
++        });
++
++        expect(response.status).toBe(200);
++        expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++        expect(response.headers.get('content-type')).toContain('application/json');
++        const data = await response.json();
++        expect(data).toEqual(upstreamData);
++        expect(fetchMock).toHaveBeenCalledTimes(1);
++    });
++
++    for (const status of [400, 401, 403, 404, 429]) {
++        test(`POST /nanogpt/images preserves upstream status ${status} with proxy marker`, async () => {
++            const { Readable } = await import('node:stream');
++            let bodyDestroyed = false;
++            const errorBody = { error: { message: `Simulated upstream failure ${status}`, code: `error_${status}` } };
++            const errorStream = new Readable({
++                read() {
++                    this.push(JSON.stringify(errorBody));
++                    this.push(null);
++                },
++                destroy(err, cb) {
++                    bodyDestroyed = true;
++                    cb(err);
++                },
++            });
++            const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++            try {
++                fetchMock.mockImplementationOnce(async () => ({
++                    status,
++                    headers: new Map([['content-type', 'application/json']]),
++                    body: errorStream,
++                }));
++
++                const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({ model: 'qwen-image', prompt: 'test' }),
++                });
++
++                expect(response.status).toBe(status);
++                expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++                const data = await response.json();
++                expect(data).toEqual({ error: 'Upstream image generation failed.' });
++                expect(bodyDestroyed).toBe(true);
++            } finally {
++                consoleErrorSpy.mockRestore();
++            }
++        });
++    }
++
++    test('does not abort upstream fetch when response completes normally', async () => {
++        const { Readable } = await import('node:stream');
++        let upstreamSignal;
++        fetchMock.mockImplementationOnce(async (url, init) => {
++            upstreamSignal = init.signal;
++            return {
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: Readable.from([JSON.stringify({ ok: true })]),
++            };
++        });
++
++        const response = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', prompt: 'test' }),
++        });
++
++        expect(response.status).toBe(200);
++        expect(await response.json()).toEqual({ ok: true });
++        expect(upstreamSignal).toBeDefined();
++        expect(upstreamSignal.aborted).toBe(false);
++    });
++
++    test('aborts upstream fetch when client disconnects prematurely, triggering abort at most once', async () => {
++        const { Readable } = await import('node:stream');
++        let upstreamSignal;
++        let abortEventCount = 0;
++        const fetchDispatched = createDeferred();
++        const abortedDeferred = createDeferred();
++        const hangingStream = new Readable({
++            read() {},
++        });
++
++        fetchMock.mockImplementationOnce(async (url, init) => {
++            upstreamSignal = init.signal;
++            if (upstreamSignal) {
++                upstreamSignal.addEventListener('abort', () => {
++                    abortEventCount++;
++                    abortedDeferred.resolve();
++                });
++            }
++            fetchDispatched.resolve();
++            return {
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: hangingStream,
++            };
++        });
++
++        const clientController = new AbortController();
++        const clientPromise = fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', prompt: 'test' }),
++            signal: clientController.signal,
++        });
++
++        // Ensure upstream request has actually started before simulating client disconnection
++        await fetchDispatched.promise;
++        expect(upstreamSignal).toBeDefined();
++        expect(upstreamSignal.aborted).toBe(false);
++        expect(abortEventCount).toBe(0);
++
++        // Client abandons request prematurely
++        clientController.abort();
++        await expect(clientPromise).rejects.toThrow();
++
++        // Await server-side abort propagation deterministically
++        await abortedDeferred.promise;
++        expect(upstreamSignal.aborted).toBe(true);
++        expect(abortEventCount).toBe(1);
++    });
++
++    test('POST /nanogpt/images handles upstream fetch rejection safely without retry or payload leak', async () => {
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        try {
++            fetchMock.mockRejectedValueOnce(new Error('Network connection refused'));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    input_references: ['https://example.com/ref.png'],
++                }),
++            });
++
++            expect(response.status).toBe(500);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'NanoGPT transport failed.' });
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images handles upstream stream error during forwarding safely without retry', async () => {
++        const { Readable } = await import('node:stream');
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        try {
++            const erroringStream = new Readable({
++                read() {
++                    this.destroy(new Error('Upstream stream corrupted'));
++                },
++            });
++
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: erroringStream,
++            }));
++
++            let clientError = null;
++            try {
++                const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({ model: 'qwen-image', prompt: 'test prompt' }),
++                });
++                await response.text();
++            } catch (error) {
++                clientError = error;
++            }
++
++            expect(clientError).not.toBeNull();
++            expect(clientError).toHaveProperty('message');
++            expect(clientError.name).toMatch(/Error$/);
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('privacy regression: sentinel values for prompt, references, and key never appear in logs or errors', async () => {
++        const SENTINEL_KEY = 'SENTINEL_SECRET_NANOGPT_API_KEY_xyz987654321';
++        const SENTINEL_PROMPT = 'SENTINEL_PROMPT_DO_NOT_EXPOSE_PROSE_abc123';
++        const SENTINEL_REFERENCE = 'data:image/png;base64,SENTINEL_BASE64_IMAGE_DATA_SECRET_fooBarBaz';
++
++        readSecretMock.mockReturnValue(SENTINEL_KEY);
++
++        const logSpies = [
++            jest.spyOn(console, 'log').mockImplementation(() => {}),
++            jest.spyOn(console, 'debug').mockImplementation(() => {}),
++            jest.spyOn(console, 'info').mockImplementation(() => {}),
++            jest.spyOn(console, 'warn').mockImplementation(() => {}),
++            jest.spyOn(console, 'error').mockImplementation(() => {}),
++        ];
++
++        try {
++            fetchMock.mockRejectedValueOnce(new Error('Simulated upstream failure'));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: SENTINEL_PROMPT,
++                    input_references: [SENTINEL_REFERENCE],
++                }),
++            });
++
++            expect(response.status).toBe(500);
++            const responseText = await response.text();
++
++            expect(responseText).not.toContain(SENTINEL_KEY);
++            expect(responseText).not.toContain(SENTINEL_PROMPT);
++            expect(responseText).not.toContain(SENTINEL_REFERENCE);
++
++            for (const spy of logSpies) {
++                for (const call of spy.mock.calls) {
++                    const serializedCall = JSON.stringify(call);
++                    expect(serializedCall).not.toContain(SENTINEL_KEY);
++                    expect(serializedCall).not.toContain(SENTINEL_PROMPT);
++                    expect(serializedCall).not.toContain(SENTINEL_REFERENCE);
++                }
++            }
++        } finally {
++            for (const spy of logSpies) {
++                spy.mockRestore();
++            }
++        }
++    });
++
++    test('legacy /nanogpt/generate still works and does not log request body', async () => {
++        const debugSpy = jest.spyOn(console, 'debug').mockImplementation(() => {});
++        try {
++            fetchMock.mockResolvedValueOnce({
++                ok: true,
++                json: async () => ({ data: [{ b64_json: 'legacy-data' }] }),
++            });
++
++            const response = await fetch(`${baseUrl}/nanogpt/generate`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ model: 'some-model', prompt: 'confidential prompt' }),
++            });
++
++            expect(response.status).toBe(200);
++            const data = await response.json();
++            expect(data).toEqual({ image: 'legacy-data' });
++
++            for (const call of debugSpy.mock.calls) {
++                expect(call[0]).not.toBe('NanoGPT request:');
++                expect(JSON.stringify(call)).not.toContain('confidential prompt');
++            }
++        } finally {
++            debugSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images rejects declared upstream Content-Length > 50 MB with 502', async () => {
++        const { Readable } = await import('node:stream');
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        try {
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 200,
++                headers: new Map([
++                    ['content-type', 'application/json'],
++                    ['content-length', String(52428800 + 1)],
++                ]),
++                body: Readable.from(['{"ok":true}']),
++            }));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                }),
++            });
++
++            expect(response.status).toBe(502);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'Upstream response exceeded size limit.' });
++        } finally {
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    for (const badContentLength of ['100invalid', '-5', 'abc', '1e6', '99999999999999999999999999999999999999']) {
++        test(`POST /nanogpt/images rejects malformed upstream Content-Length ${JSON.stringify(badContentLength)} with 502`, async () => {
++            const { Readable } = await import('node:stream');
++            const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++            try {
++                fetchMock.mockImplementationOnce(async () => ({
++                    status: 200,
++                    headers: new Map([
++                        ['content-type', 'application/json'],
++                        ['content-length', badContentLength],
++                    ]),
++                    body: Readable.from(['{"ok":true}']),
++                }));
++
++                const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({
++                        model: 'qwen-image',
++                        prompt: 'test prompt',
++                    }),
++                });
++
++                expect(response.status).toBe(502);
++                expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++                const data = await response.json();
++                expect(data).toEqual({ error: 'Upstream response exceeded size limit.' });
++            } finally {
++                consoleErrorSpy.mockRestore();
++            }
++        });
++    }
++
++    test('POST /nanogpt/images terminates connection immediately when streamed bytes exceed 50 MB', async () => {
++        const { Readable } = await import('node:stream');
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        try {
++            const chunk = Buffer.alloc(10 * 1024 * 1024, 'a');
++            const streamDestroyedDeferred = createDeferred();
++            const hugeStream = createHugeStream(Readable, chunk, 6, () => {
++                streamDestroyedDeferred.resolve();
++            });
++
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: hugeStream,
++            }));
++
++            let clientError = null;
++            try {
++                const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({
++                        model: 'qwen-image',
++                        prompt: 'test prompt',
++                    }),
++                });
++                await response.text();
++            } catch (err) {
++                clientError = err;
++            }
++
++            expect(clientError).not.toBeNull();
++            expect(clientError).toHaveProperty('message');
++            expect(clientError.name).toMatch(/Error$/);
++            await streamDestroyedDeferred.promise;
++            expect(consoleErrorSpy).toHaveBeenCalledWith('NanoGPT proxy: response size exceeded.');
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images returns 504 and aborts upstream fetch when deadline expires', async () => {
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        try {
++            setNanoGptImagesTimeoutMs(50);
++            let upstreamSignal;
++            fetchMock.mockImplementationOnce(async (url, init) => {
++                upstreamSignal = init.signal;
++                return new Promise((resolve, reject) => {
++                    init.signal?.addEventListener('abort', () => {
++                        const err = new Error('The operation was aborted');
++                        err.name = 'AbortError';
++                        reject(err);
++                    });
++                });
++            });
++
++            const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ model: 'qwen-image', prompt: 'test prompt' }),
++            });
++
++            expect(response.status).toBe(504);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'Upstream operation timed out.' });
++            expect(upstreamSignal).toBeDefined();
++            expect(upstreamSignal.aborted).toBe(true);
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            resetNanoGptImagesTimeoutMs();
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images dispatches to upstream direct host with auth and redirect: error', async () => {
++        const { Readable } = await import('node:stream');
++        let capturedUrl;
++        let capturedInit;
++        fetchMock.mockImplementationOnce(async (url, init) => {
++            capturedUrl = url;
++            capturedInit = init;
++            return {
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: Readable.from([JSON.stringify({ ok: true })]),
++            };
++        });
++
++        const response = await fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ model: 'qwen-image', prompt: 'test prompt' }),
++        });
++
++        expect(response.status).toBe(200);
++        expect(capturedUrl).toBe('https://api.nano-gpt.com/api/v1/images');
++        expect(capturedInit.redirect).toBe('error');
++        expect(capturedInit.headers['x-api-key']).toBe('test-nanogpt-key');
++    });
++
++    test('POST /nanogpt/images: fetch resolving after deadline is safely discarded, body is destroyed, and no downstream streaming occurs', async () => {
++        const { Readable } = await import('node:stream');
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        try {
++            setNanoGptImagesTimeoutMs(40);
++            const deferred = createDeferred();
++            const fetchDispatched = createDeferred();
++            const streamDestroyedDeferred = createDeferred();
++            let bodyDestroyed = false;
++            let streamReadCalled = false;
++
++            const lateStream = new Readable({
++                read() {
++                    streamReadCalled = true;
++                    this.push(JSON.stringify({ ok: true }));
++                    this.push(null);
++                },
++                destroy(err, cb) {
++                    bodyDestroyed = true;
++                    streamDestroyedDeferred.resolve();
++                    cb(err);
++                },
++            });
++
++            fetchMock.mockImplementationOnce(() => {
++                fetchDispatched.resolve();
++                return deferred.promise;
++            });
++
++            const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                }),
++            });
++
++            await fetchDispatched.promise;
++            expect(response.status).toBe(504);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'Upstream operation timed out.' });
++
++            deferred.resolve({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: lateStream,
++            });
++
++            await streamDestroyedDeferred.promise;
++            expect(bodyDestroyed).toBe(true);
++            expect(streamReadCalled).toBe(false);
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            resetNanoGptImagesTimeoutMs();
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images: fetch resolving after client disconnection is safely discarded and body is destroyed', async () => {
++        const { Readable } = await import('node:stream');
++        const deferred = createDeferred();
++        const fetchDispatched = createDeferred();
++        const abortedDeferred = createDeferred();
++        const streamDestroyedDeferred = createDeferred();
++        let bodyDestroyed = false;
++        let streamReadCalled = false;
++
++        const lateStream = new Readable({
++            read() {
++                streamReadCalled = true;
++                this.push(JSON.stringify({ ok: true }));
++                this.push(null);
++            },
++            destroy(err, cb) {
++                bodyDestroyed = true;
++                streamDestroyedDeferred.resolve();
++                cb(err);
++            },
++        });
++
++        fetchMock.mockImplementationOnce((url, init) => {
++            if (init?.signal) {
++                init.signal.addEventListener('abort', () => {
++                    abortedDeferred.resolve();
++                });
++            }
++            fetchDispatched.resolve();
++            return deferred.promise;
++        });
++
++        const clientController = new AbortController();
++        const clientPromise = fetch(`${baseUrl}/nanogpt/images`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({
++                model: 'qwen-image',
++                prompt: 'test prompt',
++            }),
++            signal: clientController.signal,
++        });
++
++        // Ensure upstream request has actually started before simulating client disconnection
++        await fetchDispatched.promise;
++
++        // Client aborts and server handles disconnect, propagating abort to upstream signal
++        clientController.abort();
++        await expect(clientPromise).rejects.toThrow();
++        await abortedDeferred.promise;
++
++        // Upstream fetch resolves late after disconnection
++        deferred.resolve({
++            status: 200,
++            headers: new Map([['content-type', 'application/json']]),
++            body: lateStream,
++        });
++
++        // Upstream stream is safely destroyed upon delivery
++        await streamDestroyedDeferred.promise;
++        expect(bodyDestroyed).toBe(true);
++        expect(streamReadCalled).toBe(false);
++        expect(fetchMock).toHaveBeenCalledTimes(1);
++    });
++
++    test('POST /nanogpt/images: upstream stream failing after headers are committed terminates connection without second response write', async () => {
++        const { Readable } = await import('node:stream');
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        const streamDestroyedDeferred = createDeferred();
++        try {
++            const errorStream = createStalledStream(Readable, '{"start":true', () => {
++                streamDestroyedDeferred.resolve();
++            });
++
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: errorStream,
++            }));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ model: 'qwen-image', prompt: 'test prompt' }),
++            });
++            expect(response.status).toBe(200);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++
++            const reader = response.body.getReader();
++            const initialChunk = await reader.read();
++            expect(initialChunk.done).toBe(false);
++            expect(Buffer.from(initialChunk.value).toString()).toContain('{"start":true');
++
++            // Trigger upstream stream error only after confirming headers and initial chunk are received
++            errorStream.destroy(new Error('Simulated upstream network drop mid-transmission'));
++
++            await expect(reader.read()).rejects.toThrow();
++
++            await streamDestroyedDeferred.promise;
++            expect(consoleErrorSpy).toHaveBeenCalledWith('NanoGPT proxy: upstream stream failure.');
++            for (const call of consoleErrorSpy.mock.calls) {
++                expect(JSON.stringify(call)).not.toContain('Simulated upstream network drop mid-transmission');
++            }
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images: stalled upstream stream exceeding operation deadline terminates connection without second response write', async () => {
++        const { Readable } = await import('node:stream');
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        setNanoGptImagesTimeoutMs(60);
++        const streamDestroyedDeferred = createDeferred();
++
++        try {
++            const stalledStream = createStalledStream(Readable, '{"start":true', () => {
++                streamDestroyedDeferred.resolve();
++            });
++
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: stalledStream,
++            }));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ model: 'qwen-image', prompt: 'test prompt' }),
++            });
++            expect(response.status).toBe(200);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++
++            const reader = response.body.getReader();
++            const initialChunk = await reader.read();
++            expect(initialChunk.done).toBe(false);
++            expect(Buffer.from(initialChunk.value).toString()).toContain('{"start":true');
++
++            // Stalled stream emits no further data; reader read rejects when deadline expires and connection terminates
++            await expect(reader.read()).rejects.toThrow();
++
++            await streamDestroyedDeferred.promise;
++            expect(consoleErrorSpy).toHaveBeenCalledWith('NanoGPT proxy: upstream timeout.');
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            resetNanoGptImagesTimeoutMs();
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images thrown exceptions with secret sentinels in message or cause are never logged', async () => {
++        const SENTINEL_IN_MESSAGE = 'SENTINEL_EXCEPTION_MSG_SECRET_ABC_123';
++        const SENTINEL_IN_CAUSE = 'SENTINEL_EXCEPTION_CAUSE_SECRET_XYZ_456';
++
++        const customError = new Error(`Connection error with ${SENTINEL_IN_MESSAGE}`);
++        customError.cause = new Error(`Root cause leaked ${SENTINEL_IN_CAUSE}`);
++
++        fetchMock.mockRejectedValueOnce(customError);
++
++        const logSpies = [
++            jest.spyOn(console, 'error').mockImplementation(() => {}),
++            jest.spyOn(console, 'warn').mockImplementation(() => {}),
++            jest.spyOn(console, 'log').mockImplementation(() => {}),
++            jest.spyOn(console, 'info').mockImplementation(() => {}),
++            jest.spyOn(console, 'debug').mockImplementation(() => {}),
++        ];
++
++        try {
++            const response = await fetch(`${baseUrl}/nanogpt/images`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                }),
++            });
++
++            expect(response.status).toBe(500);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'NanoGPT transport failed.' });
++
++            for (const spy of logSpies) {
++                for (const call of spy.mock.calls) {
++                    const serialized = JSON.stringify(call);
++                    expect(serialized).not.toContain(SENTINEL_IN_MESSAGE);
++                    expect(serialized).not.toContain(SENTINEL_IN_CAUSE);
++                }
++            }
++        } finally {
++            for (const spy of logSpies) {
++                spy.mockRestore();
++            }
++        }
++    });
++});
++
++describe('NanoGPT compatibility generations proxy', () => {
++    /** @type {import('node:http').Server} */
++    let server;
++    let baseUrl;
++    let setNanoGptGenerationsTimeoutMs;
++    let resetNanoGptGenerationsTimeoutMs;
++
++    function createDeferred() {
++        let resolve;
++        let reject;
++        const promise = new Promise((res, rej) => {
++            resolve = res;
++            reject = rej;
++        });
++        return { promise, resolve, reject };
++    }
++
++    function createHugeStream(Readable, chunk, count) {
++        let chunkCount = 0;
++        return new Readable({
++            read() {
++                if (chunkCount < count) {
++                    chunkCount++;
++                    this.push(chunk);
++                } else {
++                    this.push(null);
++                }
++            },
++        });
++    }
++
++    const VALID_PNG_DATA_URL = 'data:image/png;base64,' + Buffer.concat([
++        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
++        Buffer.alloc(16, 0),
++    ]).toString('base64');
++
++    const VALID_JPEG_DATA_URL = 'data:image/jpeg;base64,' + Buffer.concat([
++        Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
++        Buffer.alloc(16, 0),
++    ]).toString('base64');
++
++    const VALID_WEBP_DATA_URL = 'data:image/webp;base64,' + Buffer.concat([
++        Buffer.from([0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]),
++        Buffer.alloc(16, 0),
++    ]).toString('base64');
++
++    beforeAll(async () => {
++        const { default: express } = await import('express');
++        const { router, setNanoGptGenerationsTimeoutMs: setMs, resetNanoGptGenerationsTimeoutMs: resetMs } = await import('../src/endpoints/stable-diffusion.js');
++        setNanoGptGenerationsTimeoutMs = setMs;
++        resetNanoGptGenerationsTimeoutMs = resetMs;
++        const app = express();
++        app.use(express.json({ limit: '100mb' }));
++        app.use((request, response, next) => {
++            request.user = { directories: { root: '/tmp' } };
++            next();
++        });
++        app.use(router);
++        server = app.listen(0, '127.0.0.1');
++        await new Promise(resolve => server.once('listening', resolve));
++        const address = server.address();
++        baseUrl = `http://127.0.0.1:${address.port}`;
++    });
++
++    afterAll(async () => {
++        await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
++    });
++
++    beforeEach(() => {
++        fetchMock.mockReset();
++        readSecretMock.mockReset();
++        readSecretMock.mockReturnValue('test-nanogpt-key');
++    });
++
++    afterEach(() => {
++        if (resetNanoGptGenerationsTimeoutMs) {
++            resetNanoGptGenerationsTimeoutMs();
++        }
++    });
++
++    test('GET /nanogpt/images/generations returns 200 with v1-compat marker and zero provider calls', async () => {
++        const response = await fetch(`${baseUrl}/nanogpt/images/generations`);
++        expect(response.status).toBe(200);
++        expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++        const data = await response.json();
++        expect(data).toEqual({ ok: true, route: 'nanogpt-images-generations' });
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations returns 400 when NanoGPT key is not configured', async () => {
++        readSecretMock.mockReturnValue(null);
++        const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({
++                model: 'qwen-image',
++                prompt: 'test prompt',
++                nImages: 1,
++                resolution: '1024x1024',
++            }),
++        });
++        expect(response.status).toBe(400);
++        expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++        const data = await response.json();
++        expect(data).toEqual({ error: 'NanoGPT key not configured.' });
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations rejects non-object or array body with 400', async () => {
++        const resArray = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify([1, 2, 3]),
++        });
++        expect(resArray.status).toBe(400);
++        expect(resArray.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++        expect(await resArray.json()).toEqual({ error: 'Request body must be a plain JSON object.' });
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations rejects unknown top-level keys or aliases with 400', async () => {
++        const invalidBodies = [
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024', n: 1 },
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024', seed: 42 },
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024', num_inference_steps: 30 },
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024', guidance_scale: 2.5 },
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024', showExplicitContent: true },
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024', extraUnknown: 'foo' },
++        ];
++
++        for (const badBody of invalidBodies) {
++            const res = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify(badBody),
++            });
++            expect(res.status).toBe(400);
++            expect(res.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            expect(await res.json()).toEqual({ error: 'Invalid or unsupported request field.' });
++        }
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations rejects invalid or missing model with 400', async () => {
++        const testCases = [
++            { prompt: 'test', nImages: 1, resolution: '1024x1024' },
++            { model: 'flux-schnell', prompt: 'test', nImages: 1, resolution: '1024x1024' },
++            { model: 'qwen-image-edit', prompt: 'test', nImages: 1, resolution: '1024x1024' },
++            { model: 'dall-e-3', prompt: 'test', nImages: 1, resolution: '1024x1024' },
++            { model: 123, prompt: 'test', nImages: 1, resolution: '1024x1024' },
++        ];
++        for (const body of testCases) {
++            const res = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify(body),
++            });
++            expect(res.status).toBe(400);
++            expect(res.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            expect(await res.json()).toEqual({ error: 'Invalid or unsupported request field.' });
++        }
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations rejects invalid prompt with 400', async () => {
++        const testCases = [
++            { model: 'qwen-image', nImages: 1, resolution: '1024x1024' },
++            { model: 'qwen-image', prompt: 123, nImages: 1, resolution: '1024x1024' },
++            { model: 'qwen-image', prompt: '', nImages: 1, resolution: '1024x1024' },
++            { model: 'qwen-image', prompt: '   \n  \t  ', nImages: 1, resolution: '1024x1024' },
++            { model: 'qwen-image', prompt: 'a'.repeat(3001), nImages: 1, resolution: '1024x1024' },
++        ];
++        for (const body of testCases) {
++            const res = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify(body),
++            });
++            expect(res.status).toBe(400);
++            expect(res.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            expect(await res.json()).toEqual({ error: 'Invalid or unsupported request field.' });
++        }
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations rejects nImages !== 1 with 400', async () => {
++        const testCases = [
++            { model: 'qwen-image', prompt: 'test', resolution: '1024x1024' },
++            { model: 'qwen-image', prompt: 'test', nImages: 0, resolution: '1024x1024' },
++            { model: 'qwen-image', prompt: 'test', nImages: 2, resolution: '1024x1024' },
++            { model: 'qwen-image', prompt: 'test', nImages: 4, resolution: '1024x1024' },
++            { model: 'qwen-image', prompt: 'test', nImages: 1.5, resolution: '1024x1024' },
++            { model: 'qwen-image', prompt: 'test', nImages: '1', resolution: '1024x1024' },
++            { model: 'qwen-image', prompt: 'test', nImages: null, resolution: '1024x1024' },
++        ];
++        for (const body of testCases) {
++            const res = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify(body),
++            });
++            expect(res.status).toBe(400);
++            expect(res.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            expect(await res.json()).toEqual({ error: 'Invalid or unsupported request field.' });
++        }
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations rejects unsupported resolution values with 400', async () => {
++        const testCases = [
++            { model: 'qwen-image', prompt: 'test', nImages: 1 },
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '2048x2048' },
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: 'square' },
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: 1024 },
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '' },
++            { model: 'qwen-image', prompt: 'test', nImages: 1, resolution: null },
++        ];
++        for (const body of testCases) {
++            const res = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify(body),
++            });
++            expect(res.status).toBe(400);
++            expect(res.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            expect(await res.json()).toEqual({ error: 'Invalid or unsupported request field.' });
++        }
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations rejects invalid response_format with 400', async () => {
++        for (const badFmt of ['url', 'json', 123]) {
++            const res = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                    response_format: badFmt,
++                }),
++            });
++            expect(res.status).toBe(400);
++            expect(res.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            expect(await res.json()).toEqual({ error: 'Invalid or unsupported request field.' });
++        }
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations rejects conflicting or invalid image reference fields with 400', async () => {
++        const invalidReferenceBodies = [
++            // Both fields present
++            {
++                model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024',
++                imageDataUrl: VALID_PNG_DATA_URL,
++                imageDataUrls: [VALID_PNG_DATA_URL, VALID_PNG_DATA_URL],
++            },
++            // imageDataUrls with invalid item counts
++            {
++                model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024',
++                imageDataUrls: [],
++            },
++            {
++                model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024',
++                imageDataUrls: [VALID_PNG_DATA_URL],
++            },
++            {
++                model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024',
++                imageDataUrls: [VALID_PNG_DATA_URL, VALID_PNG_DATA_URL, VALID_PNG_DATA_URL, VALID_PNG_DATA_URL],
++            },
++            {
++                model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024',
++                imageDataUrls: 'not-an-array',
++            },
++            // imageDataUrl not a data URL (remote URL prohibited)
++            {
++                model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024',
++                imageDataUrl: 'https://example.com/photo.png',
++            },
++            // Unsupported image format (e.g. GIF)
++            {
++                model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024',
++                imageDataUrl: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
++            },
++            // Malformed base64
++            {
++                model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024',
++                imageDataUrl: 'data:image/png;base64,not@base64!',
++            },
++            // Magic bytes mismatch (plain text disguised as png)
++            {
++                model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024',
++                imageDataUrl: 'data:image/png;base64,' + Buffer.from('hello plain text image').toString('base64'),
++            },
++            // Magic bytes mismatch in imageDataUrls item
++            {
++                model: 'qwen-image', prompt: 'test', nImages: 1, resolution: '1024x1024',
++                imageDataUrls: [VALID_PNG_DATA_URL, 'data:image/png;base64,' + Buffer.from('hello plain text image').toString('base64')],
++            },
++        ];
++
++        for (const badBody of invalidReferenceBodies) {
++            const res = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify(badBody),
++            });
++            expect(res.status).toBe(400);
++            expect(res.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            expect(await res.json()).toEqual({ error: 'Invalid or unsupported request field.' });
++        }
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations rejects references exceeding 30 MiB aggregate decoded bytes with 400', async () => {
++        // Individual reference exceeding 30 MiB decoded bytes (30 * 1024 * 1024 = 31457280 bytes)
++        const oversizedBuf = Buffer.concat([
++            Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
++            Buffer.alloc(31457280 + 10, 0),
++        ]);
++        const oversizedRef = 'data:image/png;base64,' + oversizedBuf.toString('base64');
++
++        const resSingle = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({
++                model: 'qwen-image',
++                prompt: 'test',
++                nImages: 1,
++                resolution: '1024x1024',
++                imageDataUrl: oversizedRef,
++            }),
++        });
++        expect(resSingle.status).toBe(400);
++        expect(resSingle.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++        expect(await resSingle.json()).toEqual({ error: 'Invalid or unsupported request field.' });
++
++        // Aggregate references exceeding 30 MiB (16 MiB + 16 MiB = 32 MiB)
++        const mediumBuf = Buffer.concat([
++            Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
++            Buffer.alloc(16 * 1024 * 1024, 0),
++        ]);
++        const mediumRef = 'data:image/png;base64,' + mediumBuf.toString('base64');
++
++        const resMulti = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({
++                model: 'qwen-image',
++                prompt: 'test',
++                nImages: 1,
++                resolution: '1024x1024',
++                imageDataUrls: [mediumRef, mediumRef],
++            }),
++        });
++        expect(resMulti.status).toBe(400);
++        expect(resMulti.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++        expect(await resMulti.json()).toEqual({ error: 'Invalid or unsupported request field.' });
++
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations rejects payload exceeding 50 MB with 413', async () => {
++        // Base64 padding string exceeding 50 MB
++        const largeRef = 'data:image/png;base64,' + 'A'.repeat(50 * 1024 * 1024 + 10);
++        const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({
++                model: 'qwen-image',
++                prompt: 'test',
++                nImages: 1,
++                resolution: '1024x1024',
++                imageDataUrl: largeRef,
++            }),
++        });
++        expect(response.status).toBe(413);
++        expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++        expect(await response.json()).toEqual({ error: 'Payload exceeds 50 MB application limit.' });
++        expect(fetchMock).not.toHaveBeenCalled();
++    });
++
++    test('POST /nanogpt/images/generations dispatches to upstream direct host with auth and redirect: error', async () => {
++        const { Readable } = await import('node:stream');
++        const upstreamResult = {
++            created: 1234567890,
++            data: [{ b64_json: 'simulated-base64-image-output' }],
++        };
++
++        fetchMock.mockImplementationOnce(async (url, init) => {
++            expect(url).toBe('https://api.nano-gpt.com/api/v1/images/generations');
++            expect(init.method).toBe('POST');
++            expect(init.headers['x-api-key']).toBe('test-nanogpt-key');
++            expect(init.headers['Content-Type']).toBe('application/json');
++            expect(Number(init.headers['Content-Length'])).toBeGreaterThan(0);
++            expect(init.redirect).toBe('error');
++            expect(init.signal).toBeDefined();
++
++            const parsed = JSON.parse(init.body);
++            expect(parsed).toEqual({
++                model: 'qwen-image',
++                prompt: 'a tranquil lake at dawn',
++                nImages: 1,
++                resolution: '1024x1024',
++                response_format: 'b64_json',
++            });
++
++            return {
++                status: 200,
++                headers: new Map([['content-type', 'application/json; charset=utf-8']]),
++                body: Readable.from([JSON.stringify(upstreamResult)]),
++            };
++        });
++
++        const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({
++                model: 'qwen-image',
++                prompt: 'a tranquil lake at dawn',
++                nImages: 1,
++                resolution: '1024x1024',
++                response_format: 'b64_json',
++            }),
++        });
++
++        expect(response.status).toBe(200);
++        expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++        expect(response.headers.get('content-type')).toContain('application/json');
++        const data = await response.json();
++        expect(data).toEqual(upstreamResult);
++        expect(fetchMock).toHaveBeenCalledTimes(1);
++    });
++
++    test('POST /nanogpt/images/generations supports 0, 1, 2, and 3 valid references and all allowed resolutions', async () => {
++        const { Readable } = await import('node:stream');
++        fetchMock.mockImplementation(async () => ({
++            status: 200,
++            headers: new Map([['content-type', 'application/json']]),
++            body: Readable.from([JSON.stringify({ ok: true })]),
++        }));
++
++        const testCases = [
++            // 0 references, auto resolution
++            {
++                model: 'qwen-image',
++                prompt: 'zero references',
++                nImages: 1,
++                resolution: 'auto',
++            },
++            // 1 reference (PNG), 1024x1024
++            {
++                model: 'qwen-image',
++                prompt: 'one reference PNG',
++                nImages: 1,
++                resolution: '1024x1024',
++                imageDataUrl: VALID_PNG_DATA_URL,
++            },
++            // 1 reference (JPEG), 512x512
++            {
++                model: 'qwen-image',
++                prompt: 'one reference JPEG',
++                nImages: 1,
++                resolution: '512x512',
++                imageDataUrl: VALID_JPEG_DATA_URL,
++            },
++            // 1 reference (WebP), 768x1024
++            {
++                model: 'qwen-image',
++                prompt: 'one reference WebP',
++                nImages: 1,
++                resolution: '768x1024',
++                imageDataUrl: VALID_WEBP_DATA_URL,
++            },
++            // 2 references, 576x1024
++            {
++                model: 'qwen-image',
++                prompt: 'two references',
++                nImages: 1,
++                resolution: '576x1024',
++                imageDataUrls: [VALID_PNG_DATA_URL, VALID_JPEG_DATA_URL],
++            },
++            // 3 references, 1024x768
++            {
++                model: 'qwen-image',
++                prompt: 'three references',
++                nImages: 1,
++                resolution: '1024x768',
++                imageDataUrls: [VALID_PNG_DATA_URL, VALID_JPEG_DATA_URL, VALID_WEBP_DATA_URL],
++            },
++            // 1024x576 resolution check
++            {
++                model: 'qwen-image',
++                prompt: 'wide resolution',
++                nImages: 1,
++                resolution: '1024x576',
++            },
++        ];
++
++        for (const tc of testCases) {
++            const res = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify(tc),
++            });
++            expect(res.status).toBe(200);
++            expect(res.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            expect(await res.json()).toEqual({ ok: true });
++        }
++
++        expect(fetchMock).toHaveBeenCalledTimes(testCases.length);
++    });
++
++    for (const status of [400, 401, 403, 404, 429, 500]) {
++        test(`POST /nanogpt/images/generations preserves upstream status ${status} with sanitized error and v1-compat marker`, async () => {
++            const { Readable } = await import('node:stream');
++            const upstreamError = { error: { message: `Simulated upstream failure ${status}`, code: `error_${status}` } };
++            fetchMock.mockImplementationOnce(async () => ({
++                status,
++                headers: new Map([['content-type', 'application/json']]),
++                body: Readable.from([JSON.stringify(upstreamError)]),
++            }));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                }),
++            });
++
++            expect(response.status).toBe(status);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'Upstream image generation failed.' });
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        });
++    }
++
++    test('POST /nanogpt/images/generations sanitizes non-2xx upstream error body and destroys upstream stream', async () => {
++        const { Readable } = await import('node:stream');
++        const SENTINEL_UPSTREAM_BODY = JSON.stringify({
++            error: {
++                message: 'Leaked upstream details: SECRET_KEY_SENTINEL_123 prompt: PRIVATE_PROMPT_SENTINEL_456',
++                upstream_code: 'ERR_UPSTREAM_LEAK',
++            },
++        });
++
++        let bodyDestroyed = false;
++        const upstreamStream = new Readable({
++            read() {
++                this.push(SENTINEL_UPSTREAM_BODY);
++                this.push(null);
++            },
++            destroy(err, cb) {
++                bodyDestroyed = true;
++                cb(err);
++            },
++        });
++
++        const logSpies = [
++            jest.spyOn(console, 'log').mockImplementation(() => {}),
++            jest.spyOn(console, 'debug').mockImplementation(() => {}),
++            jest.spyOn(console, 'info').mockImplementation(() => {}),
++            jest.spyOn(console, 'warn').mockImplementation(() => {}),
++            jest.spyOn(console, 'error').mockImplementation(() => {}),
++        ];
++
++        try {
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 400,
++                headers: new Map([['content-type', 'application/json']]),
++                body: upstreamStream,
++            }));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                }),
++            });
++
++            expect(response.status).toBe(400);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'Upstream image generation failed.' });
++            expect(bodyDestroyed).toBe(true);
++
++            for (const spy of logSpies) {
++                for (const call of spy.mock.calls) {
++                    const text = JSON.stringify(call);
++                    expect(text).not.toContain('SECRET_KEY_SENTINEL_123');
++                    expect(text).not.toContain('PRIVATE_PROMPT_SENTINEL_456');
++                    expect(text).not.toContain('ERR_UPSTREAM_LEAK');
++                }
++            }
++        } finally {
++            for (const spy of logSpies) {
++                spy.mockRestore();
++            }
++        }
++    });
++
++    test('POST /nanogpt/images/generations rejects declared upstream Content-Length > 50 MB with 502', async () => {
++        const { Readable } = await import('node:stream');
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        try {
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 200,
++                headers: new Map([
++                    ['content-type', 'application/json'],
++                    ['content-length', String(52428800 + 1)],
++                ]),
++                body: Readable.from(['{"ok":true}']),
++            }));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                }),
++            });
++
++            expect(response.status).toBe(502);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'Upstream response exceeded size limit.' });
++        } finally {
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    for (const badContentLength of ['100invalid', '-5', 'abc', '1e6', '99999999999999999999999999999999999999']) {
++        test(`POST /nanogpt/images/generations rejects malformed upstream Content-Length ${JSON.stringify(badContentLength)} with 502`, async () => {
++            const { Readable } = await import('node:stream');
++            const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++            try {
++                fetchMock.mockImplementationOnce(async () => ({
++                    status: 200,
++                    headers: new Map([
++                        ['content-type', 'application/json'],
++                        ['content-length', badContentLength],
++                    ]),
++                    body: Readable.from(['{"ok":true}']),
++                }));
++
++                const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({
++                        model: 'qwen-image',
++                        prompt: 'test prompt',
++                        nImages: 1,
++                        resolution: '1024x1024',
++                    }),
++                });
++
++                expect(response.status).toBe(502);
++                expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++                const data = await response.json();
++                expect(data).toEqual({ error: 'Upstream response exceeded size limit.' });
++            } finally {
++                consoleErrorSpy.mockRestore();
++            }
++        });
++    }
++
++    test('POST /nanogpt/images/generations aborts upstream stream when streamed bytes exceed 50 MB', async () => {
++        const { Readable } = await import('node:stream');
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        try {
++            // Stream chunks without Content-Length that exceed 50 MB (52428800 bytes)
++            const chunk = Buffer.alloc(10 * 1024 * 1024, 'a');
++            const hugeStream = createHugeStream(Readable, chunk, 6);
++
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: hugeStream,
++            }));
++
++            let clientError = null;
++            try {
++                const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({
++                        model: 'qwen-image',
++                        prompt: 'test prompt',
++                        nImages: 1,
++                        resolution: '1024x1024',
++                    }),
++                });
++                await response.text();
++            } catch (err) {
++                clientError = err;
++            }
++
++            expect(clientError).not.toBeNull();
++            expect(clientError).toHaveProperty('message');
++            expect(clientError.name).toMatch(/Error$/);
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images/generations aborts upstream fetch when client disconnects prematurely', async () => {
++        const { Readable } = await import('node:stream');
++        let upstreamSignal;
++        let abortEventCount = 0;
++        const hangingStream = new Readable({
++            read() {},
++        });
++
++        fetchMock.mockImplementationOnce(async (url, init) => {
++            upstreamSignal = init.signal;
++            if (upstreamSignal) {
++                upstreamSignal.addEventListener('abort', () => {
++                    abortEventCount++;
++                });
++            }
++            return {
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: hangingStream,
++            };
++        });
++
++        const clientController = new AbortController();
++        const clientPromise = fetch(`${baseUrl}/nanogpt/images/generations`, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({
++                model: 'qwen-image',
++                prompt: 'test prompt',
++                nImages: 1,
++                resolution: '1024x1024',
++            }),
++            signal: clientController.signal,
++        });
++
++        // Wait for request to reach mock
++        await new Promise(resolve => setTimeout(resolve, 50));
++        expect(upstreamSignal).toBeDefined();
++        expect(upstreamSignal.aborted).toBe(false);
++        expect(abortEventCount).toBe(0);
++
++        // Client abandons request prematurely
++        clientController.abort();
++        await expect(clientPromise).rejects.toThrow();
++
++        // Allow server to handle response close event
++        await new Promise(resolve => setTimeout(resolve, 50));
++        expect(upstreamSignal.aborted).toBe(true);
++        expect(abortEventCount).toBe(1);
++    });
++
++    test('POST /nanogpt/images/generations handles upstream fetch rejection safely without retry or payload leak', async () => {
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        try {
++            fetchMock.mockRejectedValueOnce(new Error('Network connection refused'));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                }),
++            });
++
++            expect(response.status).toBe(500);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'NanoGPT transport failed.' });
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('privacy regression: sentinel values for prompt, references, and key never appear in logs or errors', async () => {
++        const SENTINEL_KEY = 'SENTINEL_COMPAT_SECRET_KEY_987654321';
++        const SENTINEL_PROMPT = 'SENTINEL_COMPAT_PROMPT_PROSE_abc123';
++        const SENTINEL_REFERENCE = VALID_PNG_DATA_URL;
++
++        readSecretMock.mockReturnValue(SENTINEL_KEY);
++
++        const logSpies = [
++            jest.spyOn(console, 'log').mockImplementation(() => {}),
++            jest.spyOn(console, 'debug').mockImplementation(() => {}),
++            jest.spyOn(console, 'info').mockImplementation(() => {}),
++            jest.spyOn(console, 'warn').mockImplementation(() => {}),
++            jest.spyOn(console, 'error').mockImplementation(() => {}),
++        ];
++
++        try {
++            fetchMock.mockRejectedValueOnce(new Error('Simulated upstream network failure'));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: SENTINEL_PROMPT,
++                    nImages: 1,
++                    resolution: '1024x1024',
++                    imageDataUrl: SENTINEL_REFERENCE,
++                }),
++            });
++
++            expect(response.status).toBe(500);
++            const responseText = await response.text();
++
++            expect(responseText).not.toContain(SENTINEL_KEY);
++            expect(responseText).not.toContain(SENTINEL_PROMPT);
++            expect(responseText).not.toContain(SENTINEL_REFERENCE);
++
++            for (const spy of logSpies) {
++                for (const call of spy.mock.calls) {
++                    const serializedCall = JSON.stringify(call);
++                    expect(serializedCall).not.toContain(SENTINEL_KEY);
++                    expect(serializedCall).not.toContain(SENTINEL_PROMPT);
++                    expect(serializedCall).not.toContain(SENTINEL_REFERENCE);
++                }
++            }
++        } finally {
++            for (const spy of logSpies) {
++                spy.mockRestore();
++            }
++        }
++    });
++
++    test('POST /nanogpt/images/generations returns 504 and aborts upstream fetch when deadline expires', async () => {
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        setNanoGptGenerationsTimeoutMs(50);
++        let upstreamSignal;
++        let abortTriggered = false;
++        const deferredFetch = createDeferred();
++
++        try {
++            fetchMock.mockImplementationOnce(async (url, init) => {
++                upstreamSignal = init.signal;
++                if (upstreamSignal) {
++                    upstreamSignal.addEventListener('abort', () => {
++                        abortTriggered = true;
++                    });
++                }
++                return deferredFetch.promise;
++            });
++
++            const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                }),
++            });
++
++            expect(response.status).toBe(504);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'Upstream operation timed out.' });
++            expect(upstreamSignal).toBeDefined();
++            expect(upstreamSignal.aborted).toBe(true);
++            expect(abortTriggered).toBe(true);
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++
++            // Settle deferred promise cleanly
++            deferredFetch.resolve({ status: 200 });
++            await new Promise((resolve) => setImmediate(resolve));
++        } finally {
++            resetNanoGptGenerationsTimeoutMs();
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images/generations: fetch resolving after deadline is safely discarded, body is destroyed, and no downstream streaming occurs', async () => {
++        const { Readable } = await import('node:stream');
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        setNanoGptGenerationsTimeoutMs(40);
++
++        let bodyDestroyed = false;
++        let streamReadCalled = false;
++        const deferredFetch = createDeferred();
++        let upstreamSignal;
++
++        const lateStream = new Readable({
++            read() {
++                streamReadCalled = true;
++            },
++            destroy(err, cb) {
++                bodyDestroyed = true;
++                cb(err);
++            },
++        });
++
++        try {
++            fetchMock.mockImplementationOnce(async (url, init) => {
++                upstreamSignal = init.signal;
++                return deferredFetch.promise;
++            });
++
++            // 1. Client sends request
++            const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                }),
++            });
++
++            // 2. Verify 504 returned to client
++            expect(response.status).toBe(504);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'Upstream operation timed out.' });
++            expect(upstreamSignal).toBeDefined();
++            expect(upstreamSignal.aborted).toBe(true);
++
++            // 3. Resolve the deferred fetch AFTER deadline and 504 completion
++            deferredFetch.resolve({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: lateStream,
++            });
++
++            // Allow event loop ticks to settle in server
++            await new Promise((resolve) => setImmediate(resolve));
++
++            // 4. Assert: late body was destroyed, no stream read, exactly 1 fetch
++            expect(bodyDestroyed).toBe(true);
++            expect(streamReadCalled).toBe(false);
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            resetNanoGptGenerationsTimeoutMs();
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images/generations: fetch resolving after client disconnection is safely discarded and body is destroyed', async () => {
++        const { Readable } = await import('node:stream');
++        setNanoGptGenerationsTimeoutMs(5000);
++
++        let bodyDestroyed = false;
++        let streamReadCalled = false;
++        const deferredFetch = createDeferred();
++        let upstreamSignal;
++
++        const lateStream = new Readable({
++            read() {
++                streamReadCalled = true;
++            },
++            destroy(err, cb) {
++                bodyDestroyed = true;
++                cb(err);
++            },
++        });
++
++        const clientController = new AbortController();
++
++        try {
++            fetchMock.mockImplementationOnce(async (url, init) => {
++                upstreamSignal = init.signal;
++                return deferredFetch.promise;
++            });
++
++            const clientPromise = fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                }),
++                signal: clientController.signal,
++            });
++
++            // Allow fetch to be dispatched
++            await new Promise((resolve) => setTimeout(resolve, 30));
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++
++            // Client disconnects prematurely
++            clientController.abort();
++            await expect(clientPromise).rejects.toThrow();
++
++            // Allow close event to process on server
++            await new Promise((resolve) => setTimeout(resolve, 30));
++            expect(upstreamSignal).toBeDefined();
++            expect(upstreamSignal.aborted).toBe(true);
++
++            // Upstream fetch resolves late after client disconnection
++            deferredFetch.resolve({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: lateStream,
++            });
++
++            await new Promise((resolve) => setImmediate(resolve));
++
++            expect(bodyDestroyed).toBe(true);
++            expect(streamReadCalled).toBe(false);
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            resetNanoGptGenerationsTimeoutMs();
++        }
++    });
++
++    test('POST /nanogpt/images/generations: ordinary successful completion streams downstream normally end-to-end', async () => {
++        const { Readable } = await import('node:stream');
++        setNanoGptGenerationsTimeoutMs(5000);
++
++        try {
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: Readable.from(['{"created":12345,', '"data":[{"b64_json":"dGVzdA=="}]}']),
++            }));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                }),
++            });
++
++            expect(response.status).toBe(200);
++            expect(response.headers.get('content-type')).toBe('application/json');
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            const data = await response.json();
++            expect(data).toEqual({ created: 12345, data: [{ b64_json: 'dGVzdA==' }] });
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            resetNanoGptGenerationsTimeoutMs();
++        }
++    });
++
++    test('POST /nanogpt/images/generations aborts upstream body stream when streaming exceeds deadline', async () => {
++        const { Readable } = await import('node:stream');
++        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++        setNanoGptGenerationsTimeoutMs(50);
++        let streamDestroyed = false;
++
++        const hangingStream = new Readable({
++            read() {},
++            destroy(err, cb) {
++                streamDestroyed = true;
++                cb(err);
++            },
++        });
++
++        try {
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: hangingStream,
++            }));
++
++            let clientError = null;
++            try {
++                const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({
++                        model: 'qwen-image',
++                        prompt: 'test prompt',
++                        nImages: 1,
++                        resolution: '1024x1024',
++                    }),
++                });
++                await response.text();
++            } catch (err) {
++                clientError = err;
++            }
++
++            expect(clientError).not.toBeNull();
++            expect(clientError).toHaveProperty('message');
++            expect(clientError.name).toMatch(/Error$/);
++
++            // Wait brief moment for pipeline catch block and destroy
++            await new Promise(resolve => setTimeout(resolve, 60));
++            expect(streamDestroyed).toBe(true);
++            expect(fetchMock).toHaveBeenCalledTimes(1);
++        } finally {
++            resetNanoGptGenerationsTimeoutMs();
++            consoleErrorSpy.mockRestore();
++        }
++    });
++
++    test('POST /nanogpt/images/generations normal response before deadline clears timeout without late abort', async () => {
++        const { Readable } = await import('node:stream');
++        setNanoGptGenerationsTimeoutMs(200);
++
++        try {
++            fetchMock.mockImplementationOnce(async () => ({
++                status: 200,
++                headers: new Map([['content-type', 'application/json']]),
++                body: Readable.from(['{"ok":true}']),
++            }));
++
++            const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                }),
++            });
++
++            expect(response.status).toBe(200);
++            expect(await response.json()).toEqual({ ok: true });
++
++            await new Promise((resolve) => setTimeout(resolve, 250));
++        } finally {
++            resetNanoGptGenerationsTimeoutMs();
++        }
++    });
++
++    test('POST /nanogpt/images/generations thrown exceptions with secret sentinels in message or cause are never logged', async () => {
++        const SENTINEL_IN_MESSAGE = 'SECRET_IN_ERROR_MESSAGE_xyz789';
++        const SENTINEL_IN_CAUSE = 'SECRET_IN_ERROR_CAUSE_abc321';
++
++        const customError = new Error(SENTINEL_IN_MESSAGE);
++        customError.cause = new Error(SENTINEL_IN_CAUSE);
++
++        const logSpies = [
++            jest.spyOn(console, 'log').mockImplementation(() => {}),
++            jest.spyOn(console, 'debug').mockImplementation(() => {}),
++            jest.spyOn(console, 'info').mockImplementation(() => {}),
++            jest.spyOn(console, 'warn').mockImplementation(() => {}),
++            jest.spyOn(console, 'error').mockImplementation(() => {}),
++        ];
++
++        try {
++            fetchMock.mockRejectedValueOnce(customError);
++
++            const response = await fetch(`${baseUrl}/nanogpt/images/generations`, {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({
++                    model: 'qwen-image',
++                    prompt: 'test prompt',
++                    nImages: 1,
++                    resolution: '1024x1024',
++                }),
++            });
++
++            expect(response.status).toBe(500);
++            expect(response.headers.get('x-st-nanogpt-proxy')).toBe('v1-compat');
++            const data = await response.json();
++            expect(data).toEqual({ error: 'NanoGPT transport failed.' });
++
++            for (const spy of logSpies) {
++                for (const call of spy.mock.calls) {
++                    const serialized = JSON.stringify(call);
++                    expect(serialized).not.toContain(SENTINEL_IN_MESSAGE);
++                    expect(serialized).not.toContain(SENTINEL_IN_CAUSE);
++                }
++            }
++        } finally {
++            for (const spy of logSpies) {
++                spy.mockRestore();
++            }
++        }
++    });
++});

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://raw.githubusercontent.com/zNe4/SillyTavern-ChromaticImages/main/schemas/patch-manifest-v1.json",
+  "schemaVersion": "1.0.0",
+  "targetRepository": "SillyTavern/SillyTavern",
+  "supportedBranch": "release",
+  "releaseCommit": "06bde939fb1e9c4c8d8641d810f0a916b5bce127",
+  "sourceCommit": "e735bc386e4523fb0220404e84910e00cf10a468",
+  "sourceCommitShort": "e735bc386",
+  "compatibilityScope": {
+    "guarantee": "pinned-release-only",
+    "disclaimer": "This manifest certifies compatibility only with the exact tested releaseCommit (06bde939fb1e9c4c8d8641d810f0a916b5bce127). Compatibility with future or arbitrary release branch commits is not guaranteed and requires independent verification.",
+    "endUserRequirement": "Normal end users require only the runtime patch. The developer test patch is optional for test and CI environments."
+  },
+  "capabilities": {
+    "normalized": {
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/api/sd/nanogpt/images"
+        },
+        {
+          "method": "POST",
+          "path": "/api/sd/nanogpt/images"
+        }
+      ],
+      "markerHeader": "x-st-nanogpt-proxy",
+      "markerValue": "v1"
+    },
+    "compatibility": {
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/api/sd/nanogpt/images/generations"
+        },
+        {
+          "method": "POST",
+          "path": "/api/sd/nanogpt/images/generations"
+        }
+      ],
+      "markerHeader": "x-st-nanogpt-proxy",
+      "markerValue": "v1-compat"
+    }
+  },
+  "patches": {
+    "runtime": {
+      "patchFile": "runtime.patch",
+      "relativePath": "patches/sillytavern/release-06bde939f/runtime.patch",
+      "sha256": "f4c2e96a6a51e88de8517f4f36e23e104b6e0d42934fb27ad6cddc2fcd03ea3b",
+      "sizeBytes": 37169,
+      "targetFile": "src/endpoints/stable-diffusion.js",
+      "original": {
+        "gitBlobSha": "077c2f961b528afa10376a7cc20a62132cf9fcd8",
+        "sha256": "15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43"
+      },
+      "expected": {
+        "gitBlobSha": "e8bcfb652520450951268bd7521fdc6eae1aa2b6",
+        "sha256": "16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6"
+      }
+    },
+    "tests": {
+      "patchFile": "tests.patch",
+      "relativePath": "patches/sillytavern/release-06bde939f/tests.patch",
+      "sha256": "8f948b50cf249cb9e5f2f3cfdbc37c5e07a1a2dc31ebeaee65952d507fc6f6cf",
+      "sizeBytes": 96122,
+      "targetFile": "tests/stable-diffusion.test.js",
+      "original": {
+        "gitBlobSha": "6a33571d8fbb1a71e56aec51f6c3db30d18eb2d8",
+        "sha256": "c185b4559be6e5aa9487cbd42f351ba2bd2ee8158b11c8f67ad4b4dabc4cba93"
+      },
+      "expected": {
+        "gitBlobSha": "3bd7bab7006fd1e138f74dcdd132e16a17f79933",
+        "sha256": "cc2f40c4a83e66c947591bcfeba36150f4d4205d990522cc6d3e84aa724f3dfe"
+      }
+    }
+  },
+  "cumulative": {
+    "sha256": "1996fc6d41861635670ea2d762639b6602f9d0ee105bcfa4f01a80153306a479"
+  }
+}
