@@ -1,5 +1,4 @@
 {
-  "$schema": "https://raw.githubusercontent.com/zNe4/SillyTavern-ChromaticImages/main/schemas/patch-manifest-v1.json",
   "schemaVersion": "1.0.0",
   "targetRepository": "SillyTavern/SillyTavern",
   "supportedBranch": "release",

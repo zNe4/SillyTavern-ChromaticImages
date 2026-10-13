@@ -4,11 +4,11 @@
 
 ## Current state
 
-**Phase:** M03 — NanoGPT/Qwen transport and local image primitives.
+**Phase:** Phase M03 complete (accepted); Distribution track D01 active.
 
-**Current mission:** M03-H3 (Final Documentation Reconciliation and Formal Closeout) implemented and submitted for independent review. Phase M03 complete pending formal H3 acceptance.
+**Current mission:** D01-P2B (Distribution artifacts and verification tooling) implemented and submitted for independent review. D01-P3 (installer) deferred; Phase M04 (Character identity & reference library) planned next.
 
-**Completed:** M01 scaffold (accepted), M02 message protocol / inline UI / managed prompt hygiene (accepted), M03-A through M03-G2 (accepted), M03-H0 (accepted), M03-H1 (accepted), M03-H2 (accepted), and M03-H3 (complete, under independent review).
+**Completed:** M01 scaffold (accepted), M02 message protocol / inline UI / managed prompt hygiene (accepted), M03-A through M03-H3 (complete and accepted), D01-P1 (release compatibility research, accepted), and D01-P2A (proxy hardening, accepted).
 
 **Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building (normalized and compatibility), response normalization, pure mocked transport core, production dispatch adapters with capability guards (normalized and compatibility), local image I/O primitives, provider settings schema, credential readiness reader, connection diagnostics UI, and explicit settings-only diagnostic image generator with local upload are implemented and verified. Automatic roleplay image generation remains disabled; proposal-card Generate wiring remains deferred to M05, and character identity and trusted reference library management are planned for M04.
 
@@ -229,7 +229,7 @@ No NanoGPT and no reference library yet.
 
 ## M03 — NanoGPT/Qwen transport and local image primitives
 
-**Status:** M03-A through M03-H2 complete and accepted; M03-H3 documentation reconciliation complete and submitted for independent review. Full Phase M03 implementation complete.
+**Status:** Complete and accepted (M03-A through M03-H3 accepted). Full Phase M03 implementation complete.
 
 ### Goal
 
@@ -416,13 +416,13 @@ Implemented scope:
 
 ### M03-H — Integration and closeout
 
-**Status:** Sub-missions M03-H0, M03-H1, and M03-H2 are accepted; M03-H3 documentation reconciliation is complete and submitted for independent review.
-
+**Status:** Complete and accepted (sub-missions M03-H0 through M03-H3 accepted).
+ 
 Subdivided into:
 - **M03-H0 (Integration research and verification planning): Accepted.** Established the 12-item verification matrix, evidence inventory, non-billable boundaries, and test correction baseline.
 - **M03-H1 (Non-billable integration verification): Accepted.** Verified automated suite (683/683 tests passing across 23 test files), syntax verification (47/47 files passed `node --check`), 4th reference rejection before paid dispatch, and UI lifecycle in non-billable browser smoke.
 - **M03-H2 (Live reference verification smoke): Accepted.** Verified real provider generation across reference counts, confirming single dispatch, normalization, local storage upload, and reload persistence.
-- **M03-H3 (Documentation reconciliation and closeout): Completed, submitted for independent review.** Reconciled roadmap, contract, architecture, and README with final shipped implementation.
+- **M03-H3 (Documentation reconciliation and closeout): Accepted.** Reconciled roadmap, contract, architecture, and README with final shipped implementation.
 
 #### Empirical reference verification matrix
 

@@ -89,7 +89,6 @@ The manifest provides a machine-readable, declarative contract for future instal
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/zNe4/SillyTavern-ChromaticImages/main/schemas/patch-manifest-v1.json",
   "schemaVersion": "1.0.0",
   "targetRepository": "SillyTavern/SillyTavern",
   "supportedBranch": "release",
@@ -178,14 +177,27 @@ The manifest provides a machine-readable, declarative contract for future instal
 The verification tool `scripts/verify-sillytavern-patches.mjs` provides standalone integrity checking without external network requests or modifying SillyTavern repositories.
 
 ### 6.1 Validation Checks Enforced
-1. **Manifest Integrity:** Strict schema validation ensuring required fields, 40-character hex commit hashes, and 64-character hex checksums are present and well-formed.
-2. **File Checksums:** Validates runtime patch, test patch, and cumulative patch SHA-256 digests.
-3. **Path Safety & Traversal Prevention:** Rejects any target or patch paths containing directory traversal (`..`), absolute paths (`/` or `\`), backslashes, or empty strings.
-4. **Patch Scope Restriction:** Confirms that each patch contains **exactly one** `diff --git` block modifying exclusively its declared `targetFile`. Rejects extra patched files.
+1. **Manifest Integrity:** Strict schema validation ensuring required fields, exact supported schema version (`1.0.0`), expected target repository (`SillyTavern/SillyTavern`), 40-character hex commit hashes, positive safe integer byte sizes, and 64-character hex checksums are present and well-formed. Rejects unknown properties or malformed descriptors.
+2. **File Checksums & Byte Sizes:** Validates runtime patch, test patch, and cumulative patch SHA-256 digests, and confirms exact file sizes against declared `sizeBytes`.
+3. **Path Safety & Traversal Prevention:** Rejects any target or patch paths containing directory traversal (`..`), absolute paths (`/` or `\`), backslashes, empty segments, or Windows drive-letter paths (`C:`, `c:/`, `C:\`).
+4. **Patch Scope Restriction:** Confirms that each patch contains **exactly one** `diff --git` block modifying exclusively its declared `targetFile` (`src/endpoints/stable-diffusion.js` for runtime, `tests/stable-diffusion.test.js` for developer tests). Rejects extra patched files or unexpected targets.
 5. **Operation Allowlisting:** Rejects forbidden file operations such as `new file mode`, `deleted file mode`, `Binary files differ`, `rename`, or `copy`.
 6. **Git Blob Prefix Verification:** Parses the unified diff `index <orig>..<dest>` line and ensures the short hashes are genuine prefixes of the declared `gitBlobSha` values in the manifest.
+7. **Path Containment:** Enforces strict filesystem containment ensuring patch file paths never escape the manifest directory.
 
-### 6.2 Tooling Execution
+### 6.2 Scope: Metadata Verification vs. Full Source Reconstruction
+The verification tool `scripts/verify-sillytavern-patches.mjs` performs **offline metadata and package consistency verification**. Its scope is intentionally bounded:
+- It verifies that the manifest is structurally valid, that referenced patch files exist, that checksums and byte counts match, that diff scopes are strictly confined to allowed target files, and that Git blob headers match expected identities.
+- It does **not** perform full source reconstruction, does not apply patches to an existing codebase, and is not an installer (patch application is deferred to the future D01-P3 installer).
+- Full source reconstruction and compatibility verification were performed and proven separately in an isolated stock release environment (detailed in Section 7).
+
+### 6.3 Security: Integrity Consistency vs. Independent Cryptographic Authenticity
+The SHA-256 digests and blob fingerprints embedded inside `manifest.json` provide **self-consistent package integrity**:
+- They guarantee that `runtime.patch` and `tests.patch` have not suffered file corruption, truncation, or accidental editing relative to the declared manifest.
+- However, checksums recorded within the manifest itself do **not** provide independent cryptographic authenticity or third-party non-repudiation. If an untrusted actor were to tamper with both the manifest and the patch files simultaneously, internal checksum checks would still pass.
+- Cryptographic provenance and authenticity rely on the integrity of the containing Git repository, commit history, and release distribution channels. Downstream consumers should only obtain the manifest from verified, canonical repository sources.
+
+### 6.4 Tooling Execution
 Run via npm or Node.js:
 ```bash
 npm run verify:patches

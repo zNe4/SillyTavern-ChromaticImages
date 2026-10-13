@@ -4,6 +4,56 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
+export const SUPPORTED_SCHEMA_VERSION = '1.0.0';
+export const EXPECTED_REPOSITORY = 'SillyTavern/SillyTavern';
+export const EXPECTED_RELEASE_COMMIT = '06bde939fb1e9c4c8d8641d810f0a916b5bce127';
+export const EXPECTED_SOURCE_COMMIT = 'e735bc386e4523fb0220404e84910e00cf10a468';
+
+export const EXPECTED_PATCH_SPECS = Object.freeze({
+  runtime: Object.freeze({
+    patchFile: 'runtime.patch',
+    relativePath: 'patches/sillytavern/release-06bde939f/runtime.patch',
+    targetFile: 'src/endpoints/stable-diffusion.js',
+  }),
+  tests: Object.freeze({
+    patchFile: 'tests.patch',
+    relativePath: 'patches/sillytavern/release-06bde939f/tests.patch',
+    targetFile: 'tests/stable-diffusion.test.js',
+  }),
+});
+
+const ALLOWED_TOP_LEVEL_KEYS = new Set([
+  'schemaVersion',
+  'targetRepository',
+  'supportedBranch',
+  'releaseCommit',
+  'sourceCommit',
+  'sourceCommitShort',
+  'compatibilityScope',
+  'capabilities',
+  'patches',
+  'cumulative',
+]);
+
+const ALLOWED_SCOPE_KEYS = new Set([
+  'guarantee',
+  'disclaimer',
+  'endUserRequirement',
+]);
+
+const ALLOWED_PATCH_KEYS = new Set([
+  'patchFile',
+  'relativePath',
+  'sha256',
+  'sizeBytes',
+  'targetFile',
+  'original',
+  'expected',
+]);
+
+const HEX_40_REGEX = /^[0-9a-f]{40}$/i;
+const HEX_64_REGEX = /^[0-9a-f]{64}$/i;
+
 /**
  * Compute lowercase hex SHA-256 digest of a Buffer or string.
  * @param {Buffer|string} data
@@ -14,33 +64,52 @@ export function computeSha256(data) {
 }
 
 /**
- * Validate that a target path is strictly safe and normalized:
+ * Validate that a target path is strictly safe and canonically normalized:
  * - Must be non-empty string
- * - Must not start with / or \
- * - Must not contain .. segments
- * - Must use forward slashes
+ * - Must not contain null bytes or control characters
+ * - Must reject Windows drive letters (e.g. C:, c:/, C:\) on all platforms
+ * - Must not contain backslashes
+ * - Must not start with / or end with /
+ * - Must not contain redundant separators (//) or . segments
+ * - Must reject every .. segment before normalization
+ * - Must match path.posix.normalize() exactly
  * @param {string} targetPath
  * @returns {boolean}
  */
 export function isSafeRelativePath(targetPath) {
-  if (typeof targetPath !== 'string' || targetPath.trim().length === 0) {
+  if (typeof targetPath !== 'string' || targetPath.trim() === '') {
     return false;
   }
-  if (path.isAbsolute(targetPath) || targetPath.startsWith('/') || targetPath.startsWith('\\')) {
+  // Reject null bytes and ASCII control characters
+  if (/[\x00-\x1f\x7f]/.test(targetPath)) {
     return false;
   }
-  const normalized = path.normalize(targetPath);
-  if (normalized.startsWith('..') || normalized.includes('/../') || normalized.includes('\\..\\')) {
+  // Reject Windows drive-letter syntax (e.g. C:, c:/, C:\) on any platform
+  if (/^[a-zA-Z]:/.test(targetPath)) {
     return false;
   }
+  // Reject backslashes (POSIX forward slashes required)
   if (targetPath.includes('\\')) {
+    return false;
+  }
+  // Reject leading slash (absolute) or trailing slash
+  if (targetPath.startsWith('/') || targetPath.endsWith('/')) {
+    return false;
+  }
+  // Split into raw segments before any normalization
+  const segments = targetPath.split('/');
+  for (const seg of segments) {
+    // Empty segment (redundant slashes e.g. //), current dir '.', or parent traversal '..'
+    if (seg === '' || seg === '.' || seg === '..') {
+      return false;
+    }
+  }
+  // Must match canonical POSIX normalization
+  if (path.posix.normalize(targetPath) !== targetPath) {
     return false;
   }
   return true;
 }
-
-const HEX_40_REGEX = /^[0-9a-f]{40}$/i;
-const HEX_64_REGEX = /^[0-9a-f]{64}$/i;
 
 /**
  * Validate the structure and fields of a patch manifest.
@@ -53,29 +122,66 @@ export function validateManifestStructure(manifest) {
     return { ok: false, errors: ['Manifest must be a non-null JSON object'] };
   }
 
-  if (typeof manifest.schemaVersion !== 'string' || !manifest.schemaVersion.trim()) {
-    errors.push('Missing or invalid "schemaVersion" string');
+  // Reject unknown top-level properties
+  for (const key of Object.keys(manifest)) {
+    if (!ALLOWED_TOP_LEVEL_KEYS.has(key)) {
+      errors.push(`Unknown top-level property "${key}" in manifest`);
+    }
   }
 
-  if (typeof manifest.targetRepository !== 'string' || !manifest.targetRepository.trim()) {
-    errors.push('Missing or invalid "targetRepository" string');
+  if (manifest.schemaVersion !== SUPPORTED_SCHEMA_VERSION) {
+    errors.push(
+      `Unsupported or invalid "schemaVersion": expected "${SUPPORTED_SCHEMA_VERSION}", got "${manifest.schemaVersion}"`
+    );
+  }
+
+  if (manifest.targetRepository !== EXPECTED_REPOSITORY) {
+    errors.push(
+      `Invalid "targetRepository": expected "${EXPECTED_REPOSITORY}", got "${manifest.targetRepository}"`
+    );
   }
 
   if (manifest.supportedBranch !== 'release') {
     errors.push(`Invalid "supportedBranch": expected "release", got "${manifest.supportedBranch}"`);
   }
 
-  if (!HEX_40_REGEX.test(manifest.releaseCommit || '')) {
+  if (typeof manifest.releaseCommit !== 'string' || !HEX_40_REGEX.test(manifest.releaseCommit)) {
     errors.push('Invalid "releaseCommit": expected 40-character hex SHA');
+  } else if (manifest.releaseCommit !== EXPECTED_RELEASE_COMMIT) {
+    errors.push(
+      `Unexpected "releaseCommit": expected "${EXPECTED_RELEASE_COMMIT}", got "${manifest.releaseCommit}"`
+    );
   }
 
-  if (!HEX_40_REGEX.test(manifest.sourceCommit || '')) {
+  if (typeof manifest.sourceCommit !== 'string' || !HEX_40_REGEX.test(manifest.sourceCommit)) {
     errors.push('Invalid "sourceCommit": expected 40-character hex SHA');
+  } else if (manifest.sourceCommit !== EXPECTED_SOURCE_COMMIT) {
+    errors.push(
+      `Unexpected "sourceCommit": expected "${EXPECTED_SOURCE_COMMIT}", got "${manifest.sourceCommit}"`
+    );
   }
 
-  if (!manifest.compatibilityScope || typeof manifest.compatibilityScope !== 'object') {
+  if (manifest.sourceCommitShort !== undefined) {
+    if (typeof manifest.sourceCommitShort !== 'string' || !manifest.sourceCommitShort.trim()) {
+      errors.push('Invalid "sourceCommitShort": expected non-empty string');
+    } else if (manifest.sourceCommit && !manifest.sourceCommit.startsWith(manifest.sourceCommitShort)) {
+      errors.push('Mismatch between "sourceCommitShort" and "sourceCommit"');
+    }
+  }
+
+  if (!manifest.compatibilityScope || typeof manifest.compatibilityScope !== 'object' || Array.isArray(manifest.compatibilityScope)) {
     errors.push('Missing or invalid "compatibilityScope" object');
   } else {
+    for (const key of Object.keys(manifest.compatibilityScope)) {
+      if (!ALLOWED_SCOPE_KEYS.has(key)) {
+        errors.push(`Unknown property "${key}" in "compatibilityScope"`);
+      }
+    }
+    if (manifest.compatibilityScope.guarantee !== 'pinned-release-only') {
+      errors.push(
+        `Invalid "compatibilityScope.guarantee": expected "pinned-release-only", got "${manifest.compatibilityScope.guarantee}"`
+      );
+    }
     if (typeof manifest.compatibilityScope.disclaimer !== 'string' || !manifest.compatibilityScope.disclaimer.trim()) {
       errors.push('Missing "compatibilityScope.disclaimer" string');
     }
@@ -84,57 +190,111 @@ export function validateManifestStructure(manifest) {
     }
   }
 
-  if (!manifest.capabilities || typeof manifest.capabilities !== 'object') {
+  if (!manifest.capabilities || typeof manifest.capabilities !== 'object' || Array.isArray(manifest.capabilities)) {
     errors.push('Missing or invalid "capabilities" object');
   } else {
     for (const routeType of ['normalized', 'compatibility']) {
       const cap = manifest.capabilities[routeType];
-      if (!cap || typeof cap !== 'object') {
+      if (!cap || typeof cap !== 'object' || Array.isArray(cap)) {
         errors.push(`Missing "capabilities.${routeType}" object`);
       } else {
         if (!Array.isArray(cap.routes) || cap.routes.length === 0) {
           errors.push(`Missing or empty routes array in "capabilities.${routeType}"`);
+        } else {
+          for (const route of cap.routes) {
+            if (!route || typeof route !== 'object' || typeof route.method !== 'string' || typeof route.path !== 'string') {
+              errors.push(`Malformed route descriptor in "capabilities.${routeType}"`);
+            }
+          }
         }
-        if (typeof cap.markerHeader !== 'string' || !cap.markerHeader) {
-          errors.push(`Missing markerHeader in "capabilities.${routeType}"`);
+        if (cap.markerHeader !== 'x-st-nanogpt-proxy') {
+          errors.push(`Invalid markerHeader in "capabilities.${routeType}": expected "x-st-nanogpt-proxy"`);
         }
-        if (typeof cap.markerValue !== 'string' || !cap.markerValue) {
-          errors.push(`Missing markerValue in "capabilities.${routeType}"`);
+        const expectedMarker = routeType === 'normalized' ? 'v1' : 'v1-compat';
+        if (cap.markerValue !== expectedMarker) {
+          errors.push(`Invalid markerValue in "capabilities.${routeType}": expected "${expectedMarker}"`);
         }
       }
     }
   }
 
-  if (!manifest.patches || typeof manifest.patches !== 'object') {
+  if (!manifest.patches || typeof manifest.patches !== 'object' || Array.isArray(manifest.patches)) {
     errors.push('Missing or invalid "patches" object');
   } else {
+    for (const key of Object.keys(manifest.patches)) {
+      if (key !== 'runtime' && key !== 'tests') {
+        errors.push(`Unknown patch entry "${key}" in "patches" (only "runtime" and "tests" permitted)`);
+      }
+    }
+
     for (const patchType of ['runtime', 'tests']) {
       const p = manifest.patches[patchType];
-      if (!p || typeof p !== 'object') {
+      if (!p || typeof p !== 'object' || Array.isArray(p)) {
         errors.push(`Missing "patches.${patchType}" object`);
         continue;
       }
 
-      if (!isSafeRelativePath(p.patchFile)) {
-        errors.push(`Unsafe or invalid patchFile path in "patches.${patchType}": "${p.patchFile}"`);
+      for (const prop of Object.keys(p)) {
+        if (!ALLOWED_PATCH_KEYS.has(prop)) {
+          errors.push(`Unknown property "${prop}" in "patches.${patchType}"`);
+        }
       }
+
+      const expectedSpec = EXPECTED_PATCH_SPECS[patchType];
+
+      if (p.patchFile !== expectedSpec.patchFile) {
+        errors.push(
+          `Invalid patchFile in "patches.${patchType}": expected "${expectedSpec.patchFile}", got "${p.patchFile}"`
+        );
+      }
+      if (!isSafeRelativePath(p.patchFile)) {
+        errors.push(`Unsafe patchFile path in "patches.${patchType}": "${p.patchFile}"`);
+      }
+
+      if (p.relativePath !== expectedSpec.relativePath) {
+        errors.push(
+          `Invalid relativePath in "patches.${patchType}": expected "${expectedSpec.relativePath}", got "${p.relativePath}"`
+        );
+      }
+      if (!isSafeRelativePath(p.relativePath)) {
+        errors.push(`Unsafe relativePath in "patches.${patchType}": "${p.relativePath}"`);
+      } else if (path.posix.basename(p.relativePath) !== p.patchFile) {
+        errors.push(
+          `Inconsistent relativePath in "patches.${patchType}": basename does not match patchFile "${p.patchFile}"`
+        );
+      }
+
       if (!HEX_64_REGEX.test(p.sha256 || '')) {
         errors.push(`Invalid sha256 checksum in "patches.${patchType}"`);
       }
-      if (!isSafeRelativePath(p.targetFile)) {
-        errors.push(`Unsafe or invalid targetFile path in "patches.${patchType}": "${p.targetFile}"`);
+
+      if (typeof p.sizeBytes !== 'number' || !Number.isSafeInteger(p.sizeBytes) || p.sizeBytes <= 0) {
+        errors.push(`Invalid sizeBytes in "patches.${patchType}": expected positive safe integer`);
       }
 
-      if (!p.original || !HEX_40_REGEX.test(p.original.gitBlobSha || '') || !HEX_64_REGEX.test(p.original.sha256 || '')) {
+      if (p.targetFile !== expectedSpec.targetFile) {
+        errors.push(
+          `Invalid targetFile in "patches.${patchType}": expected "${expectedSpec.targetFile}", got "${p.targetFile}"`
+        );
+      }
+      if (!isSafeRelativePath(p.targetFile)) {
+        errors.push(`Unsafe targetFile path in "patches.${patchType}": "${p.targetFile}"`);
+      }
+
+      if (!p.original || typeof p.original !== 'object' || Array.isArray(p.original) ||
+          !HEX_40_REGEX.test(p.original.gitBlobSha || '') || !HEX_64_REGEX.test(p.original.sha256 || '')) {
         errors.push(`Invalid original blob/sha256 fingerprints in "patches.${patchType}"`);
       }
-      if (!p.expected || !HEX_40_REGEX.test(p.expected.gitBlobSha || '') || !HEX_64_REGEX.test(p.expected.sha256 || '')) {
+      if (!p.expected || typeof p.expected !== 'object' || Array.isArray(p.expected) ||
+          !HEX_40_REGEX.test(p.expected.gitBlobSha || '') || !HEX_64_REGEX.test(p.expected.sha256 || '')) {
         errors.push(`Invalid expected blob/sha256 fingerprints in "patches.${patchType}"`);
       }
     }
   }
 
-  if (!manifest.cumulative || !HEX_64_REGEX.test(manifest.cumulative.sha256 || '')) {
+  if (!manifest.cumulative || typeof manifest.cumulative !== 'object' || Array.isArray(manifest.cumulative)) {
+    errors.push('Missing or invalid "cumulative" object');
+  } else if (!HEX_64_REGEX.test(manifest.cumulative.sha256 || '')) {
     errors.push('Missing or invalid "cumulative.sha256" checksum');
   }
 
@@ -145,16 +305,27 @@ export function validateManifestStructure(manifest) {
 }
 
 /**
- * Verify deterministic scope, allowed operations, target paths, and Git blob headers of patch content.
+ * Verify deterministic scope, allowed operations, target paths, declared byte size, and Git blob headers of patch content.
  * @param {Buffer} patchBuffer
  * @param {object} patchSpec
  * @returns {{ ok: boolean, errors: string[] }}
  */
 export function verifyPatchContent(patchBuffer, patchSpec) {
   const errors = [];
+
+  // 1. Verify byte size matches declared sizeBytes
+  if (typeof patchSpec.sizeBytes === 'number' && patchBuffer.length !== patchSpec.sizeBytes) {
+    errors.push(
+      `File size mismatch for ${patchSpec.targetFile}: declared ${patchSpec.sizeBytes} bytes, actual ${patchBuffer.length} bytes`
+    );
+  }
+
+  // 2. Verify SHA-256 matches declared sha256
   const actualSha256 = computeSha256(patchBuffer);
-  if (actualSha256.toLowerCase() !== patchSpec.sha256.toLowerCase()) {
-    errors.push(`Checksum mismatch for ${patchSpec.targetFile}: expected ${patchSpec.sha256}, got ${actualSha256}`);
+  if (actualSha256.toLowerCase() !== (patchSpec.sha256 || '').toLowerCase()) {
+    errors.push(
+      `Checksum mismatch for ${patchSpec.targetFile}: expected ${patchSpec.sha256}, got ${actualSha256}`
+    );
   }
 
   const patchText = patchBuffer.toString('utf-8');
@@ -224,11 +395,11 @@ export function verifyPatchContent(patchBuffer, patchSpec) {
       errors.push(`Malformed "index" header: "${indexLines[0].line}"`);
     } else {
       const [, shortOrig, shortDest] = match;
-      if (!patchSpec.original.gitBlobSha.toLowerCase().startsWith(shortOrig.toLowerCase())) {
-        errors.push(`Original blob prefix mismatch: header "${shortOrig}" is not a prefix of declared "${patchSpec.original.gitBlobSha}"`);
+      if (!patchSpec.original || !patchSpec.original.gitBlobSha || !patchSpec.original.gitBlobSha.toLowerCase().startsWith(shortOrig.toLowerCase())) {
+        errors.push(`Original blob prefix mismatch: header "${shortOrig}" is not a prefix of declared "${patchSpec.original?.gitBlobSha}"`);
       }
-      if (!patchSpec.expected.gitBlobSha.toLowerCase().startsWith(shortDest.toLowerCase())) {
-        errors.push(`Expected blob prefix mismatch: header "${shortDest}" is not a prefix of declared "${patchSpec.expected.gitBlobSha}"`);
+      if (!patchSpec.expected || !patchSpec.expected.gitBlobSha || !patchSpec.expected.gitBlobSha.toLowerCase().startsWith(shortDest.toLowerCase())) {
+        errors.push(`Expected blob prefix mismatch: header "${shortDest}" is not a prefix of declared "${patchSpec.expected?.gitBlobSha}"`);
       }
     }
   }
@@ -278,8 +449,9 @@ export async function verifyPatchManifest(manifestPath) {
     const patchSpec = manifest.patches[patchType];
     const resolvedPatchPath = path.resolve(manifestDir, patchSpec.patchFile);
 
-    // Guard against directory traversal escaping the expected directory
-    if (!resolvedPatchPath.startsWith(manifestDir)) {
+    // Robust containment check: ensure resolvedPatchPath is strictly inside manifestDir
+    const relativeFromManifestDir = path.relative(manifestDir, resolvedPatchPath);
+    if (relativeFromManifestDir.startsWith('..') || path.isAbsolute(relativeFromManifestDir) || relativeFromManifestDir === '') {
       errors.push(`Patch file path "${patchSpec.patchFile}" escapes manifest directory`);
       continue;
     }
@@ -347,9 +519,11 @@ async function main() {
   console.log(`  Runtime Patch:    ${manifest.patches.runtime.patchFile} (${manifest.patches.runtime.sizeBytes} bytes)`);
   console.log(`    SHA-256:        ${manifest.patches.runtime.sha256}`);
   console.log(`    Target File:    ${manifest.patches.runtime.targetFile}`);
+  console.log(`    Relative Path:  ${manifest.patches.runtime.relativePath}`);
   console.log(`  Tests Patch:      ${manifest.patches.tests.patchFile} (${manifest.patches.tests.sizeBytes} bytes)`);
   console.log(`    SHA-256:        ${manifest.patches.tests.sha256}`);
   console.log(`    Target File:    ${manifest.patches.tests.targetFile}`);
+  console.log(`    Relative Path:  ${manifest.patches.tests.relativePath}`);
   console.log(`  Cumulative SHA:   ${manifest.cumulative.sha256}`);
   console.log(`  End User Scope:   ${manifest.compatibilityScope.endUserRequirement}`);
 }
