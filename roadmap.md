@@ -6,13 +6,13 @@
 
 **Phase:** Phase M03 complete (accepted); Distribution track D01 active.
 
-**Current mission:** D01-P2B (Distribution artifacts and verification tooling) implemented and submitted for independent review. D01-P3 (installer) deferred; Phase M04 (Character identity & reference library) planned next.
+**Current mission:** D01-P3A (Read-only SillyTavern patch installer foundation) implemented and submitted for independent review. D01-P3B (installer application and removal) planned next.
 
-**Completed:** M01 scaffold (accepted), M02 message protocol / inline UI / managed prompt hygiene (accepted), M03-A through M03-H3 (complete and accepted), D01-P1 (release compatibility research, accepted), and D01-P2A (proxy hardening, accepted).
+**Completed:** M01 scaffold (accepted), M02 message protocol / inline UI / managed prompt hygiene (accepted), M03-A through M03-H3 (complete and accepted), D01-P1 (release compatibility research, accepted), D01-P2A (proxy hardening, accepted), and D01-P2B (distribution artifacts and verification tooling, accepted).
 
 **Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building (normalized and compatibility), response normalization, pure mocked transport core, production dispatch adapters with capability guards (normalized and compatibility), local image I/O primitives, provider settings schema, credential readiness reader, connection diagnostics UI, and explicit settings-only diagnostic image generator with local upload are implemented and verified. Automatic roleplay image generation remains disabled; proposal-card Generate wiring remains deferred to M05, and character identity and trusted reference library management are planned for M04.
 
-**Distribution track (D01):** D01-P1 (release compatibility research) and D01-P2A (proxy hardening) accepted. D01-P2B (distribution artifacts, compatibility manifest, and offline verification tooling) implemented and submitted for independent review. D01-P3 (installer) deferred.
+**Distribution track (D01):** D01-P1 (release compatibility research), D01-P2A (proxy hardening), and D01-P2B (distribution artifacts and verification tooling) accepted. D01-P3A (read-only patch installer foundation: `--status` and `--check`) implemented and submitted for independent review. D01-P3B (installer application and removal) planned next.
 
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
