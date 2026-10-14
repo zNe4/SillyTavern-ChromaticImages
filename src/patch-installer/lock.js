@@ -11,6 +11,53 @@ export const LOCK_OWNER_FILE = 'owner.json';
 const TX_ID_REGEX = /^ci-tx-[0-9]+-[0-9a-f]+$/i;
 
 /**
+ * Perform safe lstat with explicit ENOENT and dangling symlink detection.
+ * Distinguishes missing paths from dangling symlinks and filesystem errors.
+ *
+ * @param {string} targetPath
+ * @returns {{
+ *   exists: boolean,
+ *   stat: fs.Stats|null,
+ *   isSymbolicLink: boolean,
+ *   isDirectory: boolean,
+ *   isFile: boolean,
+ *   error: Error|null
+ * }}
+ */
+export function getPathLstat(targetPath) {
+  try {
+    const stat = fs.lstatSync(targetPath);
+    return {
+      exists: true,
+      stat,
+      isSymbolicLink: stat.isSymbolicLink(),
+      isDirectory: stat.isDirectory(),
+      isFile: stat.isFile(),
+      error: null,
+    };
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return {
+        exists: false,
+        stat: null,
+        isSymbolicLink: false,
+        isDirectory: false,
+        isFile: false,
+        error: null,
+      };
+    }
+    return {
+      exists: false,
+      stat: null,
+      isSymbolicLink: false,
+      isDirectory: false,
+      isFile: false,
+      error: err,
+    };
+  }
+}
+
+/**
  * Generate a cryptographically randomized transaction ID.
  * @returns {string}
  */
@@ -59,7 +106,8 @@ export function isPathContained(repoRoot, targetPath) {
 
 /**
  * Inspect .ci-patch path component safety.
- * Verifies that repoRoot and .ci-patch are not symlinks and do not escape boundaries.
+ * Verifies that repoRoot and .ci-patch are not symlinks (including dangling symlinks)
+ * and do not escape boundaries.
  *
  * @param {string} repoRoot
  * @returns {{ ok: boolean, exists: boolean, isSymlink: boolean, isDirectory: boolean, path: string, error?: string }}
@@ -74,23 +122,24 @@ export function validateCiPatchPath(repoRoot) {
     return { ok: false, exists: false, isSymlink: false, isDirectory: false, path: ciPatchDir, error: 'Path escapes repository root' };
   }
 
-  try {
-    if (!fs.existsSync(ciPatchDir)) {
-      return { ok: true, exists: false, isSymlink: false, isDirectory: false, path: ciPatchDir };
-    }
-
-    const lstat = fs.lstatSync(ciPatchDir);
-    if (lstat.isSymbolicLink()) {
-      return { ok: false, exists: true, isSymlink: true, isDirectory: false, path: ciPatchDir, error: 'Installer directory is a symbolic link' };
-    }
-    if (!lstat.isDirectory()) {
-      return { ok: false, exists: true, isSymlink: false, isDirectory: false, path: ciPatchDir, error: 'Installer directory is not a directory' };
-    }
-
-    return { ok: true, exists: true, isSymlink: false, isDirectory: true, path: ciPatchDir };
-  } catch (err) {
-    return { ok: false, exists: false, isSymlink: false, isDirectory: false, path: ciPatchDir, error: err.message };
+  const check = getPathLstat(ciPatchDir);
+  if (check.error) {
+    return { ok: false, exists: false, isSymlink: false, isDirectory: false, path: ciPatchDir, error: check.error.message };
   }
+
+  if (!check.exists) {
+    return { ok: true, exists: false, isSymlink: false, isDirectory: false, path: ciPatchDir };
+  }
+
+  if (check.isSymbolicLink) {
+    return { ok: false, exists: true, isSymlink: true, isDirectory: false, path: ciPatchDir, error: 'Installer directory is a symbolic link' };
+  }
+
+  if (!check.isDirectory) {
+    return { ok: false, exists: true, isSymlink: false, isDirectory: false, path: ciPatchDir, error: 'Installer directory is not a directory' };
+  }
+
+  return { ok: true, exists: true, isSymlink: false, isDirectory: true, path: ciPatchDir };
 }
 
 /**
@@ -108,9 +157,9 @@ export function ensureCiPatchDir(repoRoot) {
   if (!check.exists) {
     try {
       fs.mkdirSync(ciPatchDir, { mode: 0o700 });
-      // Re-verify created directory
-      const postStat = fs.lstatSync(ciPatchDir);
-      if (postStat.isSymbolicLink() || !postStat.isDirectory()) {
+      // Re-verify created directory with lstat
+      const postCheck = getPathLstat(ciPatchDir);
+      if (postCheck.isSymbolicLink || !postCheck.isDirectory) {
         return { ok: false, path: ciPatchDir, error: 'Created directory is unsafe' };
       }
     } catch (err) {
@@ -166,6 +215,7 @@ export function validateLockOwner(owner) {
 /**
  * Read-only inspection of installer lock state.
  * Never acquires, steals, mutates, or deletes locks.
+ * Detects dangling symlinks and unexpected lock directory contents.
  *
  * @param {string} repoRoot
  * @returns {{
@@ -198,67 +248,109 @@ export function inspectLock(repoRoot) {
     return { hasLock: false, isValid: true, isSymlink: false, owner: null, lockDirPath, errors: [] };
   }
 
+  const lockCheck = getPathLstat(lockDirPath);
+  if (lockCheck.error) {
+    return {
+      hasLock: false,
+      isValid: false,
+      isSymlink: false,
+      owner: null,
+      lockDirPath,
+      errors: [`Filesystem error checking lock directory: ${lockCheck.error.message}`],
+    };
+  }
+
+  if (!lockCheck.exists) {
+    return { hasLock: false, isValid: true, isSymlink: false, owner: null, lockDirPath, errors: [] };
+  }
+
+  if (lockCheck.isSymbolicLink) {
+    return {
+      hasLock: true,
+      isValid: false,
+      isSymlink: true,
+      owner: null,
+      lockDirPath,
+      errors: ['Lock directory is a symbolic link'],
+    };
+  }
+
+  if (!lockCheck.isDirectory) {
+    return {
+      hasLock: true,
+      isValid: false,
+      isSymlink: false,
+      owner: null,
+      lockDirPath,
+      errors: ['Lock path exists but is not a directory'],
+    };
+  }
+
+  // Check for unexpected contents inside lock.d
   try {
-    if (!fs.existsSync(lockDirPath)) {
-      return { hasLock: false, isValid: true, isSymlink: false, owner: null, lockDirPath, errors: [] };
+    const lockEntries = fs.readdirSync(lockDirPath);
+    const unexpected = lockEntries.filter((e) => e !== LOCK_OWNER_FILE);
+    if (unexpected.length > 0) {
+      errors.push(`Lock directory contains unexpected entries: ${unexpected.join(', ')}`);
     }
+  } catch (err) {
+    return {
+      hasLock: true,
+      isValid: false,
+      isSymlink: false,
+      owner: null,
+      lockDirPath,
+      errors: [`Failed to read lock directory: ${err.message}`],
+    };
+  }
 
-    const lockStat = fs.lstatSync(lockDirPath);
-    if (lockStat.isSymbolicLink()) {
-      return {
-        hasLock: true,
-        isValid: false,
-        isSymlink: true,
-        owner: null,
-        lockDirPath,
-        errors: ['Lock directory is a symbolic link'],
-      };
-    }
-    if (!lockStat.isDirectory()) {
-      return {
-        hasLock: true,
-        isValid: false,
-        isSymlink: false,
-        owner: null,
-        lockDirPath,
-        errors: ['Lock path exists but is not a directory'],
-      };
-    }
+  // Check owner metadata with explicit lstat
+  const ownerCheck = getPathLstat(ownerPath);
+  if (ownerCheck.error) {
+    return {
+      hasLock: true,
+      isValid: false,
+      isSymlink: false,
+      owner: null,
+      lockDirPath,
+      errors: [`Filesystem error checking owner metadata: ${ownerCheck.error.message}`],
+    };
+  }
 
-    // Check owner metadata
-    if (!fs.existsSync(ownerPath)) {
-      return {
-        hasLock: true,
-        isValid: false,
-        isSymlink: false,
-        owner: null,
-        lockDirPath,
-        errors: ['Lock owner metadata file (owner.json) is missing'],
-      };
-    }
+  if (!ownerCheck.exists) {
+    return {
+      hasLock: true,
+      isValid: false,
+      isSymlink: false,
+      owner: null,
+      lockDirPath,
+      errors: ['Lock owner metadata file (owner.json) is missing', ...errors],
+    };
+  }
 
-    const ownerStat = fs.lstatSync(ownerPath);
-    if (ownerStat.isSymbolicLink()) {
-      return {
-        hasLock: true,
-        isValid: false,
-        isSymlink: false,
-        owner: null,
-        lockDirPath,
-        errors: ['Lock owner file is a symbolic link'],
-      };
-    }
-    if (!ownerStat.isFile()) {
-      return {
-        hasLock: true,
-        isValid: false,
-        isSymlink: false,
-        owner: null,
-        lockDirPath,
-        errors: ['Lock owner path is not a regular file'],
-      };
-    }
+  if (ownerCheck.isSymbolicLink) {
+    return {
+      hasLock: true,
+      isValid: false,
+      isSymlink: true,
+      owner: null,
+      lockDirPath,
+      errors: ['Lock owner file is a symbolic link', ...errors],
+    };
+  }
 
+  if (!ownerCheck.isFile) {
+    return {
+      hasLock: true,
+      isValid: false,
+      isSymlink: false,
+      owner: null,
+      lockDirPath,
+      errors: ['Lock owner path is not a regular file', ...errors],
+    };
+  }
+
+  try {
     const raw = fs.readFileSync(ownerPath, 'utf8');
     let parsed;
     try {
@@ -270,7 +362,7 @@ export function inspectLock(repoRoot) {
         isSymlink: false,
         owner: null,
         lockDirPath,
-        errors: [`Lock owner metadata contains invalid JSON: ${parseErr.message}`],
+        errors: [`Lock owner metadata contains invalid JSON: ${parseErr.message}`, ...errors],
       };
     }
 
@@ -282,7 +374,18 @@ export function inspectLock(repoRoot) {
         isSymlink: false,
         owner: parsed,
         lockDirPath,
-        errors: val.errors,
+        errors: [...val.errors, ...errors],
+      };
+    }
+
+    if (errors.length > 0) {
+      return {
+        hasLock: true,
+        isValid: false,
+        isSymlink: false,
+        owner: parsed,
+        lockDirPath,
+        errors,
       };
     }
 
@@ -296,12 +399,12 @@ export function inspectLock(repoRoot) {
     };
   } catch (err) {
     return {
-      hasLock: false,
+      hasLock: true,
       isValid: false,
       isSymlink: false,
       owner: null,
       lockDirPath,
-      errors: [`Filesystem error inspecting lock: ${err.message}`],
+      errors: [`Filesystem error reading lock owner: ${err.message}`],
     };
   }
 }
@@ -343,6 +446,7 @@ export function acquireLock(options = {}) {
     return { ok: false, error: 'unsafe-path', reason: patchDirRes.error };
   }
 
+  const ciPatchDir = patchDirRes.path;
   const lockDirPath = getLockDirPath(repoRoot);
   const ownerPath = getLockOwnerPath(repoRoot);
 
@@ -404,6 +508,14 @@ export function acquireLock(options = {}) {
       fs.closeSync(dirFd);
     }
 
+    // Sync containing .ci-patch directory to guarantee directory entry persistence
+    const parentFd = fs.openSync(ciPatchDir, 'r');
+    try {
+      fs.fsyncSync(parentFd);
+    } finally {
+      fs.closeSync(parentFd);
+    }
+
     return {
       ok: true,
       lock: {
@@ -425,6 +537,7 @@ export function acquireLock(options = {}) {
 /**
  * Release an installer lock under positive ownership verification.
  * Refuses to release foreign, corrupted, or unverified locks.
+ * Refuses cleanup if unexpected files exist in lock.d.
  *
  * @param {object} options
  * @param {string} options.repoRoot
@@ -444,6 +557,25 @@ export function releaseLock(options = {}) {
     return { ok: false, error: 'no-lock', reason: 'No lock exists to release' };
   }
 
+  // Inspect exact contents of lock.d directory before proceeding with release
+  try {
+    const lockEntries = fs.readdirSync(inspection.lockDirPath);
+    const unexpected = lockEntries.filter((e) => e !== LOCK_OWNER_FILE);
+    if (unexpected.length > 0) {
+      return {
+        ok: false,
+        error: 'unexpected-lock-contents',
+        reason: `Cannot release lock: lock directory contains unexpected entries: ${unexpected.join(', ')}`,
+      };
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'fs-error',
+      reason: `Failed to inspect lock directory contents before release: ${err.message}`,
+    };
+  }
+
   if (!inspection.isValid || !inspection.owner) {
     return {
       ok: false,
@@ -457,6 +589,14 @@ export function releaseLock(options = {}) {
       ok: false,
       error: 'ownership-mismatch',
       reason: `Cannot release lock: owned by transaction "${inspection.owner.txId}", not "${txId}"`,
+    };
+  }
+
+  if (path.resolve(repoRoot) !== path.resolve(inspection.owner.repoRoot)) {
+    return {
+      ok: false,
+      error: 'ownership-mismatch',
+      reason: 'Cannot release lock: repository root mismatch',
     };
   }
 
@@ -480,15 +620,44 @@ export function releaseLock(options = {}) {
   const lockDirPath = inspection.lockDirPath;
   const ownerPath = getLockOwnerPath(repoRoot);
 
+  // Inspect exact contents of lock.d directory before deletion
   try {
-    if (fs.existsSync(ownerPath)) {
+    const lockEntries = fs.readdirSync(lockDirPath);
+    const unexpected = lockEntries.filter((e) => e !== LOCK_OWNER_FILE);
+    if (unexpected.length > 0) {
+      return {
+        ok: false,
+        error: 'unexpected-lock-contents',
+        reason: `Cannot release lock: lock directory contains unexpected entries: ${unexpected.join(', ')}`,
+      };
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'fs-error',
+      reason: `Failed to inspect lock directory contents before release: ${err.message}`,
+    };
+  }
+
+  const ownerCheck = getPathLstat(ownerPath);
+  if (ownerCheck.isSymbolicLink) {
+    return {
+      ok: false,
+      error: 'unverified-lock',
+      reason: 'Cannot release lock: lock owner file is a symbolic link',
+    };
+  }
+
+  try {
+    if (ownerCheck.exists) {
       fs.unlinkSync(ownerPath);
     }
     fs.rmdirSync(lockDirPath);
 
     // Sync containing .ci-patch directory
     const ciPatchDir = getCiPatchDir(repoRoot);
-    if (fs.existsSync(ciPatchDir)) {
+    const dirCheck = getPathLstat(ciPatchDir);
+    if (dirCheck.exists && dirCheck.isDirectory && !dirCheck.isSymbolicLink) {
       const dirFd = fs.openSync(ciPatchDir, 'r');
       try {
         fs.fsyncSync(dirFd);
