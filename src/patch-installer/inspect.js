@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import * as defaultGitOps from './git-ops.js';
 import { verifyPatchManifest } from '../../scripts/verify-sillytavern-patches.mjs';
+import { inspectTransactionState } from './transaction-state.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -111,6 +112,18 @@ export function classifyTargetState(observations, manifest) {
       isReleaseCommit: false,
       developerBranch: null,
       reasons: ['Target file is a symbolic link, which is not permitted'],
+    };
+  }
+
+  if (observations.transaction?.state === 'unsafe-symlink') {
+    return {
+      status: 'invalid-installation',
+      targetFileState: 'unsafe',
+      isReleaseCommit: false,
+      developerBranch: null,
+      reasons: observations.transaction.reasons.length > 0
+        ? observations.transaction.reasons
+        : ['Installer directory (.ci-patch) contains a symbolic link'],
     };
   }
 
@@ -478,6 +491,22 @@ export async function inspectTargetInstallation(options = {}) {
     }
   }
 
+  // 6. Transaction state inspection
+  let transaction = {
+    state: 'none',
+    hasLock: false,
+    hasJournal: false,
+    isPending: false,
+    lock: null,
+    journal: null,
+    foreignEntries: [],
+    reasons: [],
+  };
+
+  if (isRepoRoot && repoRoot) {
+    transaction = inspectTransactionState(repoRoot);
+  }
+
   const observations = {
     packageValid,
     packageErrors,
@@ -499,6 +528,7 @@ export async function inspectTargetInstallation(options = {}) {
     worktreeSha256,
     unrelatedChangesCount,
     developerBranches,
+    transaction,
   };
 
   const classification = classifyTargetState(observations, manifest || {});
@@ -506,6 +536,7 @@ export async function inspectTargetInstallation(options = {}) {
   return {
     ok: classification.status !== 'invalid-installation' && classification.status !== 'invalid-package',
     status: classification.status,
+    transaction,
     targetDir,
     repoRoot,
     headCommit,
@@ -545,6 +576,25 @@ export async function inspectTargetInstallation(options = {}) {
 export async function checkInstallationPreflight(options = {}) {
   const gitOps = defaultGitOps;
   const inspection = await inspectTargetInstallation(options);
+
+  // If transaction metadata is pending or ambiguous: refuse immediately
+  if (inspection.transaction && inspection.transaction.isPending) {
+    const txState = inspection.transaction.state;
+    const txReasonStr =
+      inspection.transaction.reasons.length > 0
+        ? inspection.transaction.reasons.join('; ')
+        : `Transaction state is "${txState}"`;
+    return {
+      ok: false,
+      verdict: 'refused',
+      exitCode: 1,
+      canApply: false,
+      alreadyApplied: false,
+      reason: `Operation refused: installer transaction is pending or ambiguous (${txState}): ${txReasonStr}`,
+      dryRunPassed: null,
+      inspection,
+    };
+  }
 
   // If already installed:
   if (inspection.status === 'installed') {

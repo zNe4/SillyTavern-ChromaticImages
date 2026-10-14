@@ -141,6 +141,29 @@ function formatStatusOutput(inspection) {
     lines.push(`  Developer Branch:    ${inspection.developerBranch.branch} (${inspection.developerBranch.commit.slice(0, 9)})`);
   }
 
+  if (inspection.transaction && inspection.transaction.state !== 'none') {
+    lines.push(`  Transaction State:   ${inspection.transaction.state}`);
+    if (inspection.transaction.hasLock) {
+      const o = inspection.transaction.lock?.owner;
+      if (o) {
+        lines.push(`  Lock Details:        txId=${o.txId}, pid=${o.pid}, host=${o.hostname}, op=${o.op}`);
+      } else {
+        lines.push(`  Lock Details:        (present but unverified or corrupted)`);
+      }
+    }
+    if (inspection.transaction.hasJournal) {
+      const j = inspection.transaction.journal?.journal;
+      if (j) {
+        lines.push(`  Journal Details:     phase=${j.phase}, txId=${j.txId}, op=${j.op}`);
+      } else {
+        lines.push(`  Journal Details:     (present but unverified or corrupted)`);
+      }
+    }
+    if (inspection.transaction.foreignEntries?.length > 0) {
+      lines.push(`  Foreign Files:       ${inspection.transaction.foreignEntries.join(', ')}`);
+    }
+  }
+
   if (inspection.reasons && inspection.reasons.length > 0) {
     lines.push(`  Details:`);
     for (const r of inspection.reasons) {
@@ -168,6 +191,10 @@ function formatCheckOutput(preflight) {
 
   if (preflight.dryRunPassed !== null) {
     lines.push(`  Patch Dry-Run:       ${preflight.dryRunPassed ? 'PASSED' : 'FAILED'}`);
+  }
+
+  if (preflight.inspection?.transaction && preflight.inspection.transaction.state !== 'none') {
+    lines.push(`  Transaction State:   ${preflight.inspection.transaction.state}`);
   }
 
   return lines.join('\n');
@@ -204,6 +231,7 @@ export async function main(argv = process.argv.slice(2)) {
         command: 'check',
         verdict: preflight.verdict,
         status: preflight.inspection.status,
+        transaction: preflight.inspection.transaction,
         canApply: preflight.canApply,
         alreadyApplied: preflight.alreadyApplied,
         exitCode: preflight.exitCode,
@@ -237,6 +265,7 @@ export async function main(argv = process.argv.slice(2)) {
       command: 'status',
       status: inspection.status,
       exitCode: statusExitCode,
+      transaction: inspection.transaction,
       targetDir: inspection.targetDir,
       repoRoot: inspection.repoRoot,
       headCommit: inspection.headCommit,
