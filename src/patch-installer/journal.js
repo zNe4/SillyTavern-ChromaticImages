@@ -6,6 +6,7 @@ import {
   ensureCiPatchDir,
   inspectLock,
   getPathLstat,
+  validateLease,
 } from './lock.js';
 
 export const JOURNAL_SCHEMA_VERSION = '1.0.0';
@@ -58,22 +59,41 @@ export function getJournalPath(repoRoot) {
 }
 
 /**
- * Verify lock ownership before allowing any journal mutation.
- * Verifies active lock presence, validity, txId, op, and repoRoot.
+ * Verify lock ownership and lease capability before allowing any journal mutation.
+ * Verifies caller lease capability, active lock presence, validity, txId, op, PID, and repoRoot.
  *
  * @param {string} repoRoot
  * @param {string} txId
  * @param {'apply' | 'remove'} expectedOp
- * @param {object} [callerOwner]
- * @returns {{ ok: boolean, error?: string, reason?: string, lockOwner?: object }}
+ * @param {import('./lock.js').TransactionLease} [lease]
+ * @returns {{ ok: boolean, error?: string, reason?: string, lockOwner?: object, lease?: object }}
  */
-export function verifyLockOwnershipForMutation(repoRoot, txId, expectedOp, callerOwner = null) {
+export function verifyLockOwnershipForMutation(repoRoot, txId, expectedOp, lease = null) {
+  if (lease) {
+    const leaseAuth = validateLease(lease, repoRoot, txId, expectedOp);
+    if (!leaseAuth.ok) {
+      return {
+        ok: false,
+        error: leaseAuth.error,
+        reason: `Journal mutation unauthorized: ${leaseAuth.reason}`,
+      };
+    }
+  }
+
   const lockInspection = inspectLock(repoRoot);
   if (!lockInspection.hasLock) {
     return {
       ok: false,
       error: 'no-lock',
       reason: 'Cannot mutate journal without an active exclusive lock',
+    };
+  }
+
+  if (!lease) {
+    return {
+      ok: false,
+      error: 'lease-required',
+      reason: 'Cannot mutate journal without the active acquisition lease',
     };
   }
   if (!lockInspection.isValid || !lockInspection.owner) {
@@ -104,24 +124,15 @@ export function verifyLockOwnershipForMutation(repoRoot, txId, expectedOp, calle
       reason: 'Lock repository path mismatch',
     };
   }
-  if (callerOwner) {
-    if (callerOwner.pid && lockInspection.owner.pid !== callerOwner.pid) {
-      return {
-        ok: false,
-        error: 'lock-ownership-mismatch',
-        reason: `PID mismatch with lock owner (${lockInspection.owner.pid} vs ${callerOwner.pid})`,
-      };
-    }
-    if (callerOwner.hostname && lockInspection.owner.hostname !== callerOwner.hostname) {
-      return {
-        ok: false,
-        error: 'lock-ownership-mismatch',
-        reason: `Hostname mismatch with lock owner (${lockInspection.owner.hostname})`,
-      };
-    }
+  if (lockInspection.owner.pid !== process.pid) {
+    return {
+      ok: false,
+      error: 'ownership-mismatch',
+      reason: `Lock owner PID (${lockInspection.owner.pid}) does not match current process (${process.pid})`,
+    };
   }
 
-  return { ok: true, lockOwner: lockInspection.owner };
+  return { ok: true, lockOwner: lockInspection.owner, lease };
 }
 
 /**
@@ -369,25 +380,27 @@ export function inspectJournal(repoRoot) {
 }
 
 /**
- * Atomically write and flush journal to disk with distinct pre-rename and post-rename error handling.
+ * Atomically write and flush journal to disk with distinct pre-publication and post-publication error handling.
+ * Employs atomic no-replace publication via same-directory hard link (link(2)) for initial creation.
+ * Employs atomic replacement via rename(2) for later phase updates.
  *
  * @param {string} repoRoot
  * @param {object} journal
  * @param {boolean} [isCreation=false]
- * @returns {{ ok: boolean, error?: string, stage?: 'pre-rename' | 'post-rename', journal?: object }}
+ * @returns {{ ok: boolean, error?: string, stage?: 'pre-publication' | 'post-publication', journal?: object }}
  */
 function writeJournalDurable(repoRoot, journal, isCreation = false) {
   const ciPatchDir = getCiPatchDir(repoRoot);
   const journalPath = getJournalPath(repoRoot);
   const tmpJournalPath = path.join(ciPatchDir, `.journal.${journal.txId}.tmp`);
 
-  // If this is initial creation, ensure destination doesn't exist
+  // If this is initial creation, ensure destination doesn't exist before starting
   if (isCreation) {
     const jCheck = getPathLstat(journalPath);
     if (jCheck.exists) {
       return {
         ok: false,
-        stage: 'pre-rename',
+        stage: 'pre-publication',
         error: 'Cannot create journal: a journal already exists on disk',
       };
     }
@@ -409,7 +422,6 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
       fs.closeSync(tmpFd);
     }
   } catch (writeErr) {
-    // Cleanup temporary file if it was created
     try {
       if (getPathLstat(tmpJournalPath).exists) {
         fs.unlinkSync(tmpJournalPath);
@@ -419,65 +431,139 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
     }
     return {
       ok: false,
-      stage: 'pre-rename',
-      error: `Failed to prepare journal update before rename: ${writeErr.message}`,
+      stage: isCreation ? 'pre-publication' : 'pre-rename',
+      error: `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${writeErr.message}`,
     };
   }
 
-  // 2. Pre-rename check for concurrent creation
   if (isCreation) {
-    const doubleCheck = getPathLstat(journalPath);
-    if (doubleCheck.exists) {
-      try { fs.unlinkSync(tmpJournalPath); } catch { /* ignore */ }
+    // ATOMIC NO-REPLACE PUBLICATION VIA HARD LINK (link(2))
+    // link(2) is guaranteed by POSIX / Linux to fail with EEXIST if destination already exists.
+    try {
+      fs.linkSync(tmpJournalPath, journalPath);
+    } catch (linkErr) {
+      try {
+        if (getPathLstat(tmpJournalPath).exists) {
+          fs.unlinkSync(tmpJournalPath);
+        }
+      } catch {
+        // ignore
+      }
+
+      if (linkErr.code === 'EEXIST') {
+        return {
+          ok: false,
+          stage: 'pre-publication',
+          error: 'Cannot create journal: destination journal.json already exists (atomic publication collision)',
+        };
+      }
+
+      if (linkErr.code === 'EXDEV' || linkErr.code === 'ENOTSUP' || linkErr.code === 'EPERM') {
+        return {
+          ok: false,
+          stage: 'pre-publication',
+          error: `Atomic no-replace journal publication unsupported on this filesystem (${linkErr.code}): ${linkErr.message}`,
+        };
+      }
+
+      return {
+        ok: false,
+        stage: 'pre-publication',
+        error: `Failed to publish journal atomically: ${linkErr.message}`,
+      };
+    }
+
+    // --- AT THIS POINT, journalPath IS PUBLISHED AND VISIBLE ON DISK ---
+
+    // 1. Directory sync to flush new directory entry
+    try {
+      const dirFd = fs.openSync(ciPatchDir, 'r');
+      try {
+        fs.fsyncSync(dirFd);
+      } finally {
+        fs.closeSync(dirFd);
+      }
+    } catch (syncErr) {
+      return {
+        ok: false,
+        stage: 'post-publication',
+        error: `Journal published on disk but initial directory synchronization failed: ${syncErr.message}`,
+        journal,
+      };
+    }
+
+    // 2. Remove the temporary link name
+    try {
+      fs.unlinkSync(tmpJournalPath);
+    } catch (unlinkErr) {
+      return {
+        ok: false,
+        stage: 'post-publication',
+        error: `Journal published on disk but removing temporary link failed: ${unlinkErr.message}`,
+        journal,
+      };
+    }
+
+    // 3. Directory sync to flush temporary entry removal
+    try {
+      const dirFd = fs.openSync(ciPatchDir, 'r');
+      try {
+        fs.fsyncSync(dirFd);
+      } finally {
+        fs.closeSync(dirFd);
+      }
+    } catch (syncErr) {
+      return {
+        ok: false,
+        stage: 'post-publication',
+        error: `Journal published on disk but post-cleanup directory synchronization failed: ${syncErr.message}`,
+        journal,
+      };
+    }
+
+    return { ok: true, journal };
+  } else {
+    // PHASE UPDATE: ATOMIC REPLACEMENT VIA rename(2)
+    try {
+      fs.renameSync(tmpJournalPath, journalPath);
+    } catch (renameErr) {
+      try {
+        if (getPathLstat(tmpJournalPath).exists) {
+          fs.unlinkSync(tmpJournalPath);
+        }
+      } catch {
+        // ignore
+      }
       return {
         ok: false,
         stage: 'pre-rename',
-        error: 'Cannot create journal: a journal was created concurrently',
+        error: `Failed to replace journal atomically: ${renameErr.message}`,
       };
     }
-  }
 
-  // 3. Atomic rename
-  try {
-    fs.renameSync(tmpJournalPath, journalPath);
-  } catch (renameErr) {
+    // Directory sync post-rename
     try {
-      if (getPathLstat(tmpJournalPath).exists) {
-        fs.unlinkSync(tmpJournalPath);
+      const dirFd = fs.openSync(ciPatchDir, 'r');
+      try {
+        fs.fsyncSync(dirFd);
+      } finally {
+        fs.closeSync(dirFd);
       }
-    } catch {
-      // ignore
+    } catch (syncErr) {
+      return {
+        ok: false,
+        stage: 'post-rename',
+        error: `Journal updated on disk but directory synchronization failed: ${syncErr.message}`,
+        journal,
+      };
     }
-    return {
-      ok: false,
-      stage: 'pre-rename',
-      error: `Failed to replace journal atomically: ${renameErr.message}`,
-    };
-  }
 
-  // 4. Directory fsync (post-rename stage)
-  try {
-    const dirFd = fs.openSync(ciPatchDir, 'r');
-    try {
-      fs.fsyncSync(dirFd);
-    } finally {
-      fs.closeSync(dirFd);
-    }
-  } catch (syncErr) {
-    // The journal rename ALREADY succeeded on disk!
-    return {
-      ok: false,
-      stage: 'post-rename',
-      error: `Journal updated on disk but directory synchronization failed: ${syncErr.message}`,
-      journal,
-    };
+    return { ok: true, journal };
   }
-
-  return { ok: true, journal };
 }
 
 /**
- * Create a new journal under verified exclusive lock ownership.
+ * Create a new journal under verified exclusive lock ownership and lease capability.
  * Begins strictly in phase 'LOCKED'.
  *
  * @param {object} options
@@ -488,8 +574,8 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
  * @param {string} options.expectedInitialSha256
  * @param {string} options.expectedResultSha256
  * @param {object} [options.extraMetadata]
- * @param {object} [options.callerOwner]
- * @returns {{ ok: boolean, error?: string, journal?: object }}
+ * @param {import('./lock.js').TransactionLease} [options.lease]
+ * @returns {{ ok: boolean, error?: string, stage?: string, journal?: object }}
  */
 export function createJournal(options = {}) {
   const {
@@ -500,17 +586,17 @@ export function createJournal(options = {}) {
     expectedInitialSha256,
     expectedResultSha256,
     extraMetadata = {},
-    callerOwner = null,
+    lease = null,
   } = options;
 
   if (!repoRoot || !txId || !op || !targetFile || !expectedInitialSha256 || !expectedResultSha256) {
     return { ok: false, error: 'Missing required options to create journal' };
   }
 
-  // 1. POSITIVE VERIFICATION OF EXCLUSIVE LOCK OWNERSHIP
-  const lockAuth = verifyLockOwnershipForMutation(repoRoot, txId, op, callerOwner);
+  // 1. POSITIVE VERIFICATION OF EXCLUSIVE LOCK OWNERSHIP AND LEASE CAPABILITY
+  const lockAuth = verifyLockOwnershipForMutation(repoRoot, txId, op, lease);
   if (!lockAuth.ok) {
-    return { ok: false, error: lockAuth.reason || lockAuth.error };
+    return { ok: false, error: lockAuth.reason || lockAuth.error, code: lockAuth.error, reason: lockAuth.reason };
   }
 
   // 2. Prevent overriding immutable or forbidden fields
@@ -553,17 +639,18 @@ export function createJournal(options = {}) {
 /**
  * Advance an existing journal to a new permitted phase under exclusive lock ownership verification.
  * Strictly prevents overriding immutable fields or bypassing phase transitions.
+ * Strictly requires the acquisition lease capability.
  *
  * @param {object} options
  * @param {string} options.repoRoot
  * @param {string} options.txId
  * @param {string} options.nextPhase
  * @param {object} [options.metadataUpdate]
- * @param {object} [options.callerOwner]
+ * @param {import('./lock.js').TransactionLease} [options.lease]
  * @returns {{ ok: boolean, error?: string, stage?: string, journal?: object }}
  */
 export function advanceJournalPhase(options = {}) {
-  const { repoRoot, txId, nextPhase, metadataUpdate = {}, callerOwner = null } = options;
+  const { repoRoot, txId, nextPhase, metadataUpdate = {}, lease = null } = options;
 
   if (!repoRoot || !txId || !nextPhase) {
     return { ok: false, error: 'repoRoot, txId, and nextPhase are required' };
@@ -587,10 +674,10 @@ export function advanceJournalPhase(options = {}) {
     };
   }
 
-  // 1. POSITIVE VERIFICATION OF EXCLUSIVE LOCK OWNERSHIP
-  const lockAuth = verifyLockOwnershipForMutation(repoRoot, txId, inspection.journal.op, callerOwner);
+  // 1. POSITIVE VERIFICATION OF EXCLUSIVE LOCK OWNERSHIP AND LEASE CAPABILITY
+  const lockAuth = verifyLockOwnershipForMutation(repoRoot, txId, inspection.journal.op, lease);
   if (!lockAuth.ok) {
-    return { ok: false, error: lockAuth.reason || lockAuth.error };
+    return { ok: false, error: lockAuth.reason || lockAuth.error, code: lockAuth.error, reason: lockAuth.reason };
   }
 
   // 2. Prevent overriding immutable identity or phase fields via metadataUpdate
@@ -629,17 +716,18 @@ export function advanceJournalPhase(options = {}) {
 }
 
 /**
- * Remove an existing completed journal under exclusive lock ownership verification.
+ * Remove an existing completed journal under exclusive lock ownership and lease verification.
+ * Strictly requires the acquisition lease capability.
  *
  * @param {object} options
  * @param {string} options.repoRoot
  * @param {string} options.txId
  * @param {boolean} [options.allowIncomplete=false]
- * @param {object} [options.callerOwner]
+ * @param {import('./lock.js').TransactionLease} [options.lease]
  * @returns {{ ok: boolean, error?: string }}
  */
 export function removeJournal(options = {}) {
-  const { repoRoot, txId, allowIncomplete = false, callerOwner = null } = options;
+  const { repoRoot, txId, allowIncomplete = false, lease = null, callerOwner = null } = options;
 
   if (!repoRoot || !txId) {
     return { ok: false, error: 'repoRoot and txId are required to remove journal' };
@@ -663,10 +751,27 @@ export function removeJournal(options = {}) {
     };
   }
 
-  // POSITIVE VERIFICATION OF EXCLUSIVE LOCK OWNERSHIP
-  const lockAuth = verifyLockOwnershipForMutation(repoRoot, txId, inspection.journal.op, callerOwner);
+  // POSITIVE VERIFICATION OF EXCLUSIVE LOCK OWNERSHIP AND LEASE CAPABILITY
+  const lockAuth = verifyLockOwnershipForMutation(repoRoot, txId, inspection.journal.op, lease);
   if (!lockAuth.ok) {
-    return { ok: false, error: lockAuth.reason || lockAuth.error };
+    return { ok: false, error: lockAuth.reason || lockAuth.error, code: lockAuth.error, reason: lockAuth.reason };
+  }
+
+  if (callerOwner && typeof callerOwner === 'object') {
+    if (callerOwner.pid !== undefined && callerOwner.pid !== lockAuth.lockOwner.pid) {
+      return {
+        ok: false,
+        error: `Cannot remove journal: PID mismatch (owned by ${lockAuth.lockOwner.pid}, caller specified ${callerOwner.pid})`,
+        code: 'ownership-mismatch',
+      };
+    }
+    if (callerOwner.hostname && callerOwner.hostname !== lockAuth.lockOwner.hostname) {
+      return {
+        ok: false,
+        error: `Cannot remove journal: hostname mismatch (owned by ${lockAuth.lockOwner.hostname}, caller specified ${callerOwner.hostname})`,
+        code: 'ownership-mismatch',
+      };
+    }
   }
 
   if (inspection.journal.phase !== 'COMPLETED' && !allowIncomplete) {

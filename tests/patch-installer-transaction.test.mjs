@@ -12,6 +12,8 @@ import {
   validateLockOwner,
   validateCiPatchPath,
   LOCK_SCHEMA_VERSION,
+  TransactionLease,
+  validateLease,
 } from '../src/patch-installer/lock.js';
 
 import {
@@ -124,12 +126,13 @@ describe('Installer Lock Primitives (lock.js)', () => {
     const repo = createTempDir('lock-release-clean-');
     const txId = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId, op: 'apply', pid: 9999, hostname: 'host-a' });
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply', hostname: 'host-a' });
 
     const releaseRes = releaseLock({
       repoRoot: repo,
       txId,
-      expectedOwner: { pid: 9999, hostname: 'host-a' },
+      lease,
+      expectedOwner: { pid: process.pid, hostname: 'host-a' },
     });
 
     assert.equal(releaseRes.ok, true);
@@ -139,25 +142,30 @@ describe('Installer Lock Primitives (lock.js)', () => {
     assert.equal(fs.existsSync(path.join(repo, '.ci-patch/lock.d')), false);
   });
 
-  test('releaseLock refuses to release foreign lock with ownership-mismatch', () => {
+  test('releaseLock refuses to release foreign lock with ownership-mismatch and requires lease', () => {
     const repo = createTempDir('lock-foreign-release-');
     const txOwner = generateTxId();
     const txOther = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId: txOwner, op: 'apply', pid: 1111, hostname: 'host-1' });
+    const { lease } = acquireLock({ repoRoot: repo, txId: txOwner, op: 'apply', hostname: 'host-1' });
 
-    // Different txId
-    const res1 = releaseLock({ repoRoot: repo, txId: txOther });
+    // Calling releaseLock without lease fails closed
+    const resNoLease = releaseLock({ repoRoot: repo, txId: txOwner });
+    assert.equal(resNoLease.ok, false);
+    assert.equal(resNoLease.error, 'lease-required');
+
+    // Different txId with foreign lease
+    const res1 = releaseLock({ repoRoot: repo, txId: txOther, lease });
     assert.equal(res1.ok, false);
-    assert.equal(res1.error, 'ownership-mismatch');
+    assert.match(res1.error, /(lease-tx-mismatch|ownership-mismatch)/);
 
-    // Mismatched PID
-    const res2 = releaseLock({ repoRoot: repo, txId: txOwner, expectedOwner: { pid: 2222 } });
+    // Mismatched PID in expectedOwner
+    const res2 = releaseLock({ repoRoot: repo, txId: txOwner, lease, expectedOwner: { pid: 99999 } });
     assert.equal(res2.ok, false);
     assert.equal(res2.error, 'ownership-mismatch');
 
     // Mismatched hostname
-    const res3 = releaseLock({ repoRoot: repo, txId: txOwner, expectedOwner: { hostname: 'host-2' } });
+    const res3 = releaseLock({ repoRoot: repo, txId: txOwner, lease, expectedOwner: { hostname: 'host-2' } });
     assert.equal(res3.ok, false);
     assert.equal(res3.error, 'ownership-mismatch');
 
@@ -210,13 +218,13 @@ describe('Installer Lock Primitives (lock.js)', () => {
     const repo = createTempDir('lock-release-unexpected-');
     const txId = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
     const lockDir = path.join(repo, '.ci-patch/lock.d');
     const unexpectedFile = path.join(lockDir, 'foreign.txt');
     fs.writeFileSync(unexpectedFile, 'unauthorized file in lock.d\n');
 
-    const res = releaseLock({ repoRoot: repo, txId });
+    const res = releaseLock({ repoRoot: repo, txId, lease });
     assert.equal(res.ok, false);
     assert.equal(res.error, 'unexpected-lock-contents');
     assert.match(res.reason, /unexpected entries: foreign\.txt/);
@@ -227,7 +235,7 @@ describe('Installer Lock Primitives (lock.js)', () => {
 
     // After removing unexpected entry, release succeeds
     fs.unlinkSync(unexpectedFile);
-    const retryRes = releaseLock({ repoRoot: repo, txId });
+    const retryRes = releaseLock({ repoRoot: repo, txId, lease });
     assert.equal(retryRes.ok, true);
     assert.equal(fs.existsSync(lockDir), false);
   });
@@ -241,7 +249,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
     const repo = createTempDir('journal-create-');
     const txId = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
     const res = createJournal({
       repoRoot: repo,
@@ -250,6 +258,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
 
     assert.equal(res.ok, true);
@@ -269,7 +278,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
     const repo = createTempDir('journal-exists-');
     const txId = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
     createJournal({
       repoRoot: repo,
@@ -278,19 +287,21 @@ describe('Installer Journal Primitives (journal.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
 
     const res2 = createJournal({
       repoRoot: repo,
-      txId: generateTxId(),
+      txId,
       op: 'apply',
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
 
     assert.equal(res2.ok, false);
-    assert.match(res2.error, /(already present|Lock belongs to transaction)/);
+    assert.match(res2.error, /(already present|already exists)/);
   });
 
   test('createJournal enforces lock ownership and rejects unauthenticated callers', () => {
@@ -311,9 +322,22 @@ describe('Installer Journal Primitives (journal.js)', () => {
     assert.match(resNoLock.error, /Cannot mutate journal without an active exclusive lock/);
 
     // Acquire lock for tx1 on repo with op: apply
-    acquireLock({ repoRoot: repo, txId: tx1, op: 'apply', pid: 12345, hostname: 'host-1' });
+    const { lease } = acquireLock({ repoRoot: repo, txId: tx1, op: 'apply', hostname: 'host-1' });
 
-    // 2. Caller txId mismatch
+    // 2. Calling without lease fails closed
+    const resNoLease = createJournal({
+      repoRoot: repo,
+      txId: tx1,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+    });
+    assert.equal(resNoLease.ok, false);
+    assert.equal(resNoLease.code, 'lease-required');
+    assert.match(resNoLease.error, /Cannot mutate journal without the active acquisition lease/);
+
+    // 3. Caller txId mismatch
     const resTxMismatch = createJournal({
       repoRoot: repo,
       txId: tx2,
@@ -321,11 +345,13 @@ describe('Installer Journal Primitives (journal.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
     assert.equal(resTxMismatch.ok, false);
-    assert.match(resTxMismatch.error, /Lock belongs to transaction/);
+    assert.equal(resTxMismatch.code, 'lease-tx-mismatch');
+    assert.match(resTxMismatch.error, /Transaction lease txId mismatch/);
 
-    // 3. Operation mismatch
+    // 4. Operation mismatch
     const resOpMismatch = createJournal({
       repoRoot: repo,
       txId: tx1,
@@ -333,11 +359,13 @@ describe('Installer Journal Primitives (journal.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
     assert.equal(resOpMismatch.ok, false);
-    assert.match(resOpMismatch.error, /does not match journal operation/);
+    assert.equal(resOpMismatch.code, 'lease-op-mismatch');
+    assert.match(resOpMismatch.error, /Transaction lease operation mismatch/);
 
-    // 4. Repo mismatch
+    // 5. Repo mismatch
     const otherRepo = createTempDir('journal-other-repo-');
     const resRepoMismatch = createJournal({
       repoRoot: otherRepo,
@@ -346,22 +374,11 @@ describe('Installer Journal Primitives (journal.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
     assert.equal(resRepoMismatch.ok, false);
-    assert.match(resRepoMismatch.error, /Cannot mutate journal without an active exclusive lock/);
-
-    // 5. CallerOwner PID mismatch
-    const resPidMismatch = createJournal({
-      repoRoot: repo,
-      txId: tx1,
-      op: 'apply',
-      targetFile: 'src/endpoints/stable-diffusion.js',
-      expectedInitialSha256: stockSha,
-      expectedResultSha256: patchedSha,
-      callerOwner: { pid: 99999 },
-    });
-    assert.equal(resPidMismatch.ok, false);
-    assert.match(resPidMismatch.error, /PID mismatch/);
+    assert.equal(resRepoMismatch.code, 'lease-repo-mismatch');
+    assert.match(resRepoMismatch.error, /Transaction lease repository (root|path) mismatch/);
 
     // 6. Valid call succeeds
     const resValid = createJournal({
@@ -371,7 +388,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
-      callerOwner: { pid: 12345, hostname: 'host-1' },
+      lease,
     });
     assert.equal(resValid.ok, true);
   });
@@ -380,7 +397,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
     const repo = createTempDir('journal-immutable-create-');
     const txId = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
     // Attempt to override phase at creation
     const resPhase = createJournal({
@@ -391,6 +408,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
       extraMetadata: { phase: 'COMPLETED' },
+      lease,
     });
     assert.equal(resPhase.ok, false);
     assert.match(resPhase.error, /Cannot create with forbidden journal field: "phase"/);
@@ -404,6 +422,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
       extraMetadata: { txId: 'other-id' },
+      lease,
     });
     assert.equal(resTxId.ok, false);
     assert.match(resTxId.error, /Cannot create with forbidden journal field: "txId"/);
@@ -417,6 +436,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
       extraMetadata: { schemaVersion: '9.9.9' },
+      lease,
     });
     assert.equal(resSchema.ok, false);
     assert.match(resSchema.error, /Cannot create with forbidden journal field: "schemaVersion"/);
@@ -430,6 +450,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
       extraMetadata: { arbitraryKey: 'not-allowed' },
+      lease,
     });
     assert.equal(resDisallowed.ok, false);
     assert.match(resDisallowed.error, /Disallowed auxiliary journal field/);
@@ -439,7 +460,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
     const repo = createTempDir('journal-phases-');
     const txId = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
     createJournal({
       repoRoot: repo,
@@ -448,36 +469,37 @@ describe('Installer Journal Primitives (journal.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
 
     // Illegal jump: LOCKED -> READY_TO_SWAP
-    const illegalJump = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP' });
+    const illegalJump = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP', lease });
     assert.equal(illegalJump.ok, false);
     assert.match(illegalJump.error, /Illegal phase transition/);
 
     // Legal progression:
-    const p1 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'ISOLATED_PREPARED' });
+    const p1 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'ISOLATED_PREPARED', lease });
     assert.equal(p1.ok, true);
     assert.equal(p1.journal?.phase, 'ISOLATED_PREPARED');
 
-    const p2 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'BACKUP_CREATED' });
+    const p2 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'BACKUP_CREATED', lease });
     assert.equal(p2.ok, true);
     assert.equal(p2.journal?.phase, 'BACKUP_CREATED');
 
-    const p3 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP' });
+    const p3 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP', lease });
     assert.equal(p3.ok, true);
     assert.equal(p3.journal?.phase, 'READY_TO_SWAP');
 
-    const p4 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'SWAPPED' });
+    const p4 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'SWAPPED', lease });
     assert.equal(p4.ok, true);
     assert.equal(p4.journal?.phase, 'SWAPPED');
 
     // Backward transition: SWAPPED -> READY_TO_SWAP
-    const backward = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP' });
+    const backward = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP', lease });
     assert.equal(backward.ok, false);
     assert.match(backward.error, /Illegal phase transition/);
 
-    const p5 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'COMPLETED' });
+    const p5 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'COMPLETED', lease });
     assert.equal(p5.ok, true);
     assert.equal(p5.journal?.phase, 'COMPLETED');
   });
@@ -486,7 +508,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
     const repo = createTempDir('journal-immutable-advance-');
     const txId = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
     createJournal({
       repoRoot: repo,
       txId,
@@ -494,6 +516,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
 
     // Attempt to bypass phase transition by supplying metadataUpdate.phase: 'COMPLETED'
@@ -502,6 +525,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       txId,
       nextPhase: 'ISOLATED_PREPARED',
       metadataUpdate: { phase: 'COMPLETED' },
+      lease,
     });
     assert.equal(resBypass.ok, false);
     assert.match(resBypass.error, /Cannot overwrite immutable journal field: "phase"/);
@@ -512,6 +536,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       txId,
       nextPhase: 'ISOLATED_PREPARED',
       metadataUpdate: { txId: 'tampered-txId' },
+      lease,
     });
     assert.equal(resTxId.ok, false);
     assert.match(resTxId.error, /Cannot overwrite immutable journal field: "txId"/);
@@ -522,6 +547,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       txId,
       nextPhase: 'ISOLATED_PREPARED',
       metadataUpdate: { expectedResultSha256: '0000000000000000000000000000000000000000000000000000000000000000' },
+      lease,
     });
     assert.equal(resHash.ok, false);
     assert.match(resHash.error, /Cannot overwrite immutable journal field: "expectedResultSha256"/);
@@ -532,6 +558,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
       txId,
       nextPhase: 'ISOLATED_PREPARED',
       metadataUpdate: { stagedPath: '/path/to/staged' },
+      lease,
     });
     assert.equal(resAux.ok, true);
     assert.equal(resAux.journal?.phase, 'ISOLATED_PREPARED');
@@ -544,7 +571,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
     const txOwner = generateTxId();
     const txOther = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId: txOwner, op: 'apply' });
+    const { lease: leaseOwner } = acquireLock({ repoRoot: repo, txId: txOwner, op: 'apply' });
     createJournal({
       repoRoot: repo,
       txId: txOwner,
@@ -552,18 +579,19 @@ describe('Installer Journal Primitives (journal.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease: leaseOwner,
     });
 
-    const res = advanceJournalPhase({ repoRoot: repo, txId: txOther, nextPhase: 'ISOLATED_PREPARED' });
+    const res = advanceJournalPhase({ repoRoot: repo, txId: txOther, nextPhase: 'ISOLATED_PREPARED', lease: leaseOwner });
     assert.equal(res.ok, false);
-    assert.match(res.error, /owned by transaction/);
+    assert.match(res.error, /(owned by transaction|lease-tx-mismatch)/);
   });
 
   test('removeJournal refuses removal of incomplete journal without explicit override and verifies lock', () => {
     const repo = createTempDir('journal-incomplete-remove-');
     const txId = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId, op: 'apply', pid: 4444 });
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
     createJournal({
       repoRoot: repo,
@@ -572,27 +600,34 @@ describe('Installer Journal Primitives (journal.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
 
+    // Calling removeJournal without lease fails closed
+    const badLeaseRes = removeJournal({ repoRoot: repo, txId });
+    assert.equal(badLeaseRes.ok, false);
+    assert.equal(badLeaseRes.code, 'lease-required');
+    assert.match(badLeaseRes.error, /Cannot mutate journal without the active acquisition lease/);
+
     // Removal while in LOCKED phase
-    const refuseRes = removeJournal({ repoRoot: repo, txId });
+    const refuseRes = removeJournal({ repoRoot: repo, txId, lease });
     assert.equal(refuseRes.ok, false);
     assert.match(refuseRes.error, /Refusing to remove incomplete journal/);
 
     // Advance to COMPLETED
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'ISOLATED_PREPARED' });
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'BACKUP_CREATED' });
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP' });
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'SWAPPED' });
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'COMPLETED' });
+    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'ISOLATED_PREPARED', lease });
+    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'BACKUP_CREATED', lease });
+    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP', lease });
+    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'SWAPPED', lease });
+    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'COMPLETED', lease });
 
     // Removal with callerOwner PID mismatch
-    const badPidRes = removeJournal({ repoRoot: repo, txId, callerOwner: { pid: 9999 } });
+    const badPidRes = removeJournal({ repoRoot: repo, txId, lease, callerOwner: { pid: 99999 } });
     assert.equal(badPidRes.ok, false);
     assert.match(badPidRes.error, /PID mismatch/);
 
-    // Removal of COMPLETED journal with valid lock succeeds
-    const removeRes = removeJournal({ repoRoot: repo, txId, callerOwner: { pid: 4444 } });
+    // Removal of COMPLETED journal with valid lock and lease succeeds
+    const removeRes = removeJournal({ repoRoot: repo, txId, lease, callerOwner: { pid: process.pid } });
     assert.equal(removeRes.ok, true);
     assert.equal(inspectJournal(repo).hasJournal, false);
   });
@@ -627,10 +662,10 @@ describe('Installer Journal Primitives (journal.js)', () => {
   });
 
   describe('Fault Injection & Error Resilience', () => {
-    test('createJournal preserves state and fails closed when file write fails (pre-rename)', () => {
+    test('createJournal preserves state and fails closed when file write fails (pre-publication)', () => {
       const repo = createTempDir('journal-fault-write-');
       const txId = generateTxId();
-      acquireLock({ repoRoot: repo, txId, op: 'apply' });
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
       const ciPatchDir = path.join(repo, '.ci-patch');
       fs.chmodSync(ciPatchDir, 0o500); // read-only directory
@@ -643,11 +678,12 @@ describe('Installer Journal Primitives (journal.js)', () => {
           targetFile: 'src/endpoints/stable-diffusion.js',
           expectedInitialSha256: stockSha,
           expectedResultSha256: patchedSha,
+          lease,
         });
 
         assert.equal(res.ok, false);
-        assert.equal(res.stage, 'pre-rename');
-        assert.match(res.error, /Failed to prepare journal update before rename/);
+        assert.equal(res.stage, 'pre-publication');
+        assert.match(res.error, /Failed to prepare journal update before publication/);
       } finally {
         fs.chmodSync(ciPatchDir, 0o700); // restore for cleanup
       }
@@ -656,7 +692,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
     test('advanceJournalPhase preserves existing journal when write failure occurs', () => {
       const repo = createTempDir('journal-fault-advance-');
       const txId = generateTxId();
-      acquireLock({ repoRoot: repo, txId, op: 'apply' });
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
       createJournal({
         repoRoot: repo,
@@ -665,13 +701,14 @@ describe('Installer Journal Primitives (journal.js)', () => {
         targetFile: 'src/endpoints/stable-diffusion.js',
         expectedInitialSha256: stockSha,
         expectedResultSha256: patchedSha,
+        lease,
       });
 
       const ciPatchDir = path.join(repo, '.ci-patch');
       fs.chmodSync(ciPatchDir, 0o500); // read-only
 
       try {
-        const res = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'ISOLATED_PREPARED' });
+        const res = advanceJournalPhase({ repoRoot: repo, txId, lease, nextPhase: 'ISOLATED_PREPARED' });
         assert.equal(res.ok, false);
         assert.equal(res.stage, 'pre-rename');
         assert.match(res.error, /Failed to prepare journal update before rename/);
@@ -687,15 +724,15 @@ describe('Installer Journal Primitives (journal.js)', () => {
       }
     });
 
-    test('createJournal cleans up temporary journal file if rename fails', () => {
-      const repo = createTempDir('journal-fault-rename-');
+    test('createJournal cleans up temporary journal file if atomic link publication fails', () => {
+      const repo = createTempDir('journal-fault-link-');
       const txId = generateTxId();
-      acquireLock({ repoRoot: repo, txId, op: 'apply' });
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
-      const originalRename = fs.renameSync;
-      // Mock fs.renameSync to throw error
-      fs.renameSync = () => {
-        throw new Error('Simulated atomic rename failure');
+      const originalLink = fs.linkSync;
+      // Mock fs.linkSync to throw error
+      fs.linkSync = () => {
+        throw new Error('Simulated atomic link publication failure');
       };
 
       try {
@@ -706,24 +743,25 @@ describe('Installer Journal Primitives (journal.js)', () => {
           targetFile: 'src/endpoints/stable-diffusion.js',
           expectedInitialSha256: stockSha,
           expectedResultSha256: patchedSha,
+          lease,
         });
 
         assert.equal(res.ok, false);
-        assert.equal(res.stage, 'pre-rename');
-        assert.match(res.error, /Simulated atomic rename failure/);
+        assert.equal(res.stage, 'pre-publication');
+        assert.match(res.error, /Simulated atomic link publication failure/);
 
         // Ensure temp file was cleaned up
         const tmpPath = path.join(repo, '.ci-patch', `.journal.${txId}.tmp`);
         assert.equal(fs.existsSync(tmpPath), false);
       } finally {
-        fs.renameSync = originalRename;
+        fs.linkSync = originalLink;
       }
     });
 
     test('createJournal handles simulated fsync failure cleanly', () => {
       const repo = createTempDir('journal-fault-fsync-');
       const txId = generateTxId();
-      acquireLock({ repoRoot: repo, txId, op: 'apply' });
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
       const originalFsync = fs.fsyncSync;
       // Mock fs.fsyncSync to throw error
@@ -739,29 +777,30 @@ describe('Installer Journal Primitives (journal.js)', () => {
           targetFile: 'src/endpoints/stable-diffusion.js',
           expectedInitialSha256: stockSha,
           expectedResultSha256: patchedSha,
+          lease,
         });
 
         assert.equal(res.ok, false);
-        assert.equal(res.stage, 'pre-rename');
+        assert.equal(res.stage, 'pre-publication');
         assert.match(res.error, /Simulated EIO on fsync/);
       } finally {
         fs.fsyncSync = originalFsync;
       }
     });
 
-    test('writeJournalDurable reports stage: post-rename if directory fsync fails after rename', () => {
-      const repo = createTempDir('journal-fault-post-rename-');
+    test('writeJournalDurable reports stage: post-publication if directory fsync fails after publication', () => {
+      const repo = createTempDir('journal-fault-post-link-');
       const txId = generateTxId();
-      acquireLock({ repoRoot: repo, txId, op: 'apply' });
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
       const originalFsync = fs.fsyncSync;
       let fsyncCallCount = 0;
       fs.fsyncSync = (fd) => {
         fsyncCallCount++;
         // The 1st fsync in createJournal is on the tmp file descriptor.
-        // The 2nd fsync is on the directory descriptor after rename!
+        // The 2nd fsync is on the directory descriptor after publication (linkSync)!
         if (fsyncCallCount >= 2) {
-          throw new Error('Simulated directory fsync EIO after rename');
+          throw new Error('Simulated directory fsync EIO after publication');
         }
         return originalFsync(fd);
       };
@@ -774,14 +813,60 @@ describe('Installer Journal Primitives (journal.js)', () => {
           targetFile: 'src/endpoints/stable-diffusion.js',
           expectedInitialSha256: stockSha,
           expectedResultSha256: patchedSha,
+          lease,
+        });
+
+        assert.equal(res.ok, false);
+        assert.equal(res.stage, 'post-publication');
+        assert.match(res.error, /directory synchronization failed/);
+        // Journal was published onto disk before sync error
+        assert.ok(res.journal);
+        assert.equal(res.journal.phase, 'LOCKED');
+      } finally {
+        fs.fsyncSync = originalFsync;
+      }
+    });
+
+    test('advanceJournalPhase reports stage: post-rename if directory fsync fails after phase rename', () => {
+      const repo = createTempDir('journal-fault-post-rename-');
+      const txId = generateTxId();
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      const originalFsync = fs.fsyncSync;
+      let fsyncCallCount = 0;
+      fs.fsyncSync = (fd) => {
+        fsyncCallCount++;
+        // The 1st fsync in advanceJournalPhase is on the tmp file descriptor.
+        // The 2nd fsync is on the directory descriptor after rename!
+        if (fsyncCallCount >= 2) {
+          throw new Error('Simulated directory fsync EIO after rename');
+        }
+        return originalFsync(fd);
+      };
+
+      try {
+        const res = advanceJournalPhase({
+          repoRoot: repo,
+          txId,
+          lease,
+          nextPhase: 'ISOLATED_PREPARED',
         });
 
         assert.equal(res.ok, false);
         assert.equal(res.stage, 'post-rename');
         assert.match(res.error, /directory synchronization failed/);
-        // Journal was renamed onto disk before sync error
         assert.ok(res.journal);
-        assert.equal(res.journal.phase, 'LOCKED');
+        assert.equal(res.journal.phase, 'ISOLATED_PREPARED');
       } finally {
         fs.fsyncSync = originalFsync;
       }
@@ -807,7 +892,7 @@ describe('Transaction State Inspection (transaction-state.js)', () => {
     const repo = createTempDir('tx-state-active-');
     const txId = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
     createJournal({
       repoRoot: repo,
       txId,
@@ -815,6 +900,7 @@ describe('Transaction State Inspection (transaction-state.js)', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
 
     const res = inspectTransactionState(repo);
@@ -1068,7 +1154,7 @@ describe('Read-Only Integration & CLI Transaction Inspection', () => {
     const repo = setupDisposableRepo('st-cli-tx-');
     const txId = generateTxId();
 
-    acquireLock({ repoRoot: repo, txId, op: 'apply', pid: 54321, hostname: 'workstation-test' });
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply', hostname: 'workstation-test' });
     createJournal({
       repoRoot: repo,
       txId,
@@ -1076,6 +1162,7 @@ describe('Read-Only Integration & CLI Transaction Inspection', () => {
       targetFile: 'src/endpoints/stable-diffusion.js',
       expectedInitialSha256: stockSha,
       expectedResultSha256: patchedSha,
+      lease,
     });
 
     const ownerFile = path.join(repo, '.ci-patch/lock.d/owner.json');
@@ -1097,7 +1184,7 @@ describe('Read-Only Integration & CLI Transaction Inspection', () => {
 
     assert.equal(statusExit, 0);
     assert.match(statusOut, /Transaction State:\s+ownership-unverified/);
-    assert.match(statusOut, /Lock Details:\s+txId=ci-tx-.*pid=54321/);
+    assert.match(statusOut, new RegExp(`Lock Details:\\s+txId=ci-tx-.*pid=${process.pid}`));
     assert.match(statusOut, /Journal Details:\s+phase=LOCKED/);
 
     // 2. Capture --check human output
@@ -1185,5 +1272,392 @@ describe('Read-Only Integration & CLI Transaction Inspection', () => {
     assert.equal(preflight.alreadyApplied, false);
     assert.equal(preflight.inspection.transaction.state, 'unsafe-symlink');
     assert.match(preflight.reason, /Installer directory \(\.ci-patch\) is a symbolic link/);
+  });
+});
+
+describe('Transaction Lease Capability Security & Multi-Process Hardening', () => {
+  const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
+  const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
+
+  test('reading owner.json from disk does NOT grant mutation authority', () => {
+    const repo = createTempDir('lease-sec-disk-');
+    const txId = generateTxId();
+
+    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    // Read on-disk owner.json public metadata
+    const ownerFile = path.join(repo, '.ci-patch/lock.d/owner.json');
+    const diskOwner = JSON.parse(fs.readFileSync(ownerFile, 'utf8'));
+    assert.equal(diskOwner.txId, txId);
+
+    // Caller attempting journal creation with on-disk metadata but no in-process lease capability is strictly rejected
+    const createRes = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+    });
+    assert.equal(createRes.ok, false);
+    assert.equal(createRes.code, 'lease-required');
+    assert.match(createRes.error, /Cannot mutate journal without the active acquisition lease/);
+
+    // Caller attempting lock release with on-disk metadata but no lease is rejected
+    const releaseRes = releaseLock({
+      repoRoot: repo,
+      txId,
+      expectedOwner: diskOwner,
+    });
+    assert.equal(releaseRes.ok, false);
+    assert.equal(releaseRes.error, 'lease-required');
+  });
+
+  test('rejects forged or tampered lease objects', () => {
+    const repo = createTempDir('lease-sec-forged-');
+    const txId = generateTxId();
+    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    // Forged lease token
+    const forgedLease = new TransactionLease(txId, path.resolve(repo), 'apply', 'forged-token-12345', process.pid);
+
+    const createRes = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease: forgedLease,
+    });
+    assert.equal(createRes.ok, false);
+    assert.equal(createRes.code, 'invalid-lease-token');
+    assert.match(createRes.error, /Transaction lease token or process identity verification failed/);
+
+    // Non-instance or plain dictionary lease
+    const plainObjLease = { txId, repoRoot: path.resolve(repo), op: 'apply', token: 'fake' };
+    const plainRes = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease: plainObjLease,
+    });
+    assert.equal(plainRes.ok, false);
+    assert.equal(plainRes.code, 'lease-required');
+  });
+
+  test('revoking lease on lock release prevents subsequent mutations', () => {
+    const repo = createTempDir('lease-sec-revocation-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    // Create journal while holding valid lease
+    const createRes = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    assert.equal(createRes.ok, true);
+
+    // Advance to COMPLETED and remove journal
+    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'ISOLATED_PREPARED', lease });
+    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'BACKUP_CREATED', lease });
+    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP', lease });
+    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'SWAPPED', lease });
+    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'COMPLETED', lease });
+    removeJournal({ repoRoot: repo, txId, lease });
+
+    // Release lock -> lease is revoked from ACTIVE_LEASES
+    const releaseRes = releaseLock({ repoRoot: repo, txId, lease });
+    assert.equal(releaseRes.ok, true);
+
+    // Attempting to reuse revoked lease fails closed
+    const reuseRes = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    assert.equal(reuseRes.ok, false);
+    assert.equal(reuseRes.code, 'lease-not-active');
+  });
+
+  test('another process supplying matching metadata cannot release lock or mutate journal', () => {
+    const repo = createTempDir('lease-sec-foreign-pid-');
+    const txId = generateTxId();
+
+    // Acquire lock with foreign PID
+    acquireLock({ repoRoot: repo, txId, op: 'apply', pid: 77777, hostname: 'other-box' });
+
+    // Attempt to release from current process PID fails closed
+    const releaseRes = releaseLock({
+      repoRoot: repo,
+      txId,
+      expectedOwner: { pid: 77777, hostname: 'other-box' },
+    });
+    assert.equal(releaseRes.ok, false);
+    assert.equal(releaseRes.error, 'lease-required');
+
+    // Attempt to mutate journal for foreign PID lock fails closed
+    const createRes = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+    });
+    assert.equal(createRes.ok, false);
+    assert.equal(createRes.code, 'lease-required');
+  });
+});
+
+describe('Atomic No-Replace Journal Publication (link(2) Hardening)', () => {
+  const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
+  const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
+
+  test('atomic linkSync fails with pre-publication and preserves destination on destination collision (EEXIST)', () => {
+    const repo = createTempDir('link-collision-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const journalPath = path.join(repo, '.ci-patch/journal.json');
+
+    const originalLink = fs.linkSync;
+    let linkCalled = false;
+    fs.linkSync = (src, dest) => {
+      linkCalled = true;
+      // Competing process creates destination right at publication boundary
+      fs.writeFileSync(dest, '{"pre_existing": true}\n');
+      const err = new Error('Destination already exists');
+      err.code = 'EEXIST';
+      throw err;
+    };
+
+    try {
+      const res = createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      assert.equal(linkCalled, true);
+      assert.equal(res.ok, false);
+      assert.equal(res.stage, 'pre-publication');
+      assert.match(res.error, /atomic publication collision/);
+
+      // Pre-existing destination content is untouched and uncorrupted
+      assert.equal(fs.readFileSync(journalPath, 'utf8'), '{"pre_existing": true}\n');
+
+      // Temporary file must be cleaned up
+      const tmpPath = path.join(repo, '.ci-patch', `.journal.${txId}.tmp`);
+      assert.equal(fs.existsSync(tmpPath), false);
+    } finally {
+      fs.linkSync = originalLink;
+    }
+  });
+
+  test('fails closed cleanly when filesystem does not support hard links (EXDEV/ENOTSUP)', () => {
+    const repo = createTempDir('link-unsupported-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const originalLink = fs.linkSync;
+    fs.linkSync = () => {
+      const err = new Error('Cross-device link');
+      err.code = 'EXDEV';
+      throw err;
+    };
+
+    try {
+      const res = createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.stage, 'pre-publication');
+      assert.match(res.error, /Atomic no-replace journal publication unsupported on this filesystem/);
+
+      // Temporary file must be cleaned up
+      const tmpPath = path.join(repo, '.ci-patch', `.journal.${txId}.tmp`);
+      assert.equal(fs.existsSync(tmpPath), false);
+    } finally {
+      fs.linkSync = originalLink;
+    }
+  });
+});
+
+describe('Fail-Closed Filesystem Inspection Errors & Preflight Refusal', () => {
+  function setupDisposableRepo(prefix = 'st-inspect-err-') {
+    const repoDir = createTempDir(prefix);
+    execFileSync('git', ['init', '-q'], { cwd: repoDir });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoDir });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
+
+    fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({ name: 'sillytavern' }));
+    fs.writeFileSync(path.join(repoDir, 'server.js'), '// server\n');
+    fs.mkdirSync(path.join(repoDir, 'src/endpoints'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'src/endpoints/stable-diffusion.js'), '// original\n');
+
+    execFileSync('git', ['add', '.'], { cwd: repoDir });
+    execFileSync('git', ['commit', '-q', '-m', 'Initial commit'], { cwd: repoDir });
+
+    return repoDir;
+  }
+
+  test('inspectTransactionState fails closed on lstat error other than ENOENT', () => {
+    const repo = createTempDir('inspect-lstat-err-');
+    fs.mkdirSync(path.join(repo, '.ci-patch'), { recursive: true });
+
+    const originalLstat = fs.lstatSync;
+    fs.lstatSync = (p, opts) => {
+      if (typeof p === 'string' && p.endsWith('.ci-patch')) {
+        const err = new Error('Permission denied on .ci-patch');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return originalLstat(p, opts);
+    };
+
+    try {
+      const res = inspectTransactionState(repo);
+      assert.equal(res.state, 'inspection-error');
+      assert.equal(res.isPending, true);
+      assert.match(res.reasons[0], /(Failed to inspect installer directory|Permission denied on \.ci-patch)/);
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+  });
+
+  test('inspectTransactionState fails closed on readdir error on .ci-patch', () => {
+    const repo = createTempDir('inspect-readdir-err-');
+    fs.mkdirSync(path.join(repo, '.ci-patch'), { recursive: true });
+
+    const originalReaddir = fs.readdirSync;
+    fs.readdirSync = (p, opts) => {
+      if (typeof p === 'string' && p.endsWith('.ci-patch')) {
+        const err = new Error('Simulated EIO on readdir');
+        err.code = 'EIO';
+        throw err;
+      }
+      return originalReaddir(p, opts);
+    };
+
+    try {
+      const res = inspectTransactionState(repo);
+      assert.equal(res.state, 'inspection-error');
+      assert.equal(res.isPending, true);
+      assert.match(res.reasons[0], /Failed to read installer directory/);
+    } finally {
+      fs.readdirSync = originalReaddir;
+    }
+  });
+
+  test('inspectTransactionState fails closed on staging or backup inspection error', () => {
+    // 1. Staging inspection error
+    const repo1 = createTempDir('inspect-staging-err-');
+    fs.mkdirSync(path.join(repo1, '.ci-patch/staging'), { recursive: true });
+
+    const originalLstat = fs.lstatSync;
+    fs.lstatSync = (p, opts) => {
+      if (typeof p === 'string' && p.endsWith('staging')) {
+        const err = new Error('Simulated EACCES on staging');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return originalLstat(p, opts);
+    };
+
+    try {
+      const res1 = inspectTransactionState(repo1);
+      assert.equal(res1.state, 'inspection-error');
+      assert.equal(res1.isPending, true);
+      assert.match(res1.reasons[0], /Failed to inspect staging path/);
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+
+    // 2. Backup inspection error
+    const repo2 = createTempDir('inspect-backup-err-');
+    fs.mkdirSync(path.join(repo2, '.ci-patch/backup'), { recursive: true });
+
+    fs.lstatSync = (p, opts) => {
+      if (typeof p === 'string' && p.endsWith('backup')) {
+        const err = new Error('Simulated EACCES on backup');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return originalLstat(p, opts);
+    };
+
+    try {
+      const res2 = inspectTransactionState(repo2);
+      assert.equal(res2.state, 'inspection-error');
+      assert.equal(res2.isPending, true);
+      assert.match(res2.reasons[0], /Failed to inspect backup path/);
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+  });
+
+  test('checkInstallationPreflight refuses to proceed with exitCode 1 when inspection-error is present', async () => {
+    const repo = setupDisposableRepo('st-preflight-inspect-err-');
+    fs.mkdirSync(path.join(repo, '.ci-patch'), { recursive: true });
+
+    const originalReaddir = fs.readdirSync;
+    fs.readdirSync = (p, opts) => {
+      if (typeof p === 'string' && p.endsWith('.ci-patch')) {
+        const err = new Error('Simulated EACCES on .ci-patch');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return originalReaddir(p, opts);
+    };
+
+    try {
+      const preflight = await checkInstallationPreflight({ targetDir: repo });
+      assert.equal(preflight.ok, false);
+      assert.equal(preflight.verdict, 'refused');
+      assert.equal(preflight.exitCode, 1);
+      assert.equal(preflight.canApply, false);
+      assert.equal(preflight.inspection.transaction.state, 'inspection-error');
+      assert.match(preflight.reason, /Failed to read installer directory/);
+    } finally {
+      fs.readdirSync = originalReaddir;
+    }
+  });
+
+  test('clean checkouts without transaction metadata remain correctly classified as state: none and isPending: false', async () => {
+    const repo = setupDisposableRepo('st-clean-checkout-');
+
+    const txState = inspectTransactionState(repo);
+    assert.equal(txState.state, 'none');
+    assert.equal(txState.isPending, false);
+    assert.equal(txState.hasLock, false);
+    assert.equal(txState.hasJournal, false);
+
+    const inspection = await inspectTargetInstallation({ targetDir: repo });
+    assert.equal(inspection.transaction.state, 'none');
+    assert.equal(inspection.transaction.isPending, false);
   });
 });

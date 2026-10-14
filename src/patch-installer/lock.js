@@ -10,6 +10,140 @@ export const LOCK_OWNER_FILE = 'owner.json';
 
 const TX_ID_REGEX = /^ci-tx-[0-9]+-[0-9a-f]+$/i;
 
+const ACTIVE_LEASES = new Map();
+
+/**
+ * In-process transaction lease capability returned upon successful lock acquisition.
+ * Unforgeable capability binding the transaction to the current process, repository,
+ * transaction ID, and operation.
+ */
+export class TransactionLease {
+  #txId;
+  #repoRoot;
+  #op;
+  #token;
+  #pid;
+  #createdAt;
+
+  constructor(txId, repoRoot, op, token, pid) {
+    this.#txId = txId;
+    this.#repoRoot = path.resolve(repoRoot);
+    this.#op = op;
+    this.#token = token;
+    this.#pid = pid;
+    this.#createdAt = new Date().toISOString();
+  }
+
+  get txId() {
+    return this.#txId;
+  }
+
+  get repoRoot() {
+    return this.#repoRoot;
+  }
+
+  get op() {
+    return this.#op;
+  }
+
+  get pid() {
+    return this.#pid;
+  }
+
+  get createdAt() {
+    return this.#createdAt;
+  }
+
+  /**
+   * Internal verification of token and lease attributes.
+   * @internal
+   */
+  _verify(expectedRepoRoot, expectedTxId, expectedOp, expectedToken) {
+    return (
+      this.#txId === expectedTxId &&
+      this.#repoRoot === path.resolve(expectedRepoRoot) &&
+      this.#op === expectedOp &&
+      this.#token === expectedToken &&
+      this.#pid === process.pid
+    );
+  }
+}
+
+/**
+ * Validate an in-process transaction lease capability.
+ * Verifies that the caller possesses genuine acquisition authority for the lock.
+ *
+ * @param {any} lease
+ * @param {string} expectedRepoRoot
+ * @param {string} expectedTxId
+ * @param {'apply' | 'remove'} expectedOp
+ * @returns {{ ok: boolean, error?: string, reason?: string }}
+ */
+export function validateLease(lease, expectedRepoRoot, expectedTxId, expectedOp) {
+  if (!lease || !(lease instanceof TransactionLease)) {
+    return {
+      ok: false,
+      error: 'lease-required',
+      reason: 'A valid in-process TransactionLease capability is required',
+    };
+  }
+
+  if (!expectedRepoRoot || !expectedTxId || !expectedOp) {
+    return {
+      ok: false,
+      error: 'validation-error',
+      reason: 'expectedRepoRoot, expectedTxId, and expectedOp are required for lease validation',
+    };
+  }
+
+  const normRepo = path.resolve(expectedRepoRoot);
+  const normTxId = expectedTxId.trim();
+
+  if (lease.txId !== normTxId) {
+    return {
+      ok: false,
+      error: 'lease-tx-mismatch',
+      reason: `Transaction lease txId mismatch: lease belongs to "${lease.txId}", caller specified "${normTxId}"`,
+    };
+  }
+
+  if (lease.repoRoot !== normRepo) {
+    return {
+      ok: false,
+      error: 'lease-repo-mismatch',
+      reason: 'Transaction lease repository root mismatch',
+    };
+  }
+
+  if (lease.op !== expectedOp) {
+    return {
+      ok: false,
+      error: 'lease-op-mismatch',
+      reason: `Transaction lease operation mismatch: lease is for "${lease.op}", caller requested "${expectedOp}"`,
+    };
+  }
+
+  const leaseKey = `${normRepo}:${normTxId}`;
+  const activeEntry = ACTIVE_LEASES.get(leaseKey);
+  if (!activeEntry) {
+    return {
+      ok: false,
+      error: 'lease-not-active',
+      reason: 'Transaction lease is not active or has been revoked / released',
+    };
+  }
+
+  if (!lease._verify(normRepo, normTxId, expectedOp, activeEntry.token)) {
+    return {
+      ok: false,
+      error: 'invalid-lease-token',
+      reason: 'Transaction lease token or process identity verification failed',
+    };
+  }
+
+  return { ok: true };
+}
+
 /**
  * Perform safe lstat with explicit ENOENT and dangling symlink detection.
  * Distinguishes missing paths from dangling symlinks and filesystem errors.
@@ -516,12 +650,28 @@ export function acquireLock(options = {}) {
       fs.closeSync(parentFd);
     }
 
+    // Generate and register in-process lease capability
+    const token = crypto.randomBytes(32).toString('hex');
+    const normRepo = path.resolve(repoRoot);
+    const leaseKey = `${normRepo}:${txId.trim()}`;
+    ACTIVE_LEASES.set(leaseKey, {
+      token,
+      txId: txId.trim(),
+      repoRoot: normRepo,
+      op,
+      pid,
+    });
+
+    const lease = new TransactionLease(txId.trim(), normRepo, op, token, pid);
+
     return {
       ok: true,
+      lease,
       lock: {
         lockDirPath,
         ownerPath,
         owner,
+        lease,
       },
     };
   } catch (writeErr) {
@@ -537,16 +687,18 @@ export function acquireLock(options = {}) {
 /**
  * Release an installer lock under positive ownership verification.
  * Refuses to release foreign, corrupted, or unverified locks.
+ * Strictly requires the acquisition lease capability.
  * Refuses cleanup if unexpected files exist in lock.d.
  *
  * @param {object} options
  * @param {string} options.repoRoot
  * @param {string} options.txId
+ * @param {TransactionLease} options.lease
  * @param {object} [options.expectedOwner]
  * @returns {{ ok: boolean, error?: string, reason?: string }}
  */
 export function releaseLock(options = {}) {
-  const { repoRoot, txId, expectedOwner } = options;
+  const { repoRoot, txId, lease, expectedOwner } = options;
 
   if (!repoRoot || !txId) {
     return { ok: false, error: 'validation-error', reason: 'repoRoot and txId are required to release lock' };
@@ -555,6 +707,25 @@ export function releaseLock(options = {}) {
   const inspection = inspectLock(repoRoot);
   if (!inspection.hasLock) {
     return { ok: false, error: 'no-lock', reason: 'No lock exists to release' };
+  }
+
+  if (!lease) {
+    return {
+      ok: false,
+      error: 'lease-required',
+      reason: 'Cannot release lock: caller must possess the acquisition lease capability',
+    };
+  }
+
+  // Validate lease against on-disk owner operation
+  const expectedOp = inspection.owner?.op || 'apply';
+  const leaseAuth = validateLease(lease, repoRoot, txId, expectedOp);
+  if (!leaseAuth.ok) {
+    return {
+      ok: false,
+      error: leaseAuth.error,
+      reason: `Cannot release lock: ${leaseAuth.reason}`,
+    };
   }
 
   // Inspect exact contents of lock.d directory before proceeding with release
@@ -597,6 +768,14 @@ export function releaseLock(options = {}) {
       ok: false,
       error: 'ownership-mismatch',
       reason: 'Cannot release lock: repository root mismatch',
+    };
+  }
+
+  if (inspection.owner.pid !== process.pid) {
+    return {
+      ok: false,
+      error: 'ownership-mismatch',
+      reason: `Cannot release lock: process ${process.pid} does not match lock owner PID ${inspection.owner.pid}`,
     };
   }
 
@@ -665,6 +844,11 @@ export function releaseLock(options = {}) {
         fs.closeSync(dirFd);
       }
     }
+
+    // Revoke active lease upon successful release
+    const normRepo = path.resolve(repoRoot);
+    const leaseKey = `${normRepo}:${txId.trim()}`;
+    ACTIVE_LEASES.delete(leaseKey);
 
     return { ok: true };
   } catch (err) {

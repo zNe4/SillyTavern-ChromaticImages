@@ -115,7 +115,10 @@ export function classifyTargetState(observations, manifest) {
     };
   }
 
-  if (observations.transaction?.state === 'unsafe-symlink') {
+  if (
+    observations.transaction?.state === 'unsafe-symlink' ||
+    observations.transaction?.state === 'inspection-error'
+  ) {
     return {
       status: 'invalid-installation',
       targetFileState: 'unsafe',
@@ -123,7 +126,11 @@ export function classifyTargetState(observations, manifest) {
       developerBranch: null,
       reasons: observations.transaction.reasons.length > 0
         ? observations.transaction.reasons
-        : ['Installer directory (.ci-patch) contains a symbolic link'],
+        : [
+            observations.transaction.state === 'unsafe-symlink'
+              ? 'Installer directory (.ci-patch) contains a symbolic link'
+              : 'Failed to safely inspect installer transaction state (.ci-patch)',
+          ],
     };
   }
 

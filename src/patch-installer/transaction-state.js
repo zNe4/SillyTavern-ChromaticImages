@@ -43,7 +43,9 @@ export function inspectTransactionState(repoRoot) {
   const reasons = [];
   const foreignEntries = [];
   const orphanedArtifacts = [];
+  const inspectionErrors = [];
   let hasUnsafeSymlink = false;
+  let hasInspectionError = false;
 
   const ciPathCheck = validateCiPatchPath(repoRoot);
   if (!ciPathCheck.ok) {
@@ -61,7 +63,7 @@ export function inspectTransactionState(repoRoot) {
       };
     }
     return {
-      state: 'unsafe-symlink',
+      state: 'inspection-error',
       hasLock: false,
       hasJournal: false,
       isPending: true,
@@ -93,7 +95,7 @@ export function inspectTransactionState(repoRoot) {
     dirEntries = fs.readdirSync(ciPatchDir);
   } catch (err) {
     return {
-      state: 'corrupted-lock',
+      state: 'inspection-error',
       hasLock: false,
       hasJournal: false,
       isPending: true,
@@ -124,7 +126,11 @@ export function inspectTransactionState(repoRoot) {
       reasons.push(`Orphaned temporary journal file detected: ${entry}`);
       const tmpPath = path.join(ciPatchDir, entry);
       const tmpCheck = getPathLstat(tmpPath);
-      if (tmpCheck.isSymbolicLink) {
+      if (tmpCheck.error) {
+        hasInspectionError = true;
+        inspectionErrors.push(`Failed to inspect temporary journal file (${entry}): ${tmpCheck.error.message}`);
+        reasons.push(`Failed to inspect temporary journal file (${entry}): ${tmpCheck.error.message}`);
+      } else if (tmpCheck.isSymbolicLink) {
         hasUnsafeSymlink = true;
         reasons.push(`Temporary journal file (${entry}) is a symbolic link`);
       }
@@ -140,7 +146,11 @@ export function inspectTransactionState(repoRoot) {
   // Inspect recognized directory: staging
   const stagingPath = path.join(ciPatchDir, 'staging');
   const stagingCheck = getPathLstat(stagingPath);
-  if (stagingCheck.exists) {
+  if (stagingCheck.error) {
+    hasInspectionError = true;
+    inspectionErrors.push(`Failed to inspect staging path (.ci-patch/staging): ${stagingCheck.error.message}`);
+    reasons.push(`Failed to inspect staging path (.ci-patch/staging): ${stagingCheck.error.message}`);
+  } else if (stagingCheck.exists) {
     if (stagingCheck.isSymbolicLink) {
       hasUnsafeSymlink = true;
       reasons.push('Staging path (.ci-patch/staging) is a symbolic link');
@@ -159,7 +169,11 @@ export function inspectTransactionState(repoRoot) {
             for (const sEntry of stagingEntries) {
               const sSubPath = path.join(stagingPath, sEntry);
               const sSubCheck = getPathLstat(sSubPath);
-              if (sSubCheck.isSymbolicLink) {
+              if (sSubCheck.error) {
+                hasInspectionError = true;
+                inspectionErrors.push(`Failed to inspect staging component (staging/${sEntry}): ${sSubCheck.error.message}`);
+                reasons.push(`Failed to inspect staging component (staging/${sEntry}): ${sSubCheck.error.message}`);
+              } else if (sSubCheck.isSymbolicLink) {
                 hasUnsafeSymlink = true;
                 reasons.push(`Staging component (staging/${sEntry}) is a symbolic link`);
               } else if (sEntry !== expectedTxId) {
@@ -171,12 +185,18 @@ export function inspectTransactionState(repoRoot) {
                   for (const cEntry of txChildren) {
                     const cPath = path.join(sSubPath, cEntry);
                     const cCheck = getPathLstat(cPath);
-                    if (cCheck.isSymbolicLink) {
+                    if (cCheck.error) {
+                      hasInspectionError = true;
+                      inspectionErrors.push(`Failed to inspect staging artifact (staging/${sEntry}/${cEntry}): ${cCheck.error.message}`);
+                      reasons.push(`Failed to inspect staging artifact (staging/${sEntry}/${cEntry}): ${cCheck.error.message}`);
+                    } else if (cCheck.isSymbolicLink) {
                       hasUnsafeSymlink = true;
                       reasons.push(`Staging artifact (staging/${sEntry}/${cEntry}) is a symbolic link`);
                     }
                   }
                 } catch (readErr) {
+                  hasInspectionError = true;
+                  inspectionErrors.push(`Failed to inspect staging contents for transaction ${sEntry}: ${readErr.message}`);
                   reasons.push(`Failed to inspect staging contents for transaction ${sEntry}: ${readErr.message}`);
                 }
               }
@@ -184,6 +204,8 @@ export function inspectTransactionState(repoRoot) {
           }
         }
       } catch (err) {
+        hasInspectionError = true;
+        inspectionErrors.push(`Failed to read staging directory: ${err.message}`);
         reasons.push(`Failed to read staging directory: ${err.message}`);
       }
     }
@@ -192,7 +214,11 @@ export function inspectTransactionState(repoRoot) {
   // Inspect recognized directory: backup
   const backupPath = path.join(ciPatchDir, 'backup');
   const backupCheck = getPathLstat(backupPath);
-  if (backupCheck.exists) {
+  if (backupCheck.error) {
+    hasInspectionError = true;
+    inspectionErrors.push(`Failed to inspect backup path (.ci-patch/backup): ${backupCheck.error.message}`);
+    reasons.push(`Failed to inspect backup path (.ci-patch/backup): ${backupCheck.error.message}`);
+  } else if (backupCheck.exists) {
     if (backupCheck.isSymbolicLink) {
       hasUnsafeSymlink = true;
       reasons.push('Backup path (.ci-patch/backup) is a symbolic link');
@@ -211,7 +237,11 @@ export function inspectTransactionState(repoRoot) {
             for (const bEntry of backupEntries) {
               const bSubPath = path.join(backupPath, bEntry);
               const bSubCheck = getPathLstat(bSubPath);
-              if (bSubCheck.isSymbolicLink) {
+              if (bSubCheck.error) {
+                hasInspectionError = true;
+                inspectionErrors.push(`Failed to inspect backup component (backup/${bEntry}): ${bSubCheck.error.message}`);
+                reasons.push(`Failed to inspect backup component (backup/${bEntry}): ${bSubCheck.error.message}`);
+              } else if (bSubCheck.isSymbolicLink) {
                 hasUnsafeSymlink = true;
                 reasons.push(`Backup component (backup/${bEntry}) is a symbolic link`);
               } else if (bEntry !== expectedTxId) {
@@ -223,12 +253,18 @@ export function inspectTransactionState(repoRoot) {
                   for (const cEntry of txChildren) {
                     const cPath = path.join(bSubPath, cEntry);
                     const cCheck = getPathLstat(cPath);
-                    if (cCheck.isSymbolicLink) {
+                    if (cCheck.error) {
+                      hasInspectionError = true;
+                      inspectionErrors.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
+                      reasons.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
+                    } else if (cCheck.isSymbolicLink) {
                       hasUnsafeSymlink = true;
                       reasons.push(`Backup artifact (backup/${bEntry}/${cEntry}) is a symbolic link`);
                     }
                   }
                 } catch (readErr) {
+                  hasInspectionError = true;
+                  inspectionErrors.push(`Failed to inspect backup contents for transaction ${bEntry}: ${readErr.message}`);
                   reasons.push(`Failed to inspect backup contents for transaction ${bEntry}: ${readErr.message}`);
                 }
               }
@@ -236,6 +272,8 @@ export function inspectTransactionState(repoRoot) {
           }
         }
       } catch (err) {
+        hasInspectionError = true;
+        inspectionErrors.push(`Failed to read backup directory: ${err.message}`);
         reasons.push(`Failed to read backup directory: ${err.message}`);
       }
     }
@@ -279,6 +317,8 @@ export function inspectTransactionState(repoRoot) {
 
   if (hasUnsafeSymlink) {
     state = 'unsafe-symlink';
+  } else if (hasInspectionError) {
+    state = 'inspection-error';
   } else if (foreignEntries.length > 0) {
     state = 'foreign-content';
   } else if (orphanedArtifacts.length > 0) {
