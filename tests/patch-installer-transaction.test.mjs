@@ -24,6 +24,8 @@ import {
   validateJournalStructure,
   validatePhaseTransition,
   safeUnlinkCreatedFile,
+  isValidDeviceIdentifier,
+  isValidInodeIdentifier,
   JOURNAL_SCHEMA_VERSION,
   PERMITTED_PHASES,
 } from '../src/patch-installer/journal.js';
@@ -1816,22 +1818,109 @@ describe('P3B-1-F: Temporary Journal Preservation and Ownership (journal.js)', (
     }
   });
 
-  test('safeUnlinkCreatedFile positively verifies identity and refuses to unlink symlinks, directories, or mismatched files', () => {
-    const dir = createTempDir('safe-unlink-test-');
-    const regularFile = path.join(dir, 'regular.txt');
-    fs.writeFileSync(regularFile, 'hello', 'utf8');
+  test('isValidDeviceIdentifier and isValidInodeIdentifier strictly validate identifier constraints', () => {
+    // Device: non-negative integer, rejects negative, non-integers, NaN, strings, null, undefined
+    assert.equal(isValidDeviceIdentifier(0), true);
+    assert.equal(isValidDeviceIdentifier(1), true);
+    assert.equal(isValidDeviceIdentifier(2049), true);
+    assert.equal(isValidDeviceIdentifier(100n), true);
+    assert.equal(isValidDeviceIdentifier(0n), true);
+    assert.equal(isValidDeviceIdentifier(-1), false);
+    assert.equal(isValidDeviceIdentifier(-1n), false);
+    assert.equal(isValidDeviceIdentifier(NaN), false);
+    assert.equal(isValidDeviceIdentifier(1.5), false);
+    assert.equal(isValidDeviceIdentifier('123'), false);
+    assert.equal(isValidDeviceIdentifier(null), false);
+    assert.equal(isValidDeviceIdentifier(undefined), false);
+    assert.equal(isValidDeviceIdentifier({}), false);
+
+    // Inode: positive nonzero integer, rejects 0, negative, non-integers, NaN, strings, null, undefined
+    assert.equal(isValidInodeIdentifier(1), true);
+    assert.equal(isValidInodeIdentifier(412356), true);
+    assert.equal(isValidInodeIdentifier(1n), true);
+    assert.equal(isValidInodeIdentifier(0), false);
+    assert.equal(isValidInodeIdentifier(0n), false);
+    assert.equal(isValidInodeIdentifier(-1), false);
+    assert.equal(isValidInodeIdentifier(-1n), false);
+    assert.equal(isValidInodeIdentifier(NaN), false);
+    assert.equal(isValidInodeIdentifier(2.5), false);
+    assert.equal(isValidInodeIdentifier('456'), false);
+    assert.equal(isValidInodeIdentifier(null), false);
+    assert.equal(isValidInodeIdentifier(undefined), false);
+    assert.equal(isValidInodeIdentifier([]), false);
+  });
+
+  test('safeUnlinkCreatedFile strictly requires valid positive identity and refuses deletion on invalid or missing identifiers', () => {
+    const dir = createTempDir('safe-unlink-identity-');
+    const regularFile = path.join(dir, 'evidence.txt');
+    const expectedContent = 'precious-evidence-never-delete';
+    fs.writeFileSync(regularFile, expectedContent, 'utf8');
     const stat = fs.statSync(regularFile);
 
-    // Non-existent file returns false
+    const invalidDevCases = [
+      null,
+      undefined,
+      -1,
+      -9999,
+      NaN,
+      '123',
+      'dev-string',
+      1.5,
+      {},
+      [],
+      true,
+      false,
+    ];
+
+    const invalidInoCases = [
+      null,
+      undefined,
+      0,
+      -1,
+      -9999,
+      NaN,
+      '456',
+      'ino-string',
+      2.5,
+      {},
+      [],
+      true,
+      false,
+    ];
+
+    for (const badDev of invalidDevCases) {
+      assert.equal(safeUnlinkCreatedFile(regularFile, badDev, stat.ino), false);
+      assert.ok(fs.existsSync(regularFile), `File must survive invalid dev: ${badDev}`);
+      assert.equal(fs.readFileSync(regularFile, 'utf8'), expectedContent);
+    }
+
+    for (const badIno of invalidInoCases) {
+      assert.equal(safeUnlinkCreatedFile(regularFile, stat.dev, badIno), false);
+      assert.ok(fs.existsSync(regularFile), `File must survive invalid ino: ${badIno}`);
+      assert.equal(fs.readFileSync(regularFile, 'utf8'), expectedContent);
+    }
+
+    // Both undefined or null
+    assert.equal(safeUnlinkCreatedFile(regularFile, undefined, undefined), false);
+    assert.ok(fs.existsSync(regularFile));
+    assert.equal(fs.readFileSync(regularFile, 'utf8'), expectedContent);
+
+    assert.equal(safeUnlinkCreatedFile(regularFile, null, null), false);
+    assert.ok(fs.existsSync(regularFile));
+    assert.equal(fs.readFileSync(regularFile, 'utf8'), expectedContent);
+
+    // Non-existent target file returns false
     assert.equal(safeUnlinkCreatedFile(path.join(dir, 'nonexistent.txt'), stat.dev, stat.ino), false);
 
-    // Mismatched ino returns false and preserves file
-    assert.equal(safeUnlinkCreatedFile(regularFile, stat.dev, stat.ino + 9999), false);
-    assert.ok(fs.existsSync(regularFile));
-
     // Mismatched dev returns false and preserves file
-    assert.equal(safeUnlinkCreatedFile(regularFile, stat.dev + 9999, stat.ino), false);
+    assert.equal(safeUnlinkCreatedFile(regularFile, stat.dev + 99999, stat.ino), false);
     assert.ok(fs.existsSync(regularFile));
+    assert.equal(fs.readFileSync(regularFile, 'utf8'), expectedContent);
+
+    // Mismatched ino returns false and preserves file
+    assert.equal(safeUnlinkCreatedFile(regularFile, stat.dev, stat.ino + 99999), false);
+    assert.ok(fs.existsSync(regularFile));
+    assert.equal(fs.readFileSync(regularFile, 'utf8'), expectedContent);
 
     // Symlink targeting regularFile returns false and preserves both
     const linkPath = path.join(dir, 'symlink.txt');
@@ -1839,6 +1928,7 @@ describe('P3B-1-F: Temporary Journal Preservation and Ownership (journal.js)', (
     assert.equal(safeUnlinkCreatedFile(linkPath, stat.dev, stat.ino), false);
     assert.ok(fs.existsSync(linkPath));
     assert.ok(fs.existsSync(regularFile));
+    assert.equal(fs.readFileSync(regularFile, 'utf8'), expectedContent);
 
     // Directory returns false and preserves directory
     const subDir = path.join(dir, 'subfolder');
@@ -1847,9 +1937,102 @@ describe('P3B-1-F: Temporary Journal Preservation and Ownership (journal.js)', (
     assert.equal(safeUnlinkCreatedFile(subDir, dirStat.dev, dirStat.ino), false);
     assert.ok(fs.existsSync(subDir));
 
-    // Correct matching regular file unlinks successfully
+    // Filesystem lstat error fails closed and preserves file
+    const origLstat = fs.lstatSync;
+    fs.lstatSync = () => {
+      const err = new Error('Simulated EACCES inspection error');
+      err.code = 'EACCES';
+      throw err;
+    };
+    try {
+      assert.equal(safeUnlinkCreatedFile(regularFile, stat.dev, stat.ino), false);
+      assert.ok(fs.existsSync(regularFile));
+      assert.equal(fs.readFileSync(regularFile, 'utf8'), expectedContent);
+    } finally {
+      fs.lstatSync = origLstat;
+    }
+
+    // Matching valid dev and ino succeeds and unlinks
     assert.equal(safeUnlinkCreatedFile(regularFile, stat.dev, stat.ino), true);
     assert.ok(!fs.existsSync(regularFile));
+  });
+
+  test('failure to establish temporary file identity in writeJournalDurable preserves temporary file and fails closed', () => {
+    const repo = createTempDir('journal-identity-fail-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const originalFstatSync = fs.fstatSync;
+    fs.fstatSync = () => {
+      const err = new Error('Simulated fstatSync failure (EIO)');
+      err.code = 'EIO';
+      throw err;
+    };
+
+    try {
+      const res = createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.stage, 'pre-publication');
+      assert.match(res.error, /Simulated fstatSync failure/);
+
+      // Verify that the temporary file was NOT deleted and is preserved for evidence
+      const tmpPath = path.join(repo, '.ci-patch', `.journal.${txId}.tmp`);
+      assert.ok(fs.existsSync(tmpPath), 'Temporary file must be preserved when identity cannot be established');
+
+      // Verify journal was NOT published
+      assert.ok(!fs.existsSync(path.join(repo, '.ci-patch', 'journal.json')));
+    } finally {
+      fs.fstatSync = originalFstatSync;
+    }
+  });
+
+  test('fstatSync returning unusable zero inode in writeJournalDurable preserves temporary file and fails closed', () => {
+    const repo = createTempDir('journal-zero-ino-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const originalFstatSync = fs.fstatSync;
+    fs.fstatSync = (fd) => {
+      const realStat = originalFstatSync(fd);
+      return {
+        ...realStat,
+        ino: 0, // Unusable zero inode
+      };
+    };
+
+    try {
+      const res = createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.stage, 'pre-publication');
+      assert.match(res.error, /Failed to establish usable file identity/);
+
+      // Verify that the temporary file was preserved
+      const tmpPath = path.join(repo, '.ci-patch', `.journal.${txId}.tmp`);
+      assert.ok(fs.existsSync(tmpPath), 'Temporary file must be preserved when inode is zero');
+
+      // Verify journal was NOT published
+      assert.ok(!fs.existsSync(path.join(repo, '.ci-patch', 'journal.json')));
+    } finally {
+      fs.fstatSync = originalFstatSync;
+    }
   });
 
   test('valid journal creation and permitted phase updates advance through complete lifecycle', () => {

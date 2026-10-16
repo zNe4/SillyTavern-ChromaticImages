@@ -380,27 +380,72 @@ export function inspectJournal(repoRoot) {
 }
 
 /**
+ * Validate device identifier. Must be a finite non-negative integer (Number or BigInt).
+ * Rejects null, undefined, NaN, negative numbers, floats, strings, and non-numerics.
+ *
+ * @param {unknown} val
+ * @returns {boolean}
+ */
+export function isValidDeviceIdentifier(val) {
+  if (typeof val === 'bigint') {
+    return val >= 0n;
+  }
+  if (typeof val !== 'number') {
+    return false;
+  }
+  return Number.isFinite(val) && !Number.isNaN(val) && Number.isInteger(val) && val >= 0;
+}
+
+/**
+ * Validate inode identifier. Must be a finite positive (nonzero) integer (Number or BigInt).
+ * In POSIX/Linux, inode 0 indicates an unused or sentinel inode.
+ * Rejects null, undefined, NaN, zero, negative numbers, floats, strings, and non-numerics.
+ *
+ * @param {unknown} val
+ * @returns {boolean}
+ */
+export function isValidInodeIdentifier(val) {
+  if (typeof val === 'bigint') {
+    return val > 0n;
+  }
+  if (typeof val !== 'number') {
+    return false;
+  }
+  return Number.isFinite(val) && !Number.isNaN(val) && Number.isInteger(val) && val > 0;
+}
+
+/**
  * Safely unlink a temporary file created by the current operation.
- * Positively verifies ownership and identity against the expected dev/ino,
- * ensuring the path exists, is a regular file, and is not a symbolic link.
- * Preserves the file when identity or safety cannot be proven.
+ * Positively verifies ownership and identity against the expected dev/ino.
+ * Refuses deletion unless:
+ * - expectedDev is present and a valid non-negative integer.
+ * - expectedIno is present and a valid positive (nonzero) integer.
+ * - target exists, is a regular file, and is not a symbolic link.
+ * - lstat succeeds without an inspection error.
+ * - actual dev and ino match expectedDev and expectedIno.
+ * Preserves the file when identity, ownership, or cleanup safety cannot be proven.
  *
  * @param {string} targetPath
- * @param {number|null} expectedDev
- * @param {number|null} expectedIno
+ * @param {number|bigint} expectedDev
+ * @param {number|bigint} expectedIno
  * @returns {boolean} True if safely unlinked; false if preserved or failed
  */
 export function safeUnlinkCreatedFile(targetPath, expectedDev, expectedIno) {
+  if (!targetPath || typeof targetPath !== 'string') {
+    return false;
+  }
+  if (!isValidDeviceIdentifier(expectedDev) || !isValidInodeIdentifier(expectedIno)) {
+    return false;
+  }
+
   try {
     const check = getPathLstat(targetPath);
-    if (!check.exists || check.isSymbolicLink || !check.isFile || !check.stat) {
+    if (check.error || !check.exists || check.isSymbolicLink || !check.isFile || !check.stat) {
       return false;
     }
-    if (expectedDev !== null && expectedIno !== null && expectedIno !== 0) {
-      if (check.stat.dev !== expectedDev || check.stat.ino !== expectedIno) {
-        // Path was replaced or does not match our created file; preserve evidence
-        return false;
-      }
+    if (check.stat.dev !== expectedDev || check.stat.ino !== expectedIno) {
+      // Path was replaced or does not match our created file; preserve evidence
+      return false;
     }
     fs.unlinkSync(targetPath);
     return true;
@@ -454,6 +499,9 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
     );
     fileCreatedByUs = true;
     const stat = fs.fstatSync(tmpFd);
+    if (!isValidDeviceIdentifier(stat?.dev) || !isValidInodeIdentifier(stat?.ino)) {
+      throw new Error(`Failed to establish usable file identity: dev=${stat?.dev}, ino=${stat?.ino}`);
+    }
     createdDev = stat.dev;
     createdIno = stat.ino;
 
