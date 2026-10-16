@@ -22,6 +22,38 @@ const RECOGNIZED_ENTRIES = Object.freeze([
 const TMP_JOURNAL_REGEX = /^\.journal\..*\.tmp$/;
 
 /**
+ * Allowed artifact file basenames for a transaction's staging or backup directory.
+ * Narrow explicit contract for P3B-1.
+ * Final details for multi-file or full directory tree mirroring will be formalized in P3B-2.
+ *
+ * @param {object|null} journal
+ * @param {'staging'|'backup'} kind
+ * @returns {Set<string>}
+ */
+export function getPermittedArtifactNames(journal, kind) {
+  const permitted = new Set();
+  if (!journal) return permitted;
+
+  if (typeof journal.targetFile === 'string' && journal.targetFile.trim() !== '') {
+    const base = path.basename(journal.targetFile.trim());
+    permitted.add(base);
+    if (kind === 'backup') {
+      permitted.add(`${base}.bak`);
+      permitted.add(`${base}.orig`);
+    }
+  }
+
+  if (kind === 'staging' && typeof journal.stagedPath === 'string' && journal.stagedPath.trim() !== '') {
+    permitted.add(path.basename(journal.stagedPath.trim()));
+  }
+  if (kind === 'backup' && typeof journal.backupPath === 'string' && journal.backupPath.trim() !== '') {
+    permitted.add(path.basename(journal.backupPath.trim()));
+  }
+
+  return permitted;
+}
+
+/**
  * Perform comprehensive read-only inspection of installer transaction metadata.
  * Never mutates, acquires, steals, or deletes locks or journals.
  * Detects orphaned artifacts, dangling symlinks, and ambiguous metadata.
@@ -143,6 +175,54 @@ export function inspectTransactionState(repoRoot) {
     }
   }
 
+  // Full lock/journal transaction consistency
+  let isMismatched = false;
+  if (hasLock && hasJournal && lockInspection.isValid && journalInspection.isValid && lockInspection.owner && journalInspection.journal) {
+    const lockOwner = lockInspection.owner;
+    const journalObj = journalInspection.journal;
+
+    // 1. Transaction ID match
+    if (lockOwner.txId !== journalObj.txId) {
+      isMismatched = true;
+      reasons.push(
+        `Transaction ID mismatch: lock belongs to "${lockOwner.txId}" but journal belongs to "${journalObj.txId}"`
+      );
+    }
+
+    // 2. Operation match ('apply' vs 'remove')
+    if (lockOwner.op !== journalObj.op) {
+      isMismatched = true;
+      reasons.push(
+        `Transaction operation mismatch: lock operation is "${lockOwner.op}" but journal operation is "${journalObj.op}"`
+      );
+    }
+
+    // 3. Repository root match
+    if (path.resolve(lockOwner.repoRoot) !== path.resolve(repoRoot)) {
+      isMismatched = true;
+      reasons.push(
+        `Transaction repository root mismatch: lock repoRoot "${lockOwner.repoRoot}" does not match inspected repoRoot "${repoRoot}"`
+      );
+    }
+  }
+
+  // Corrupted lock
+  if (hasLock && !lockInspection.isValid) {
+    reasons.push(...lockInspection.errors);
+  }
+
+  // Corrupted journal
+  if (hasJournal && !journalInspection.isValid) {
+    reasons.push(...journalInspection.errors);
+  }
+
+  // Orphaned journal (journal exists without lock)
+  if (hasJournal && !hasLock) {
+    reasons.push(
+      `Orphaned journal detected: journal exists in phase "${journalInspection.journal?.phase || 'unknown'}" without an active lock`
+    );
+  }
+
   // Inspect recognized directory: staging
   const stagingPath = path.join(ciPatchDir, 'staging');
   const stagingCheck = getPathLstat(stagingPath);
@@ -166,9 +246,11 @@ export function inspectTransactionState(repoRoot) {
             reasons.push(`Non-empty staging directory detected with no active valid transaction: ${stagingEntries.join(', ')}`);
           } else {
             const expectedTxId = lockInspection.owner.txId;
+
             for (const sEntry of stagingEntries) {
               const sSubPath = path.join(stagingPath, sEntry);
               const sSubCheck = getPathLstat(sSubPath);
+
               if (sSubCheck.error) {
                 hasInspectionError = true;
                 inspectionErrors.push(`Failed to inspect staging component (staging/${sEntry}): ${sSubCheck.error.message}`);
@@ -179,19 +261,53 @@ export function inspectTransactionState(repoRoot) {
               } else if (sEntry !== expectedTxId) {
                 orphanedArtifacts.push(`staging/${sEntry}`);
                 reasons.push(`Staging entry "${sEntry}" does not match active transaction "${expectedTxId}"`);
-              } else if (sSubCheck.isDirectory) {
+              } else if (!sSubCheck.isDirectory) {
+                orphanedArtifacts.push(`staging/${sEntry}`);
+                reasons.push(`Staging entry "staging/${sEntry}" is not a directory`);
+              } else {
+                // Inspect inside staging/<txId>
                 try {
                   const txChildren = fs.readdirSync(sSubPath);
-                  for (const cEntry of txChildren) {
-                    const cPath = path.join(sSubPath, cEntry);
-                    const cCheck = getPathLstat(cPath);
-                    if (cCheck.error) {
-                      hasInspectionError = true;
-                      inspectionErrors.push(`Failed to inspect staging artifact (staging/${sEntry}/${cEntry}): ${cCheck.error.message}`);
-                      reasons.push(`Failed to inspect staging artifact (staging/${sEntry}/${cEntry}): ${cCheck.error.message}`);
-                    } else if (cCheck.isSymbolicLink) {
-                      hasUnsafeSymlink = true;
-                      reasons.push(`Staging artifact (staging/${sEntry}/${cEntry}) is a symbolic link`);
+
+                  if (txChildren.length > 0) {
+                    if (!hasJournal || !journalInspection.isValid || !journalInspection.journal || isMismatched) {
+                      orphanedArtifacts.push(...txChildren.map((c) => `staging/${sEntry}/${c}`));
+                      reasons.push(`Staging directory for "${expectedTxId}" contains artifacts but journal is missing, invalid, or mismatched`);
+                    } else {
+                      const journalObj = journalInspection.journal;
+
+                      // Phase consistency: in 'LOCKED', staging has not been prepared yet!
+                      if (journalObj.phase === 'LOCKED') {
+                        orphanedArtifacts.push(...txChildren.map((c) => `staging/${sEntry}/${c}`));
+                        reasons.push(`Staging directory contains artifacts in phase "${journalObj.phase}" before staging preparation: ${txChildren.join(', ')}`);
+                      } else {
+                        const permittedStagingNames = getPermittedArtifactNames(journalObj, 'staging');
+                        for (const cEntry of txChildren) {
+                          const cPath = path.join(sSubPath, cEntry);
+                          const cCheck = getPathLstat(cPath);
+
+                          if (cCheck.error) {
+                            hasInspectionError = true;
+                            inspectionErrors.push(`Failed to inspect staging artifact (staging/${sEntry}/${cEntry}): ${cCheck.error.message}`);
+                            reasons.push(`Failed to inspect staging artifact (staging/${sEntry}/${cEntry}): ${cCheck.error.message}`);
+                          } else if (cCheck.isSymbolicLink) {
+                            hasUnsafeSymlink = true;
+                            reasons.push(`Staging artifact (staging/${sEntry}/${cEntry}) is a symbolic link`);
+                          } else if (cCheck.isDirectory) {
+                            // Subdirectories are unexpected in P3B-1 flat staging contract
+                            orphanedArtifacts.push(`staging/${sEntry}/${cEntry}`);
+                            reasons.push(`Unexpected subdirectory in staging: "staging/${sEntry}/${cEntry}"`);
+                          } else if (!cCheck.isFile) {
+                            // Unsupported filesystem object type (FIFO, socket, device)
+                            orphanedArtifacts.push(`staging/${sEntry}/${cEntry}`);
+                            reasons.push(`Unsupported filesystem object type in staging: "staging/${sEntry}/${cEntry}"`);
+                          } else if (!permittedStagingNames.has(cEntry)) {
+                            // Unexpected regular file
+                            orphanedArtifacts.push(`staging/${sEntry}/${cEntry}`);
+                            reasons.push(`Unexpected regular file in staging: "staging/${sEntry}/${cEntry}" (permitted: ${Array.from(permittedStagingNames).join(', ')})`);
+                          }
+                        }
+                      }
                     }
                   }
                 } catch (readErr) {
@@ -237,6 +353,7 @@ export function inspectTransactionState(repoRoot) {
             for (const bEntry of backupEntries) {
               const bSubPath = path.join(backupPath, bEntry);
               const bSubCheck = getPathLstat(bSubPath);
+
               if (bSubCheck.error) {
                 hasInspectionError = true;
                 inspectionErrors.push(`Failed to inspect backup component (backup/${bEntry}): ${bSubCheck.error.message}`);
@@ -247,19 +364,53 @@ export function inspectTransactionState(repoRoot) {
               } else if (bEntry !== expectedTxId) {
                 orphanedArtifacts.push(`backup/${bEntry}`);
                 reasons.push(`Backup entry "${bEntry}" does not match active transaction "${expectedTxId}"`);
-              } else if (bSubCheck.isDirectory) {
+              } else if (!bSubCheck.isDirectory) {
+                orphanedArtifacts.push(`backup/${bEntry}`);
+                reasons.push(`Backup entry "backup/${bEntry}" is not a directory`);
+              } else {
+                // Inspect inside backup/<txId>
                 try {
                   const txChildren = fs.readdirSync(bSubPath);
-                  for (const cEntry of txChildren) {
-                    const cPath = path.join(bSubPath, cEntry);
-                    const cCheck = getPathLstat(cPath);
-                    if (cCheck.error) {
-                      hasInspectionError = true;
-                      inspectionErrors.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
-                      reasons.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
-                    } else if (cCheck.isSymbolicLink) {
-                      hasUnsafeSymlink = true;
-                      reasons.push(`Backup artifact (backup/${bEntry}/${cEntry}) is a symbolic link`);
+
+                  if (txChildren.length > 0) {
+                    if (!hasJournal || !journalInspection.isValid || !journalInspection.journal || isMismatched) {
+                      orphanedArtifacts.push(...txChildren.map((c) => `backup/${bEntry}/${c}`));
+                      reasons.push(`Backup directory for "${expectedTxId}" contains artifacts but journal is missing, invalid, or mismatched`);
+                    } else {
+                      const journalObj = journalInspection.journal;
+
+                      // Phase consistency: in 'LOCKED' or 'ISOLATED_PREPARED', backup has not been created yet!
+                      if (journalObj.phase === 'LOCKED' || journalObj.phase === 'ISOLATED_PREPARED') {
+                        orphanedArtifacts.push(...txChildren.map((c) => `backup/${bEntry}/${c}`));
+                        reasons.push(`Backup directory contains artifacts in phase "${journalObj.phase}" before backup creation: ${txChildren.join(', ')}`);
+                      } else {
+                        const permittedBackupNames = getPermittedArtifactNames(journalObj, 'backup');
+                        for (const cEntry of txChildren) {
+                          const cPath = path.join(bSubPath, cEntry);
+                          const cCheck = getPathLstat(cPath);
+
+                          if (cCheck.error) {
+                            hasInspectionError = true;
+                            inspectionErrors.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
+                            reasons.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
+                          } else if (cCheck.isSymbolicLink) {
+                            hasUnsafeSymlink = true;
+                            reasons.push(`Backup artifact (backup/${bEntry}/${cEntry}) is a symbolic link`);
+                          } else if (cCheck.isDirectory) {
+                            // Subdirectories are unexpected in P3B-1 flat backup contract
+                            orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
+                            reasons.push(`Unexpected subdirectory in backup: "backup/${bEntry}/${cEntry}"`);
+                          } else if (!cCheck.isFile) {
+                            // Unsupported filesystem object type (FIFO, socket, device)
+                            orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
+                            reasons.push(`Unsupported filesystem object type in backup: "backup/${bEntry}/${cEntry}"`);
+                          } else if (!permittedBackupNames.has(cEntry)) {
+                            // Unexpected regular file
+                            orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
+                            reasons.push(`Unexpected regular file in backup: "backup/${bEntry}/${cEntry}" (permitted: ${Array.from(permittedBackupNames).join(', ')})`);
+                          }
+                        }
+                      }
                     }
                   }
                 } catch (readErr) {
@@ -282,34 +433,6 @@ export function inspectTransactionState(repoRoot) {
   // Foreign content
   if (foreignEntries.length > 0) {
     reasons.push(`Installer directory contains unexpected foreign files: ${foreignEntries.join(', ')}`);
-  }
-
-  // Corrupted lock
-  if (hasLock && !lockInspection.isValid) {
-    reasons.push(...lockInspection.errors);
-  }
-
-  // Corrupted journal
-  if (hasJournal && !journalInspection.isValid) {
-    reasons.push(...journalInspection.errors);
-  }
-
-  // Mismatched transaction IDs
-  let isMismatched = false;
-  if (hasLock && hasJournal && lockInspection.isValid && journalInspection.isValid) {
-    if (lockInspection.owner.txId !== journalInspection.journal.txId) {
-      isMismatched = true;
-      reasons.push(
-        `Transaction ID mismatch: lock belongs to "${lockInspection.owner.txId}" but journal belongs to "${journalInspection.journal.txId}"`
-      );
-    }
-  }
-
-  // Orphaned journal (journal exists without lock)
-  if (hasJournal && !hasLock) {
-    reasons.push(
-      `Orphaned journal detected: journal exists in phase "${journalInspection.journal?.phase || 'unknown'}" without an active lock`
-    );
   }
 
   // Determine overall classification state

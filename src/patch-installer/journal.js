@@ -380,14 +380,46 @@ export function inspectJournal(repoRoot) {
 }
 
 /**
+ * Safely unlink a temporary file created by the current operation.
+ * Positively verifies ownership and identity against the expected dev/ino,
+ * ensuring the path exists, is a regular file, and is not a symbolic link.
+ * Preserves the file when identity or safety cannot be proven.
+ *
+ * @param {string} targetPath
+ * @param {number|null} expectedDev
+ * @param {number|null} expectedIno
+ * @returns {boolean} True if safely unlinked; false if preserved or failed
+ */
+export function safeUnlinkCreatedFile(targetPath, expectedDev, expectedIno) {
+  try {
+    const check = getPathLstat(targetPath);
+    if (!check.exists || check.isSymbolicLink || !check.isFile || !check.stat) {
+      return false;
+    }
+    if (expectedDev !== null && expectedIno !== null && expectedIno !== 0) {
+      if (check.stat.dev !== expectedDev || check.stat.ino !== expectedIno) {
+        // Path was replaced or does not match our created file; preserve evidence
+        return false;
+      }
+    }
+    fs.unlinkSync(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Atomically write and flush journal to disk with distinct pre-publication and post-publication error handling.
  * Employs atomic no-replace publication via same-directory hard link (link(2)) for initial creation.
  * Employs atomic replacement via rename(2) for later phase updates.
+ * Never unlinks a pre-existing temporary journal upon collision (EEXIST).
+ * Positively verifies created file ownership and identity before permitted cleanup.
  *
  * @param {string} repoRoot
  * @param {object} journal
  * @param {boolean} [isCreation=false]
- * @returns {{ ok: boolean, error?: string, stage?: 'pre-publication' | 'post-publication', journal?: object }}
+ * @returns {{ ok: boolean, error?: string, stage?: 'pre-publication' | 'post-publication' | 'pre-rename' | 'post-rename', journal?: object }}
  */
 function writeJournalDurable(repoRoot, journal, isCreation = false) {
   const ciPatchDir = getCiPatchDir(repoRoot);
@@ -409,31 +441,62 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
   const serialized = JSON.stringify(journal, null, 2) + '\n';
 
   // 1. Exclusive temporary file creation and fsync
-  try {
-    fs.writeFileSync(tmpJournalPath, serialized, {
-      flag: 'wx',
-      mode: 0o600,
-    });
+  let tmpFd = null;
+  let createdDev = null;
+  let createdIno = null;
+  let fileCreatedByUs = false;
 
-    const tmpFd = fs.openSync(tmpJournalPath, 'r');
-    try {
-      fs.fsyncSync(tmpFd);
-    } finally {
-      fs.closeSync(tmpFd);
-    }
+  try {
+    tmpFd = fs.openSync(
+      tmpJournalPath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600
+    );
+    fileCreatedByUs = true;
+    const stat = fs.fstatSync(tmpFd);
+    createdDev = stat.dev;
+    createdIno = stat.ino;
+
+    fs.writeSync(tmpFd, serialized, 0, 'utf8');
+    fs.fsyncSync(tmpFd);
   } catch (writeErr) {
-    try {
-      if (getPathLstat(tmpJournalPath).exists) {
-        fs.unlinkSync(tmpJournalPath);
+    if (tmpFd !== null) {
+      try {
+        fs.closeSync(tmpFd);
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
+      tmpFd = null;
     }
+
+    if (writeErr.code === 'EEXIST') {
+      // PRESERVE PRE-EXISTING ARTIFACT: do NOT unlink!
+      return {
+        ok: false,
+        stage: isCreation ? 'pre-publication' : 'pre-rename',
+        error: `Cannot prepare temporary journal: pre-existing temporary artifact "${path.basename(tmpJournalPath)}" already exists (collision)`,
+      };
+    }
+
+    if (fileCreatedByUs) {
+      // Safely unlink ONLY if we created it and its identity matches
+      safeUnlinkCreatedFile(tmpJournalPath, createdDev, createdIno);
+    }
+
     return {
       ok: false,
       stage: isCreation ? 'pre-publication' : 'pre-rename',
       error: `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${writeErr.message}`,
     };
+  }
+
+  if (tmpFd !== null) {
+    try {
+      fs.closeSync(tmpFd);
+    } catch {
+      // ignore
+    }
+    tmpFd = null;
   }
 
   if (isCreation) {
@@ -442,13 +505,7 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
     try {
       fs.linkSync(tmpJournalPath, journalPath);
     } catch (linkErr) {
-      try {
-        if (getPathLstat(tmpJournalPath).exists) {
-          fs.unlinkSync(tmpJournalPath);
-        }
-      } catch {
-        // ignore
-      }
+      safeUnlinkCreatedFile(tmpJournalPath, createdDev, createdIno);
 
       if (linkErr.code === 'EEXIST') {
         return {
@@ -492,9 +549,12 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
       };
     }
 
-    // 2. Remove the temporary link name
+    // 2. Remove the temporary link name with verified identity
     try {
-      fs.unlinkSync(tmpJournalPath);
+      const unlinked = safeUnlinkCreatedFile(tmpJournalPath, createdDev, createdIno);
+      if (!unlinked && getPathLstat(tmpJournalPath).exists) {
+        throw new Error('Temporary link ownership or identity could not be verified for removal');
+      }
     } catch (unlinkErr) {
       return {
         ok: false,
@@ -527,13 +587,7 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
     try {
       fs.renameSync(tmpJournalPath, journalPath);
     } catch (renameErr) {
-      try {
-        if (getPathLstat(tmpJournalPath).exists) {
-          fs.unlinkSync(tmpJournalPath);
-        }
-      } catch {
-        // ignore
-      }
+      safeUnlinkCreatedFile(tmpJournalPath, createdDev, createdIno);
       return {
         ok: false,
         stage: 'pre-rename',

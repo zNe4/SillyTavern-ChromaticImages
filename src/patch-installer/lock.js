@@ -133,6 +133,14 @@ export function validateLease(lease, expectedRepoRoot, expectedTxId, expectedOp)
     };
   }
 
+  if (activeEntry.status === 'uncertain') {
+    return {
+      ok: false,
+      error: 'lease-uncertain',
+      reason: `Transaction lease is uncertain: ${activeEntry.reason || 'prior release or synchronization failure'}`,
+    };
+  }
+
   if (!lease._verify(normRepo, normTxId, expectedOp, activeEntry.token)) {
     return {
       ok: false,
@@ -689,13 +697,21 @@ export function acquireLock(options = {}) {
  * Refuses to release foreign, corrupted, or unverified locks.
  * Strictly requires the acquisition lease capability.
  * Refuses cleanup if unexpected files exist in lock.d.
+ * Filesystem atomicity limitation note:
+ * POSIX / Linux provides no atomic operation to remove both a directory and its contents
+ * in a single system call. Therefore, owner.json must be unlinked prior to rmdir(lock.d).
+ * If rmdir fails (or a crash occurs in this narrow window), the implementation attempts
+ * to restore owner.json. If restoration also fails (e.g., EIO/hardware failure), lock.d
+ * may remain without owner.json, which is correctly detected as 'corrupted-lock' by
+ * inspectLock(). In any partial cleanup failure, the lease is marked 'uncertain' rather
+ * than reported as cleanly released.
  *
  * @param {object} options
  * @param {string} options.repoRoot
  * @param {string} options.txId
  * @param {TransactionLease} options.lease
  * @param {object} [options.expectedOwner]
- * @returns {{ ok: boolean, error?: string, reason?: string }}
+ * @returns {{ ok: boolean, error?: string, reason?: string, stage?: string, uncertain?: boolean }}
  */
 export function releaseLock(options = {}) {
   const { repoRoot, txId, lease, expectedOwner } = options;
@@ -818,7 +834,22 @@ export function releaseLock(options = {}) {
     };
   }
 
+  // Positively verify owner metadata file identity and content right before cleanup
   const ownerCheck = getPathLstat(ownerPath);
+  if (ownerCheck.error) {
+    return {
+      ok: false,
+      error: 'fs-error',
+      reason: `Failed to inspect lock owner file: ${ownerCheck.error.message}`,
+    };
+  }
+  if (!ownerCheck.exists) {
+    return {
+      ok: false,
+      error: 'unverified-lock',
+      reason: 'Cannot release lock: lock owner file does not exist',
+    };
+  }
   if (ownerCheck.isSymbolicLink) {
     return {
       ok: false,
@@ -826,14 +857,120 @@ export function releaseLock(options = {}) {
       reason: 'Cannot release lock: lock owner file is a symbolic link',
     };
   }
+  if (!ownerCheck.isFile) {
+    return {
+      ok: false,
+      error: 'unverified-lock',
+      reason: 'Cannot release lock: lock owner path is not a regular file',
+    };
+  }
 
+  let serializedOwner;
   try {
-    if (ownerCheck.exists) {
-      fs.unlinkSync(ownerPath);
+    serializedOwner = fs.readFileSync(ownerPath, 'utf8');
+    const parsedOwner = JSON.parse(serializedOwner);
+    const val = validateLockOwner(parsedOwner);
+    if (!val.valid) {
+      return {
+        ok: false,
+        error: 'unverified-lock',
+        reason: `Cannot release lock: owner metadata is invalid: ${val.errors.join('; ')}`,
+      };
     }
-    fs.rmdirSync(lockDirPath);
+    if (
+      parsedOwner.txId !== txId.trim() ||
+      parsedOwner.pid !== process.pid ||
+      parsedOwner.op !== expectedOp ||
+      path.resolve(parsedOwner.repoRoot) !== path.resolve(repoRoot)
+    ) {
+      return {
+        ok: false,
+        error: 'ownership-mismatch',
+        reason: 'Cannot release lock: owner metadata was replaced or modified before cleanup',
+      };
+    }
+    if (expectedOwner) {
+      if (expectedOwner.pid && parsedOwner.pid !== expectedOwner.pid) {
+        return { ok: false, error: 'ownership-mismatch', reason: 'Cannot release lock: PID mismatch' };
+      }
+      if (expectedOwner.hostname && parsedOwner.hostname !== expectedOwner.hostname) {
+        return { ok: false, error: 'ownership-mismatch', reason: 'Cannot release lock: hostname mismatch' };
+      }
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'unverified-lock',
+      reason: `Cannot release lock: failed to verify owner metadata: ${err.message}`,
+    };
+  }
 
-    // Sync containing .ci-patch directory
+  // Final check: confirm lock.d still contains only owner.json
+  try {
+    const finalEntries = fs.readdirSync(lockDirPath);
+    const finalUnexpected = finalEntries.filter((e) => e !== LOCK_OWNER_FILE);
+    if (finalUnexpected.length > 0) {
+      return {
+        ok: false,
+        error: 'unexpected-lock-contents',
+        reason: `Cannot release lock: lock directory contains unexpected entries: ${finalUnexpected.join(', ')}`,
+      };
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'fs-error',
+      reason: `Failed to inspect lock directory before unlink: ${err.message}`,
+    };
+  }
+
+  const normRepo = path.resolve(repoRoot);
+  const leaseKey = `${normRepo}:${txId.trim()}`;
+
+  // Step 1: Unlink owner metadata
+  try {
+    fs.unlinkSync(ownerPath);
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'fs-error',
+      stage: 'owner-unlink-failed',
+      reason: `Failed to remove lock owner metadata: ${err.message}`,
+    };
+  }
+
+  // Step 2: Remove lock directory
+  try {
+    fs.rmdirSync(lockDirPath);
+  } catch (rmdirErr) {
+    // Attempt to restore owner.json to preserve transaction evidence
+    try {
+      fs.writeFileSync(ownerPath, serializedOwner, { flag: 'wx', mode: 0o600 });
+    } catch {
+      // restore failed; documented filesystem limitation
+    }
+
+    // Mark lease outcome as uncertain in process state
+    const activeEntry = ACTIVE_LEASES.get(leaseKey);
+    if (activeEntry) {
+      ACTIVE_LEASES.set(leaseKey, {
+        ...activeEntry,
+        status: 'uncertain',
+        reason: `Lock directory removal failed: ${rmdirErr.message}`,
+      });
+    }
+
+    return {
+      ok: false,
+      error: 'fs-error',
+      stage: 'lock-removal-failed',
+      uncertain: true,
+      reason: `Failed to remove lock directory: ${rmdirErr.message}`,
+    };
+  }
+
+  // Step 3: Directory sync of containing .ci-patch
+  try {
     const ciPatchDir = getCiPatchDir(repoRoot);
     const dirCheck = getPathLstat(ciPatchDir);
     if (dirCheck.exists && dirCheck.isDirectory && !dirCheck.isSymbolicLink) {
@@ -844,18 +981,28 @@ export function releaseLock(options = {}) {
         fs.closeSync(dirFd);
       }
     }
+  } catch (syncErr) {
+    // Lock directory was removed on disk, but containing directory sync failed
+    const activeEntry = ACTIVE_LEASES.get(leaseKey);
+    if (activeEntry) {
+      ACTIVE_LEASES.set(leaseKey, {
+        ...activeEntry,
+        status: 'uncertain',
+        reason: `Containing directory sync failed after lock directory removal: ${syncErr.message}`,
+      });
+    }
 
-    // Revoke active lease upon successful release
-    const normRepo = path.resolve(repoRoot);
-    const leaseKey = `${normRepo}:${txId.trim()}`;
-    ACTIVE_LEASES.delete(leaseKey);
-
-    return { ok: true };
-  } catch (err) {
     return {
       ok: false,
       error: 'fs-error',
-      reason: `Failed to clean up lock directory: ${err.message}`,
+      stage: 'post-removal-sync',
+      uncertain: true,
+      reason: `Lock directory removed but directory synchronization failed: ${syncErr.message}`,
     };
   }
+
+  // Step 4: Revoke active lease ONLY upon complete established success
+  ACTIVE_LEASES.delete(leaseKey);
+
+  return { ok: true };
 }

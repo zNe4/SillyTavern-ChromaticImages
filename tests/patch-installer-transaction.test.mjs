@@ -23,12 +23,14 @@ import {
   inspectJournal,
   validateJournalStructure,
   validatePhaseTransition,
+  safeUnlinkCreatedFile,
   JOURNAL_SCHEMA_VERSION,
   PERMITTED_PHASES,
 } from '../src/patch-installer/journal.js';
 
 import {
   inspectTransactionState,
+  getPermittedArtifactNames,
 } from '../src/patch-installer/transaction-state.js';
 
 const tempDirsToClean = [];
@@ -1661,3 +1663,917 @@ describe('Fail-Closed Filesystem Inspection Errors & Preflight Refusal', () => {
     assert.equal(inspection.transaction.isPending, false);
   });
 });
+
+describe('P3B-1-F: Temporary Journal Preservation and Ownership (journal.js)', () => {
+  const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
+  const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
+
+  test('existing .journal.<txId>.tmp survives exclusive-creation collision unchanged', () => {
+    const repo = createTempDir('journal-collision-create-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const tmpPath = path.join(repo, '.ci-patch', `.journal.${txId}.tmp`);
+    const preExistingContent = 'precious-evidence-do-not-delete';
+    fs.writeFileSync(tmpPath, preExistingContent, 'utf8');
+
+    const res = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.stage, 'pre-publication');
+    assert.match(res.error, /already exists/);
+
+    // Verify evidence survived unchanged
+    assert.ok(fs.existsSync(tmpPath), 'Pre-existing temporary journal must not be deleted');
+    assert.equal(fs.readFileSync(tmpPath, 'utf8'), preExistingContent);
+
+    // Verify journal.json was not created
+    assert.ok(!fs.existsSync(path.join(repo, '.ci-patch', 'journal.json')));
+  });
+
+  test('advanceJournalPhase collision preserves existing artifact and previous durable journal', () => {
+    const repo = createTempDir('journal-collision-advance-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const createRes = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    assert.equal(createRes.ok, true);
+
+    const tmpPath = path.join(repo, '.ci-patch', `.journal.${txId}.tmp`);
+    const preExistingContent = 'unrelated-or-prior-tmp-artifact';
+    fs.writeFileSync(tmpPath, preExistingContent, 'utf8');
+
+    const advanceRes = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      lease,
+    });
+
+    assert.equal(advanceRes.ok, false);
+    assert.equal(advanceRes.stage, 'pre-rename');
+    assert.match(advanceRes.error, /already exists/);
+
+    // Verify evidence survived unchanged
+    assert.ok(fs.existsSync(tmpPath));
+    assert.equal(fs.readFileSync(tmpPath, 'utf8'), preExistingContent);
+
+    // Verify durable journal remains at LOCKED phase
+    const journalInspection = inspectJournal(repo);
+    assert.equal(journalInspection.isValid, true);
+    assert.equal(journalInspection.journal.phase, 'LOCKED');
+  });
+
+  test('pre-publication write/sync failure cleans up created tmp without deleting foreign file', () => {
+    const repo = createTempDir('journal-fail-cleanup-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const foreignPath = path.join(repo, '.ci-patch', 'foreign-artifact.txt');
+    fs.writeFileSync(foreignPath, 'keep-me', 'utf8');
+
+    const originalWriteSync = fs.writeSync;
+    fs.writeSync = () => {
+      const err = new Error('Simulated write failure (disk full)');
+      err.code = 'ENOSPC';
+      throw err;
+    };
+
+    try {
+      const res = createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.stage, 'pre-publication');
+      assert.match(res.error, /Simulated write failure/);
+    } finally {
+      fs.writeSync = originalWriteSync;
+    }
+
+    // Foreign file must remain intact
+    assert.ok(fs.existsSync(foreignPath));
+    assert.equal(fs.readFileSync(foreignPath, 'utf8'), 'keep-me');
+  });
+
+  test('post-publication directory sync failure reports durability uncertainty correctly', () => {
+    const repo = createTempDir('journal-post-sync-fail-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const originalFsyncSync = fs.fsyncSync;
+    let callCount = 0;
+    fs.fsyncSync = (fd) => {
+      callCount++;
+      // First fsyncSync is on the file descriptor; second is on the directory descriptor
+      if (callCount > 1) {
+        const err = new Error('Simulated directory fsync failure');
+        err.code = 'EIO';
+        throw err;
+      }
+      return originalFsyncSync(fd);
+    };
+
+    try {
+      const res = createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.stage, 'post-publication');
+      assert.match(res.error, /directory synchronization failed/);
+      assert.ok(res.journal, 'New journal object returned to avoid claiming old state is authoritative');
+    } finally {
+      fs.fsyncSync = originalFsyncSync;
+    }
+  });
+
+  test('safeUnlinkCreatedFile positively verifies identity and refuses to unlink symlinks, directories, or mismatched files', () => {
+    const dir = createTempDir('safe-unlink-test-');
+    const regularFile = path.join(dir, 'regular.txt');
+    fs.writeFileSync(regularFile, 'hello', 'utf8');
+    const stat = fs.statSync(regularFile);
+
+    // Non-existent file returns false
+    assert.equal(safeUnlinkCreatedFile(path.join(dir, 'nonexistent.txt'), stat.dev, stat.ino), false);
+
+    // Mismatched ino returns false and preserves file
+    assert.equal(safeUnlinkCreatedFile(regularFile, stat.dev, stat.ino + 9999), false);
+    assert.ok(fs.existsSync(regularFile));
+
+    // Mismatched dev returns false and preserves file
+    assert.equal(safeUnlinkCreatedFile(regularFile, stat.dev + 9999, stat.ino), false);
+    assert.ok(fs.existsSync(regularFile));
+
+    // Symlink targeting regularFile returns false and preserves both
+    const linkPath = path.join(dir, 'symlink.txt');
+    fs.symlinkSync(regularFile, linkPath);
+    assert.equal(safeUnlinkCreatedFile(linkPath, stat.dev, stat.ino), false);
+    assert.ok(fs.existsSync(linkPath));
+    assert.ok(fs.existsSync(regularFile));
+
+    // Directory returns false and preserves directory
+    const subDir = path.join(dir, 'subfolder');
+    fs.mkdirSync(subDir);
+    const dirStat = fs.statSync(subDir);
+    assert.equal(safeUnlinkCreatedFile(subDir, dirStat.dev, dirStat.ino), false);
+    assert.ok(fs.existsSync(subDir));
+
+    // Correct matching regular file unlinks successfully
+    assert.equal(safeUnlinkCreatedFile(regularFile, stat.dev, stat.ino), true);
+    assert.ok(!fs.existsSync(regularFile));
+  });
+
+  test('valid journal creation and permitted phase updates advance through complete lifecycle', () => {
+    const repo = createTempDir('journal-lifecycle-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const phases = ['LOCKED', 'ISOLATED_PREPARED', 'BACKUP_CREATED', 'READY_TO_SWAP', 'SWAPPED', 'COMPLETED'];
+    const createRes = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    assert.equal(createRes.ok, true);
+    assert.equal(createRes.journal.phase, 'LOCKED');
+
+    for (let i = 1; i < phases.length; i++) {
+      const nextPhase = phases[i];
+      const advRes = advanceJournalPhase({
+        repoRoot: repo,
+        txId,
+        nextPhase,
+        lease,
+      });
+      assert.equal(advRes.ok, true);
+      assert.equal(advRes.journal.phase, nextPhase);
+    }
+
+    const finalInspection = inspectJournal(repo);
+    assert.equal(finalInspection.journal.phase, 'COMPLETED');
+  });
+});
+
+describe('P3B-1-F: Strict Validation of Recognized Transaction Artifacts (transaction-state.js)', () => {
+  const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
+  const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
+
+  function setupRepo(prefix = 'st-tx-artifacts-') {
+    const repoDir = createTempDir(prefix);
+    execFileSync('git', ['init', '-q'], { cwd: repoDir });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoDir });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir });
+    return repoDir;
+  }
+
+  test('unexpected regular file in matching staging transaction directory is rejected as orphaned-artifact', async () => {
+    const repo = setupRepo('st-staging-unexpected-file-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      lease,
+    });
+
+    const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+    fs.mkdirSync(txStagingDir, { recursive: true });
+    // Permitted file
+    fs.writeFileSync(path.join(txStagingDir, 'stable-diffusion.js'), 'patched', 'utf8');
+    // Intruder file
+    fs.writeFileSync(path.join(txStagingDir, 'intruder.txt'), 'unexpected', 'utf8');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.ok(state.orphanedArtifacts.some((p) => p.endsWith('intruder.txt')));
+
+    const preflight = await checkInstallationPreflight({ targetDir: repo });
+    assert.equal(preflight.verdict, 'refused');
+    assert.equal(preflight.canApply, false);
+  });
+
+  test('unexpected subdirectory in staging transaction directory is rejected as orphaned-artifact', async () => {
+    const repo = setupRepo('st-staging-unexpected-dir-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      lease,
+    });
+
+    const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+    fs.mkdirSync(path.join(txStagingDir, 'unexpected-subdir'), { recursive: true });
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+
+    const preflight = await checkInstallationPreflight({ targetDir: repo });
+    assert.equal(preflight.verdict, 'refused');
+  });
+
+  test('unexpected regular file or subdirectory in backup transaction directory is rejected as orphaned-artifact', async () => {
+    const repo = setupRepo('st-backup-unexpected-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: { backupPath: path.join(repo, '.ci-patch/backup', txId, 'stable-diffusion.js.bak') },
+      lease,
+    });
+
+    const txBackupDir = path.join(repo, '.ci-patch/backup', txId);
+    fs.mkdirSync(txBackupDir, { recursive: true });
+    // Permitted file
+    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js.bak'), 'stock', 'utf8');
+    // Intruder regular file
+    fs.writeFileSync(path.join(txBackupDir, 'unrelated.png'), 'png', 'utf8');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.ok(state.orphanedArtifacts.some((p) => p.endsWith('unrelated.png')));
+
+    const preflight = await checkInstallationPreflight({ targetDir: repo });
+    assert.equal(preflight.verdict, 'refused');
+  });
+
+  test('foreign transaction directories in staging or backup are rejected as orphaned-artifact', async () => {
+    const repo = setupRepo('st-foreign-tx-dir-');
+    const txId = generateTxId();
+    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    // Staging contains a folder for a different txId
+    const foreignDir = path.join(repo, '.ci-patch/staging/other-tx-folder-1234');
+    fs.mkdirSync(foreignDir, { recursive: true });
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.ok(state.orphanedArtifacts.some((p) => p.includes('other-tx-folder-1234')));
+
+    const preflight = await checkInstallationPreflight({ targetDir: repo });
+    assert.equal(preflight.verdict, 'refused');
+  });
+
+  test('nested symlinks and dangling nested symlinks in transaction directories are rejected as unsafe-symlink', async () => {
+    const repo = setupRepo('st-nested-symlink-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      lease,
+    });
+
+    const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+    fs.mkdirSync(txStagingDir, { recursive: true });
+
+    // Dangling nested symlink
+    fs.symlinkSync('/nonexistent/path/outside', path.join(txStagingDir, 'stable-diffusion.js'));
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'unsafe-symlink');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('stable-diffusion.js')));
+
+    const preflight = await checkInstallationPreflight({ targetDir: repo });
+    assert.equal(preflight.verdict, 'refused');
+  });
+
+  test('child path inspection filesystem errors fail closed with inspection-error', async () => {
+    const repo = setupRepo('st-child-inspect-err-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      lease,
+    });
+
+    const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+    fs.mkdirSync(txStagingDir, { recursive: true });
+    fs.writeFileSync(path.join(txStagingDir, 'test.js'), 'code', 'utf8');
+
+    const originalLstat = fs.lstatSync;
+    fs.lstatSync = (p, opts) => {
+      if (typeof p === 'string' && p.endsWith('test.js')) {
+        const err = new Error('Simulated EACCES on child entry');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return originalLstat(p, opts);
+    };
+
+    try {
+      const state = inspectTransactionState(repo);
+      assert.equal(state.state, 'inspection-error');
+      assert.equal(state.isPending, true);
+
+      const preflight = await checkInstallationPreflight({ targetDir: repo });
+      assert.equal(preflight.verdict, 'refused');
+      assert.equal(preflight.exitCode, 1);
+    } finally {
+      fs.lstatSync = originalLstat;
+    }
+  });
+
+  test('premature staging or backup artifacts in LOCKED phase are rejected as orphaned-artifact', () => {
+    const repo = setupRepo('st-premature-artifacts-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    // Journal created in LOCKED phase (staging not yet prepared)
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+    fs.mkdirSync(txStagingDir, { recursive: true });
+    fs.writeFileSync(path.join(txStagingDir, 'stable-diffusion.js'), 'code', 'utf8');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.ok(state.orphanedArtifacts.some((p) => p.endsWith('stable-diffusion.js')));
+    assert.ok(state.reasons.some((r) => r.includes('before staging preparation')));
+  });
+
+  test('legitimate empty recognized directories report state: none and isPending: false', () => {
+    const repo = setupRepo('st-empty-recognized-');
+    fs.mkdirSync(path.join(repo, '.ci-patch/staging'), { recursive: true });
+    fs.mkdirSync(path.join(repo, '.ci-patch/backup'), { recursive: true });
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'none');
+    assert.equal(state.isPending, false);
+    assert.equal(state.hasLock, false);
+    assert.equal(state.hasJournal, false);
+    assert.equal(state.orphanedArtifacts.length, 0);
+  });
+
+  test('valid recognized transaction with permitted artifacts reports clean pending state without orphans', () => {
+    const repo = setupRepo('st-valid-tx-permitted-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      lease,
+    });
+
+    const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+    fs.mkdirSync(txStagingDir, { recursive: true });
+    fs.writeFileSync(path.join(txStagingDir, 'stable-diffusion.js'), 'valid-patched-code', 'utf8');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'ownership-unverified');
+    assert.equal(state.isPending, true);
+    assert.equal(state.orphanedArtifacts.length, 0);
+  });
+
+  test('getPermittedArtifactNames helper returns exact allowable filenames for staging and backup', () => {
+    const journal = {
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      stagedPath: '/path/to/custom-staged.js',
+      backupPath: '/path/to/custom-backup.js.bak',
+    };
+
+    const stagingAllowlist = getPermittedArtifactNames(journal, 'staging');
+    assert.ok(stagingAllowlist.has('stable-diffusion.js'));
+    assert.ok(stagingAllowlist.has('custom-staged.js'));
+    assert.ok(!stagingAllowlist.has('other.js'));
+
+    const backupAllowlist = getPermittedArtifactNames(journal, 'backup');
+    assert.ok(backupAllowlist.has('stable-diffusion.js'));
+    assert.ok(backupAllowlist.has('stable-diffusion.js.bak'));
+    assert.ok(backupAllowlist.has('stable-diffusion.js.orig'));
+    assert.ok(backupAllowlist.has('custom-backup.js.bak'));
+    assert.ok(!backupAllowlist.has('unrelated.png'));
+  });
+});
+
+describe('P3B-1-F: Lock Release Hardening Against Partial Cleanup Failures (lock.js)', () => {
+  test('unexpected files appearing in lock.d before release causes refusal without deletion', () => {
+    const repo = createTempDir('lock-release-unexpected-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    // Plant unexpected file
+    const intruderPath = path.join(repo, '.ci-patch/lock.d/intruder.txt');
+    fs.writeFileSync(intruderPath, 'unauthorized', 'utf8');
+
+    const res = releaseLock({ repoRoot: repo, txId, lease });
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'unexpected-lock-contents');
+
+    // Verify lock and intruder remain intact
+    assert.ok(fs.existsSync(intruderPath));
+    assert.ok(fs.existsSync(path.join(repo, '.ci-patch/lock.d/owner.json')));
+
+    // Lease should remain active because release was refused before mutation
+    const leaseCheck = validateLease(lease, repo, txId, 'apply');
+    assert.equal(leaseCheck.ok, true);
+  });
+
+  test('owner metadata modified or tampered before cleanup causes release refusal', () => {
+    const repo = createTempDir('lock-release-tampered-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    // Tamper owner.json
+    const ownerPath = path.join(repo, '.ci-patch/lock.d/owner.json');
+    const ownerData = JSON.parse(fs.readFileSync(ownerPath, 'utf8'));
+    ownerData.txId = generateTxId(); // foreign txId
+    fs.writeFileSync(ownerPath, JSON.stringify(ownerData, null, 2), 'utf8');
+
+    const res = releaseLock({ repoRoot: repo, txId, lease });
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'ownership-mismatch');
+
+    // Lock must remain intact
+    assert.ok(fs.existsSync(ownerPath));
+  });
+
+  test('owner metadata replaced by a symlink causes release refusal', () => {
+    const repo = createTempDir('lock-release-symlink-owner-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const ownerPath = path.join(repo, '.ci-patch/lock.d/owner.json');
+    fs.unlinkSync(ownerPath);
+    fs.symlinkSync('/dev/null', ownerPath);
+
+    const res = releaseLock({ repoRoot: repo, txId, lease });
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'unverified-lock');
+  });
+
+  test('failure to unlink owner metadata leaves lock intact with active lease', () => {
+    const repo = createTempDir('lock-unlink-owner-fail-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const originalUnlink = fs.unlinkSync;
+    fs.unlinkSync = (p) => {
+      if (typeof p === 'string' && p.endsWith('owner.json')) {
+        const err = new Error('Simulated unlink permission failure');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return originalUnlink(p);
+    };
+
+    try {
+      const res = releaseLock({ repoRoot: repo, txId, lease });
+      assert.equal(res.ok, false);
+      assert.equal(res.error, 'fs-error');
+      assert.equal(res.stage, 'owner-unlink-failed');
+
+      // Lease remains active because lock was not removed
+      const leaseCheck = validateLease(lease, repo, txId, 'apply');
+      assert.equal(leaseCheck.ok, true);
+    } finally {
+      fs.unlinkSync = originalUnlink;
+    }
+  });
+
+  test('failure to remove lock directory attempts owner restoration and marks lease uncertain', () => {
+    const repo = createTempDir('lock-rmdir-fail-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const originalRmdir = fs.rmdirSync;
+    fs.rmdirSync = (p) => {
+      if (typeof p === 'string' && p.endsWith('lock.d')) {
+        const err = new Error('Simulated rmdir failure (EIO)');
+        err.code = 'EIO';
+        throw err;
+      }
+      return originalRmdir(p);
+    };
+
+    try {
+      const res = releaseLock({ repoRoot: repo, txId, lease });
+      assert.equal(res.ok, false);
+      assert.equal(res.error, 'fs-error');
+      assert.equal(res.stage, 'lock-removal-failed');
+      assert.equal(res.uncertain, true);
+
+      // Verify owner.json restoration was attempted
+      const ownerPath = path.join(repo, '.ci-patch/lock.d/owner.json');
+      assert.ok(fs.existsSync(ownerPath), 'owner.json should be restored after failed rmdir');
+
+      // Verify lease is now marked uncertain
+      const leaseCheck = validateLease(lease, repo, txId, 'apply');
+      assert.equal(leaseCheck.ok, false);
+      assert.equal(leaseCheck.error, 'lease-uncertain');
+    } finally {
+      fs.rmdirSync = originalRmdir;
+    }
+  });
+
+  test('failure to synchronize containing directory after removal marks lease uncertain', () => {
+    const repo = createTempDir('lock-post-sync-fail-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const originalFsync = fs.fsyncSync;
+    fs.fsyncSync = () => {
+      const err = new Error('Simulated directory fsync failure');
+      err.code = 'EIO';
+      throw err;
+    };
+
+    try {
+      const res = releaseLock({ repoRoot: repo, txId, lease });
+      assert.equal(res.ok, false);
+      assert.equal(res.error, 'fs-error');
+      assert.equal(res.stage, 'post-removal-sync');
+      assert.equal(res.uncertain, true);
+
+      // Verify lease is marked uncertain
+      const leaseCheck = validateLease(lease, repo, txId, 'apply');
+      assert.equal(leaseCheck.ok, false);
+      assert.equal(leaseCheck.error, 'lease-uncertain');
+    } finally {
+      fs.fsyncSync = originalFsync;
+    }
+  });
+
+  test('successful release deletes lease from active set while uncertain release preserves lease as uncertain', () => {
+    const repo = createTempDir('lock-lease-distinction-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const res = releaseLock({ repoRoot: repo, txId, lease });
+    assert.equal(res.ok, true);
+
+    const leaseCheck = validateLease(lease, repo, txId, 'apply');
+    assert.equal(leaseCheck.ok, false);
+    assert.equal(leaseCheck.error, 'lease-not-active');
+  });
+
+  test('unrelated files in .ci-patch are preserved during lock release', () => {
+    const repo = createTempDir('lock-preserve-foreign-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const unrelatedLog = path.join(repo, '.ci-patch/installer-audit.log');
+    fs.writeFileSync(unrelatedLog, 'important-audit-trail', 'utf8');
+
+    const res = releaseLock({ repoRoot: repo, txId, lease });
+    assert.equal(res.ok, true);
+
+    assert.ok(fs.existsSync(unrelatedLog));
+    assert.equal(fs.readFileSync(unrelatedLog, 'utf8'), 'important-audit-trail');
+  });
+});
+
+describe('P3B-1-F: Full Lock/Journal Transaction Consistency', () => {
+  const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
+  const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
+
+  test('conflicting operation (lock apply vs journal remove) classified as mismatched-metadata', () => {
+    const repo = createTempDir('tx-op-mismatch-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    // createJournal refuses mismatched op at creation time
+    const resCreate = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'remove',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    assert.equal(resCreate.ok, false);
+    assert.equal(resCreate.code, 'lease-op-mismatch');
+
+    // If mismatched journal is already present on disk, inspectTransactionState rejects it
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const journalPath = path.join(repo, '.ci-patch/journal.json');
+    const journalData = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
+    journalData.op = 'remove';
+    fs.writeFileSync(journalPath, JSON.stringify(journalData, null, 2), 'utf8');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'mismatched-metadata');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Transaction operation mismatch')));
+  });
+
+  test('conflicting repository identity (repoRoot mismatch) classified as mismatched-metadata', () => {
+    const repo = createTempDir('tx-reporoot-mismatch-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    // Tamper lock owner repoRoot
+    const ownerPath = path.join(repo, '.ci-patch/lock.d/owner.json');
+    const owner = JSON.parse(fs.readFileSync(ownerPath, 'utf8'));
+    owner.repoRoot = '/completely/different/repo/root';
+    fs.writeFileSync(ownerPath, JSON.stringify(owner, null, 2), 'utf8');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'mismatched-metadata');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.toLowerCase().includes('repository root mismatch')));
+  });
+
+  test('corrupted lock directory (missing owner.json) with journal classified as corrupted-lock', () => {
+    const repo = createTempDir('tx-corrupt-lock-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    // Remove owner.json while leaving lock.d
+    fs.unlinkSync(path.join(repo, '.ci-patch/lock.d/owner.json'));
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'corrupted-lock');
+    assert.equal(state.isPending, true);
+  });
+
+  test('valid matching lock and journal metadata classified as ownership-unverified and consistent', () => {
+    const repo = createTempDir('tx-valid-matching-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'ownership-unverified');
+    assert.equal(state.isPending, true);
+    assert.equal(state.orphanedArtifacts.length, 0);
+  });
+
+  test('journal mutation strictly requires valid active lease matching txId and refuses uncertain or foreign lease', () => {
+    const repo = createTempDir('tx-journal-lease-enforcement-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    // Attempt mutation without lease
+    const noLeaseRes = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+    });
+    assert.equal(noLeaseRes.ok, false);
+    assert.equal(noLeaseRes.code, 'lease-required');
+
+    // Attempt mutation with foreign lease
+    const foreignTxId = generateTxId();
+    const foreignRepo = createTempDir('tx-foreign-lease-');
+    const { lease: foreignLease } = acquireLock({ repoRoot: foreignRepo, txId: foreignTxId, op: 'apply' });
+
+    const foreignLeaseRes = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      lease: foreignLease,
+    });
+    assert.equal(foreignLeaseRes.ok, false);
+    assert.equal(foreignLeaseRes.code, 'lease-tx-mismatch');
+
+    // Attempt mutation with uncertain lease
+    const uncertainRepo = createTempDir('tx-uncertain-lease-');
+    const uTxId = generateTxId();
+    const { lease: uLease } = acquireLock({ repoRoot: uncertainRepo, txId: uTxId, op: 'apply' });
+    createJournal({
+      repoRoot: uncertainRepo,
+      txId: uTxId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease: uLease,
+    });
+
+    // Simulate rmdir failure to mark uLease uncertain
+    const origRmdir = fs.rmdirSync;
+    fs.rmdirSync = () => { throw new Error('EIO'); };
+    try {
+      releaseLock({ repoRoot: uncertainRepo, txId: uTxId, lease: uLease });
+    } finally {
+      fs.rmdirSync = origRmdir;
+    }
+
+    const uncertainLeaseRes = advanceJournalPhase({
+      repoRoot: uncertainRepo,
+      txId: uTxId,
+      nextPhase: 'ISOLATED_PREPARED',
+      lease: uLease,
+    });
+    assert.equal(uncertainLeaseRes.ok, false);
+    assert.equal(uncertainLeaseRes.code, 'lease-uncertain');
+  });
+});
+
