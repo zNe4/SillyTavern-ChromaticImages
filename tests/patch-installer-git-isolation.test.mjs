@@ -20,6 +20,8 @@ import {
   prepareIsolatedPatch,
   computeSha256,
   computeGitBlobSha,
+  applyPatchToIsolatedWorktree,
+  _setBundledManifestPathForTest,
 } from '../src/patch-installer/staging.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -258,8 +260,37 @@ describe('P3B-2A: Native Git Execution Isolation & Strip Invariants', () => {
     assert.equal(fs.existsSync(hookMarker), false);
   });
 
-  test('corrupted or truncated patch fails closed with git-apply-failed and never advances journal', async () => {
-    const repo = setupDisposableRepo('git-corrupt-patch-');
+  test('applyPatchToIsolatedWorktree fails closed with git-apply-failed on corrupted or truncated patch bytes', () => {
+    const tmpDir = createTempDir('git-apply-corrupt-');
+    const targetFile = path.join(tmpDir, 'stable-diffusion.js');
+    fs.writeFileSync(targetFile, authenticStock);
+
+    const corruptPatch = Buffer.from(
+      'diff --git a/src/endpoints/stable-diffusion.js b/src/endpoints/stable-diffusion.js\ncorrupt gibberish\n@@ -1,5 +1,8 @@\n'
+    );
+
+    const res = applyPatchToIsolatedWorktree(tmpDir, corruptPatch, 'apply');
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'git-apply-failed');
+    assert.match(res.error, /Git patch execution failed/);
+
+    // Target file remains untouched
+    assert.equal(computeSha256(fs.readFileSync(targetFile)), stockSha);
+  });
+
+  test('applyPatchToIsolatedWorktree validates input patch buffer', () => {
+    const tmpDir = createTempDir('git-apply-invalid-');
+    const resEmpty = applyPatchToIsolatedWorktree(tmpDir, Buffer.alloc(0), 'apply');
+    assert.equal(resEmpty.ok, false);
+    assert.equal(resEmpty.code, 'invalid-patch-bytes');
+
+    const resNull = applyPatchToIsolatedWorktree(tmpDir, null, 'apply');
+    assert.equal(resNull.ok, false);
+    assert.equal(resNull.code, 'invalid-patch-bytes');
+  });
+
+  test('replacing original patch pathname on disk after authentication does not affect in-memory Git execution', async () => {
+    const repo = setupDisposableRepo('git-tamper-after-read-');
     const txId = generateTxId();
 
     const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
@@ -276,10 +307,77 @@ describe('P3B-2A: Native Git Execution Isolation & Strip Invariants', () => {
       lease,
     });
 
-    // Create a corrupted patch file
-    const corruptPatchPath = path.join(repo, 'corrupt.patch');
-    fs.writeFileSync(corruptPatchPath, 'diff --git a/src/endpoints/stable-diffusion.js b/src/endpoints/stable-diffusion.js\ncorrupt gibberish\n@@ -1,5 +1,8 @@\n');
+    // Create a disposable copy of the certified distribution package
+    const disposablePkg = createTempDir('disposable-pkg-');
+    const manifestSrc = BUNDLED_MANIFEST_PATH;
+    const patchSrc = path.join(path.dirname(manifestSrc), 'runtime.patch');
+    const testsPatchSrc = path.join(path.dirname(manifestSrc), 'tests.patch');
+    const disposableManifest = path.join(disposablePkg, 'manifest.json');
+    const disposablePatch = path.join(disposablePkg, 'runtime.patch');
+    const disposableTestsPatch = path.join(disposablePkg, 'tests.patch');
 
+    fs.copyFileSync(manifestSrc, disposableManifest);
+    fs.copyFileSync(patchSrc, disposablePatch);
+    fs.copyFileSync(testsPatchSrc, disposableTestsPatch);
+
+    _setBundledManifestPathForTest(disposableManifest);
+
+    try {
+      let overwritten = false;
+      const faultHook = (stage) => {
+        if (stage === 'after-patch-read') {
+          // Overwrite the patch file on disk with corrupt data after in-memory read/authentication
+          fs.writeFileSync(disposablePatch, 'GARBAGE REPLACED ON DISK AFTER AUTHENTICATION\n');
+          overwritten = true;
+        }
+      };
+
+      const prepRes = await prepareIsolatedPatch({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+        faultHook,
+      });
+
+      assert.equal(overwritten, true);
+      assert.equal(prepRes.ok, true);
+      assert.equal(prepRes.sha256, patchedSha);
+      assert.equal(prepRes.journal?.phase, 'ISOLATED_PREPARED');
+
+      // The on-disk patch file was indeed corrupted
+      assert.notEqual(computeSha256(fs.readFileSync(disposablePatch)), manifest.patches.runtime.sha256);
+
+      // But Git executed from in-memory authenticated buffer via stdin, so staged output is correct
+      const stagedFile = path.join(repo, prepRes.isolatedStagedPath);
+      assert.equal(computeSha256(fs.readFileSync(stagedFile)), patchedSha);
+    } finally {
+      _setBundledManifestPathForTest(null);
+    }
+  });
+
+  test('prepareIsolatedPatch ignores obsolete _testCorruptPatchPath bypass option', async () => {
+    const repo = setupDisposableRepo('git-ignore-bypass-');
+    const txId = generateTxId();
+
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const corruptPatchPath = path.join(repo, 'corrupt.patch');
+    fs.writeFileSync(corruptPatchPath, 'corrupt patch file');
+
+    // Passing _testCorruptPatchPath has no effect; production entry point executes certified patch
     const prepRes = await prepareIsolatedPatch({
       repoRoot: repo,
       txId,
@@ -288,18 +386,9 @@ describe('P3B-2A: Native Git Execution Isolation & Strip Invariants', () => {
       _testCorruptPatchPath: corruptPatchPath,
     });
 
-    assert.equal(prepRes.ok, false);
-    assert.equal(prepRes.code, 'git-apply-failed');
-    assert.match(prepRes.error, /Git patch execution failed/);
-
-    // Journal remains in phase LOCKED
-    const jInspection = inspectJournal(repo);
-    assert.equal(jInspection.journal?.phase, 'LOCKED');
-    assert.equal(jInspection.journal?.isolatedStagedPath, undefined);
-
-    // Live target remains authentic stock
-    const liveBytes = fs.readFileSync(liveTarget);
-    assert.equal(computeSha256(liveBytes), stockSha);
+    assert.equal(prepRes.ok, true);
+    assert.equal(prepRes.sha256, patchedSha);
+    assert.equal(prepRes.journal?.phase, 'ISOLATED_PREPARED');
   });
 
   test('caller-supplied conflicting patchPath is rejected before patch execution (Finding B)', async () => {

@@ -967,3 +967,251 @@ describe('P3B-2A-F1: Staging Path Safety & Permissions (Finding C)', () => {
   });
 });
 
+describe('P3B-2A-F2: Authenticated Patch Execution and Final Staged-File Identity', () => {
+  if (!authenticStock) {
+    test.skip('Skipping P3B-2A-F2 tests (authentic stock unavailable)', () => {});
+    return;
+  }
+
+  test('verified descriptor and synchronized descriptor refer to the same inode identity', async () => {
+    const repo = setupDisposableRepo('f2-identity-bind-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    let syncFdIno = null;
+    let syncFdDev = null;
+    let preStatIno = null;
+    let preStatDev = null;
+
+    const faultHook = (stage, context) => {
+      if (stage === 'sync-output-file') {
+        const stat = fs.fstatSync(context.stagedFd);
+        syncFdIno = stat.ino;
+        syncFdDev = stat.dev;
+      } else if (stage === 'before-pathname-identity-check') {
+        preStatIno = context.preStat.ino;
+        preStatDev = context.preStat.dev;
+      }
+    };
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+      faultHook,
+    });
+
+    assert.equal(res.ok, true);
+    assert.equal(res.journal?.phase, 'ISOLATED_PREPARED');
+
+    // Verified and synchronized descriptor refer to the exact same device and inode
+    assert.ok(syncFdIno !== null && syncFdIno === preStatIno);
+    assert.ok(syncFdDev !== null && syncFdDev === preStatDev);
+
+    // Staged pathname on disk matches that exact inode
+    const finalStat = fs.lstatSync(path.join(repo, res.isolatedStagedPath));
+    assert.equal(finalStat.ino, preStatIno);
+    assert.equal(finalStat.dev, preStatDev);
+  });
+
+  test('replacing staged pathname after verification causes refusal with staged-pathname-missing', async () => {
+    const repo = setupDisposableRepo('f2-pathname-deleted-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const faultHook = (stage, context) => {
+      if (stage === 'before-pathname-identity-check') {
+        // Unlink the staged file before pathname identity check
+        fs.unlinkSync(context.isolatedStagedFile);
+      }
+    };
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+      faultHook,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'staged-pathname-missing');
+    assert.match(res.error, /Staged pathname missing/);
+
+    // Journal remains strictly in phase LOCKED
+    const jInspection = inspectJournal(repo);
+    assert.equal(jInspection.journal?.phase, 'LOCKED');
+    assert.equal(jInspection.journal?.isolatedStagedPath, undefined);
+  });
+
+  test('replacing staged pathname with a symbolic link causes refusal with unsafe-symlink', async () => {
+    const repo = setupDisposableRepo('f2-pathname-symlink-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const faultHook = (stage, context) => {
+      if (stage === 'before-pathname-identity-check') {
+        fs.unlinkSync(context.isolatedStagedFile);
+        fs.symlinkSync(liveTarget, context.isolatedStagedFile);
+      }
+    };
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+      faultHook,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unsafe-symlink');
+    assert.match(res.error, /replaced by a symbolic link/);
+
+    // Journal remains strictly in phase LOCKED
+    const jInspection = inspectJournal(repo);
+    assert.equal(jInspection.journal?.phase, 'LOCKED');
+  });
+
+  test('replacing staged pathname with a different regular file causes refusal with staged-identity-replaced', async () => {
+    const repo = setupDisposableRepo('f2-pathname-replaced-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    let replacedFile = null;
+    const faultHook = (stage, context) => {
+      if (stage === 'before-pathname-identity-check') {
+        replacedFile = context.isolatedStagedFile;
+        fs.unlinkSync(context.isolatedStagedFile);
+        fs.writeFileSync(context.isolatedStagedFile, 'replaced with different file content\n');
+      }
+    };
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+      faultHook,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'staged-identity-replaced');
+    assert.match(res.error, /inode identity changed/);
+
+    // Journal remains strictly in phase LOCKED
+    const jInspection = inspectJournal(repo);
+    assert.equal(jInspection.journal?.phase, 'LOCKED');
+    assert.equal(jInspection.journal?.isolatedStagedPath, undefined);
+
+    // Transaction artifacts are preserved on disk for recovery/inspection
+    assert.ok(fs.existsSync(replacedFile));
+    const txState = inspectTransactionState(repo);
+    assert.equal(txState.isPending, true);
+  });
+
+  test('Git subprocess failure leaves journal in LOCKED and preserves transaction artifacts without touching live repo', async () => {
+    const repo = setupDisposableRepo('f2-git-fail-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+    child_process.execFileSync('git', ['add', '.'], { cwd: repo });
+    child_process.execFileSync('git', ['commit', '-q', '-m', 'Initial authentic commit'], { cwd: repo });
+
+    const headBefore = child_process.execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    // Cause git apply to fail by corrupting the isolated staged file before git apply
+    const faultHook = (stage, context) => {
+      if (stage === 'before-git-apply') {
+        fs.writeFileSync(context.isolatedStagedFile, 'CORRUPTED TO FORCE GIT APPLY FAILURE\n');
+      }
+    };
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+      faultHook,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'git-apply-failed');
+    assert.match(res.error, /Git patch execution failed/);
+
+    // Journal remains strictly in phase LOCKED
+    const jInspection = inspectJournal(repo);
+    assert.equal(jInspection.journal?.phase, 'LOCKED');
+
+    // Live target and git repository are completely untouched
+    const liveContent = fs.readFileSync(liveTarget);
+    assert.equal(computeSha256(liveContent), stockSha);
+    const headAfter = child_process.execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    assert.equal(headAfter, headBefore);
+    const diff = child_process.execFileSync('git', ['diff'], { cwd: repo, encoding: 'utf8' }).trim();
+    assert.equal(diff, '');
+    const diffCached = child_process.execFileSync('git', ['diff', '--cached'], { cwd: repo, encoding: 'utf8' }).trim();
+    assert.equal(diffCached, '');
+  });
+});
+

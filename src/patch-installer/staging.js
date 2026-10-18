@@ -16,6 +16,8 @@ import {
   inspectJournal,
   advanceJournalPhase,
   verifyLockOwnershipForMutation,
+  isValidDeviceIdentifier,
+  isValidInodeIdentifier,
 } from './journal.js';
 
 import {
@@ -30,6 +32,19 @@ const BUNDLED_MANIFEST_PATH = path.join(
   REPO_ROOT,
   'patches/sillytavern/release-06bde939f/manifest.json'
 );
+
+const MAX_SOURCE_FILE_BYTES = 50 * 1024 * 1024; // 50 MiB
+
+let bundledManifestPath = BUNDLED_MANIFEST_PATH;
+
+/**
+ * Test-only seam to redirect manifest location to a disposable directory.
+ * @internal
+ * @param {string|null} customPath
+ */
+export function _setBundledManifestPathForTest(customPath) {
+  bundledManifestPath = customPath || BUNDLED_MANIFEST_PATH;
+}
 
 /**
  * Compute SHA-256 lowercase hex digest.
@@ -187,6 +202,84 @@ export function readLiveSourceFile(absPath, options = {}) {
 }
 
 /**
+ * Apply patch bytes to an isolated staging worktree using Git over standard input.
+ * Strictly consumes authenticated patch bytes from memory without reading from a patch pathname.
+ *
+ * @param {string} stagingTxDir
+ * @param {Buffer} patchBytes
+ * @param {'apply' | 'remove'} [op='apply']
+ * @returns {{ ok: boolean, error?: string, code?: string }}
+ */
+export function applyPatchToIsolatedWorktree(stagingTxDir, patchBytes, op = 'apply') {
+  if (!Buffer.isBuffer(patchBytes) || patchBytes.length === 0) {
+    return {
+      ok: false,
+      error: 'Cannot apply patch: patchBytes must be a non-empty Buffer',
+      code: 'invalid-patch-bytes',
+    };
+  }
+
+  const gitArgs = ['--no-optional-locks', '-C', stagingTxDir, 'apply', '-p3'];
+  if (op === 'remove') {
+    gitArgs.push('-R');
+  }
+
+  const scrubbedEnv = {
+    PATH: process.env.PATH,
+    GIT_DIR: '/dev/null',
+    GIT_WORK_TREE: stagingTxDir,
+    GIT_INDEX_FILE: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_TERMINAL_PROMPT: '0',
+    HOME: stagingTxDir,
+  };
+
+  let gitRes;
+  try {
+    gitRes = child_process.spawnSync('git', gitArgs, {
+      env: scrubbedEnv,
+      input: patchBytes,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: false,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  } catch (spawnErr) {
+    return {
+      ok: false,
+      error: `Failed to spawn Git executable: ${spawnErr.message}`,
+      code: spawnErr.code || 'git-spawn-failed',
+    };
+  }
+
+  if (gitRes.error) {
+    return {
+      ok: false,
+      error: `Git process spawn error: ${gitRes.error.message}`,
+      code: gitRes.error.code || 'git-spawn-failed',
+    };
+  }
+
+  if (gitRes.signal) {
+    return {
+      ok: false,
+      error: `Git patch execution terminated by signal: ${gitRes.signal}`,
+      code: 'git-process-terminated',
+    };
+  }
+
+  if (gitRes.status !== 0) {
+    const stderrStr = gitRes.stderr ? gitRes.stderr.toString('utf8').trim() : '';
+    return {
+      ok: false,
+      error: `Git patch execution failed (exit ${gitRes.status}): ${stderrStr}`,
+      code: 'git-apply-failed',
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
  * Prepare and verify patched or unpatched content in an isolated transaction staging directory.
  * Never mutates or replaces the live SillyTavern checkout.
  * Executes native Git apply with a scrubbed environment and rigorous output verification.
@@ -199,7 +292,6 @@ export function readLiveSourceFile(absPath, options = {}) {
  * @param {import('./lock.js').TransactionLease} options.lease
  * @param {object} [options.manifest]
  * @param {string} [options.patchPath]
- * @param {string} [options._testCorruptPatchPath]
  * @param {(stage: string, context?: object) => void} [options.faultHook]
  * @returns {Promise<{
  *   ok: boolean,
@@ -220,7 +312,6 @@ export async function prepareIsolatedPatch(options = {}) {
     lease,
     manifest: providedManifest = null,
     patchPath: providedPatchPath = null,
-    _testCorruptPatchPath = null,
     faultHook = null,
   } = options;
 
@@ -325,7 +416,7 @@ export async function prepareIsolatedPatch(options = {}) {
   runFault('after-preconditions', { journal });
 
   // 3. Certified Manifest and Patch Authentication (Finding B)
-  const pkgCheck = await verifyPatchManifest(BUNDLED_MANIFEST_PATH);
+  const pkgCheck = await verifyPatchManifest(bundledManifestPath);
   if (!pkgCheck.ok || !pkgCheck.manifest) {
     return {
       ok: false,
@@ -359,7 +450,7 @@ export async function prepareIsolatedPatch(options = {}) {
     }
   }
 
-  const certifiedPatchPath = path.resolve(path.dirname(BUNDLED_MANIFEST_PATH), patchEntry.patchFile);
+  const certifiedPatchPath = path.resolve(path.dirname(bundledManifestPath), patchEntry.patchFile);
 
   if (providedPatchPath !== null) {
     const normProvided = path.resolve(providedPatchPath);
@@ -440,6 +531,8 @@ export async function prepareIsolatedPatch(options = {}) {
       code: 'tampered-patch-file',
     };
   }
+
+  runFault('after-patch-read', { certifiedPatchPath });
 
   if (journal.targetFile !== patchEntry.targetFile) {
     return {
@@ -668,20 +761,20 @@ export async function prepareIsolatedPatch(options = {}) {
   // 6. Isolated source file creation & initial synchronization (Finding A & C)
   runFault('before-file-create', { isolatedStagedFile });
 
-  let stagedFd = null;
+  let initialFd = null;
   try {
-    stagedFd = fs.openSync(
+    initialFd = fs.openSync(
       isolatedStagedFile,
       fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
       0o600
     );
 
-    runFault('during-source-write', { stagedFd });
+    runFault('during-source-write', { stagedFd: initialFd });
 
     let written = 0;
     while (written < liveSource.buffer.length) {
       const bytesWritten = fs.writeSync(
-        stagedFd,
+        initialFd,
         liveSource.buffer,
         written,
         liveSource.buffer.length - written,
@@ -694,7 +787,7 @@ export async function prepareIsolatedPatch(options = {}) {
     }
 
     try {
-      fs.fsyncSync(stagedFd);
+      fs.fsyncSync(initialFd);
     } catch (syncErr) {
       if (syncErr?._isFault) throw syncErr;
       return {
@@ -714,13 +807,13 @@ export async function prepareIsolatedPatch(options = {}) {
       code: writeErr.code || 'staged-file-write-failed',
     };
   } finally {
-    if (stagedFd !== null) {
+    if (initialFd !== null) {
       try {
-        fs.closeSync(stagedFd);
+        fs.closeSync(initialFd);
       } catch {
         // ignore
       }
-      stagedFd = null;
+      initialFd = null;
     }
   }
 
@@ -740,44 +833,18 @@ export async function prepareIsolatedPatch(options = {}) {
 
   runFault('after-file-create', { isolatedStagedFile });
 
-  // 7. Native Git patch application
-  const patchPathForGit = _testCorruptPatchPath || certifiedPatchPath;
+  // 7. Native Git patch application via authenticated standard input (Finding A)
+  runFault('before-git-apply', { isolatedStagedFile });
 
-  runFault('before-git-apply', { isolatedStagedFile, resolvedPatchPath: patchPathForGit });
-
-  const gitArgs = ['--no-optional-locks', '-C', stagingTxDir, 'apply', '-p3'];
-  if (op === 'remove') {
-    gitArgs.push('-R');
-  }
-  gitArgs.push(patchPathForGit);
-
-  const scrubbedEnv = {
-    PATH: process.env.PATH,
-    GIT_DIR: '/dev/null',
-    GIT_WORK_TREE: stagingTxDir,
-    GIT_INDEX_FILE: '/dev/null',
-    GIT_CONFIG_NOSYSTEM: '1',
-    GIT_TERMINAL_PROMPT: '0',
-    HOME: stagingTxDir,
-  };
-
-  const gitRes = child_process.spawnSync('git', gitArgs, {
-    env: scrubbedEnv,
-    stdio: 'pipe',
-  });
-
-  if (gitRes.status !== 0) {
-    const stderrStr = gitRes.stderr ? gitRes.stderr.toString('utf8').trim() : '';
-    return {
-      ok: false,
-      error: `Git patch execution failed (exit ${gitRes.status}): ${stderrStr}`,
-      code: 'git-apply-failed',
-    };
+  const gitRes = applyPatchToIsolatedWorktree(stagingTxDir, patchBytes, op);
+  if (!gitRes.ok) {
+    return gitRes;
   }
 
   runFault('after-git-apply', { stagingTxDir });
 
-  // 8. Prepared output verification, permissions, and synchronization (Finding A & C)
+  // 8. Descriptor-bound finalization protocol (Finding B)
+  // Step 1: The staging directory contains exactly the expected regular file.
   let childrenAfter;
   try {
     childrenAfter = fs.readdirSync(stagingTxDir);
@@ -797,70 +864,199 @@ export async function prepareIsolatedPatch(options = {}) {
     };
   }
 
-  let postFd = null;
+  // Steps 2 - 10: Retain verified open descriptor across content verification, permissions, sync, and identity check
+  let stagedFd = null;
+  let stagedResult = null;
   try {
-    postFd = fs.openSync(isolatedStagedFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    const postStat = fs.fstatSync(postFd);
-    if (!postStat.isFile() || postStat.isSymbolicLink()) {
+    // Step 2: The staged file is opened with appropriate no-follow protection.
+    const openFlags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+    try {
+      stagedFd = fs.openSync(isolatedStagedFile, openFlags);
+    } catch (openErr) {
+      if (openErr?._isFault) throw openErr;
       return {
         ok: false,
-        error: 'Staged result descriptor is missing, not a regular file, or is a symbolic link',
+        error: `Failed to open staged file descriptor: ${openErr.message}`,
+        code: openErr.code === 'ELOOP' ? 'unsafe-symlink' : 'staged-open-failed',
+      };
+    }
+
+    // Step 3: The open descriptor is verified using fstatSync().
+    const preStat = fs.fstatSync(stagedFd);
+    if (!preStat.isFile() || preStat.isSymbolicLink()) {
+      return {
+        ok: false,
+        error: 'Staged file descriptor is not a regular file',
         code: 'invalid-staged-result',
       };
     }
-    fs.fchmodSync(postFd, 0o600);
-    fs.fsyncSync(postFd);
-  } catch (permErr) {
-    if (permErr?._isFault) throw permErr;
-    return {
-      ok: false,
-      error: `Failed to establish permissions and synchronize staged result descriptor: ${permErr.message}`,
-      code: permErr.code || 'fsync-failed',
-      stage: 'sync-output-file',
+    if (!isValidDeviceIdentifier(preStat.dev) || !isValidInodeIdentifier(preStat.ino)) {
+      return {
+        ok: false,
+        error: 'Staged file descriptor has invalid device or inode identity',
+        code: 'invalid-file-identity',
+      };
+    }
+    if (preStat.size > MAX_SOURCE_FILE_BYTES) {
+      return {
+        ok: false,
+        error: `Staged file size (${preStat.size} bytes) exceeds maximum allowable size (${MAX_SOURCE_FILE_BYTES} bytes)`,
+        code: 'file-too-large',
+      };
+    }
+
+    // Step 4: The file contents are read from that descriptor.
+    const expectedSize = preStat.size;
+    const buffer = Buffer.alloc(expectedSize);
+    let readBytes = 0;
+    while (readBytes < expectedSize) {
+      const chunk = fs.readSync(stagedFd, buffer, readBytes, expectedSize - readBytes, readBytes);
+      if (chunk === 0) {
+        return {
+          ok: false,
+          error: `Unexpected EOF reading staged file descriptor: read ${readBytes} of ${expectedSize} bytes`,
+          code: 'unexpected-eof',
+        };
+      }
+      readBytes += chunk;
+    }
+
+    const extraCheck = Buffer.alloc(1);
+    const extra = fs.readSync(stagedFd, extraCheck, 0, 1, expectedSize);
+    if (extra !== 0) {
+      return {
+        ok: false,
+        error: 'Staged file expanded concurrently during descriptor read',
+        code: 'concurrent-expansion',
+      };
+    }
+
+    // Step 5: SHA-256 and Git blob fingerprints are verified.
+    const actualSha256 = computeSha256(buffer);
+    const actualGitBlobSha = computeGitBlobSha(buffer);
+
+    if (actualSha256.toLowerCase() !== expectedResultSha) {
+      return {
+        ok: false,
+        error: `Patched result SHA-256 mismatch: got "${actualSha256}", expected "${expectedResultSha}"`,
+        code: 'result-sha256-mismatch',
+      };
+    }
+
+    if (actualGitBlobSha.toLowerCase() !== expectedResultBlob) {
+      return {
+        ok: false,
+        error: `Patched result Git blob SHA mismatch: got "${actualGitBlobSha}", expected "${expectedResultBlob}"`,
+        code: 'result-blob-mismatch',
+      };
+    }
+
+    stagedResult = {
+      buffer,
+      stat: preStat,
+      sha256: actualSha256,
+      gitBlobSha: actualGitBlobSha,
     };
+
+    // Step 6: Required permissions are established through fchmodSync() on the authenticated descriptor.
+    try {
+      fs.fchmodSync(stagedFd, 0o600);
+    } catch (chmodErr) {
+      if (chmodErr?._isFault) throw chmodErr;
+      return {
+        ok: false,
+        error: `Failed to set permissions on staged file descriptor: ${chmodErr.message}`,
+        code: chmodErr.code || 'chmod-failed',
+        stage: 'sync-output-file',
+      };
+    }
+
+    // Step 7: File data and metadata are synchronized using the authenticated descriptor.
+    runFault('sync-output-file', { isolatedStagedFile, stagedFd });
+    try {
+      fs.fsyncSync(stagedFd);
+    } catch (syncErr) {
+      if (syncErr?._isFault) throw syncErr;
+      return {
+        ok: false,
+        error: `Failed to synchronize staged file descriptor: ${syncErr.message}`,
+        code: syncErr.code || 'fsync-failed',
+        stage: 'sync-output-file',
+      };
+    }
+
+    // Step 8: Descriptor identity is checked again after synchronization.
+    const postStat = fs.fstatSync(stagedFd);
+    if (
+      postStat.dev !== preStat.dev ||
+      postStat.ino !== preStat.ino ||
+      postStat.size !== expectedSize ||
+      !postStat.isFile()
+    ) {
+      return {
+        ok: false,
+        error: 'Staged file descriptor identity changed during synchronization',
+        code: 'staged-identity-changed',
+      };
+    }
+    if ((postStat.mode & 0o777) !== 0o600) {
+      return {
+        ok: false,
+        error: `Staged file descriptor mode mismatch after chmod/fsync: got 0o${(postStat.mode & 0o777).toString(8)}, expected 0o600`,
+        code: 'staged-mode-mismatch',
+      };
+    }
+
+    // Step 9 & 10: The expected staged pathname is checked using lstatSync().
+    // The pathname must still resolve to the authenticated device/inode identity.
+    runFault('before-pathname-identity-check', { isolatedStagedFile, stagedFd, preStat });
+
+    let pathStat;
+    try {
+      pathStat = fs.lstatSync(isolatedStagedFile);
+    } catch (lstatErr) {
+      if (lstatErr?._isFault) throw lstatErr;
+      return {
+        ok: false,
+        error: `Staged pathname missing or unreadable before journal advancement: ${lstatErr.message}`,
+        code: 'staged-pathname-missing',
+      };
+    }
+
+    if (pathStat.isSymbolicLink()) {
+      return {
+        ok: false,
+        error: `Staged pathname "${isolatedStagedFile}" was replaced by a symbolic link`,
+        code: 'unsafe-symlink',
+      };
+    }
+
+    if (!pathStat.isFile()) {
+      return {
+        ok: false,
+        error: `Staged pathname "${isolatedStagedFile}" is not a regular file`,
+        code: 'invalid-staged-result',
+      };
+    }
+
+    if (pathStat.dev !== preStat.dev || pathStat.ino !== preStat.ino) {
+      return {
+        ok: false,
+        error: `Staged pathname "${isolatedStagedFile}" inode identity changed before journal advancement (dev: ${pathStat.dev} vs ${preStat.dev}, ino: ${pathStat.ino} vs ${preStat.ino})`,
+        code: 'staged-identity-replaced',
+      };
+    }
   } finally {
-    if (postFd !== null) {
+    if (stagedFd !== null) {
       try {
-        fs.closeSync(postFd);
+        fs.closeSync(stagedFd);
       } catch {
-        // ignore
+        // ignore close error
       }
     }
   }
 
-  let stagedResult;
-  try {
-    stagedResult = readLiveSourceFile(isolatedStagedFile);
-  } catch (readErr) {
-    return {
-      ok: false,
-      error: `Failed to read and verify patched result: ${readErr.message}`,
-      code: 'result-read-failed',
-    };
-  }
-
-  if (stagedResult.sha256.toLowerCase() !== expectedResultSha) {
-    return {
-      ok: false,
-      error: `Patched result SHA-256 mismatch: got "${stagedResult.sha256}", expected "${expectedResultSha}"`,
-      code: 'result-sha256-mismatch',
-    };
-  }
-
-  if (stagedResult.gitBlobSha.toLowerCase() !== expectedResultBlob) {
-    return {
-      ok: false,
-      error: `Patched result Git blob SHA mismatch: got "${stagedResult.gitBlobSha}", expected "${expectedResultBlob}"`,
-      code: 'result-blob-mismatch',
-    };
-  }
-
-  // Synchronize file and directory entries strictly (Finding A)
-  const syncFile = syncPathDurable(isolatedStagedFile, 'output-file', false, runFault);
-  if (!syncFile.ok) {
-    return syncFile;
-  }
-
+  // Step 11: Required containing directories are synchronized.
   const syncTxDir = syncPathDurable(stagingTxDir, 'output-txdir', true, runFault);
   if (!syncTxDir.ok) {
     return syncTxDir;
