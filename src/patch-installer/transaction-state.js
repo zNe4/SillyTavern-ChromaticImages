@@ -91,13 +91,24 @@ export const MAX_BACKUP_INSPECT_BYTES = 50 * 1024 * 1024; // 50 MiB
  *   reason?: string
  * }}
  */
-function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact) {
+export function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact, constants = fs.constants) {
+  if (!constants || typeof constants.O_NOFOLLOW !== 'number' || constants.O_NOFOLLOW === 0) {
+    return {
+      ok: false,
+      isError: true,
+      reason: `Unsupported platform: O_NOFOLLOW file open flag is required for safe backup inspection of "${relArtifact}"`,
+    };
+  }
+
   let fd = null;
   try {
-    fd = fs.openSync(cPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = fs.openSync(cPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (err) {
     if (err?.code === 'ELOOP') {
       return { ok: false, isSymlink: true, reason: `Backup artifact is a symbolic link: "${relArtifact}"` };
+    }
+    if (err?.code === 'ENOENT') {
+      return { ok: false, isIncomplete: true, reason: `Backup artifact was not found when opening: "${relArtifact}"` };
     }
     return { ok: false, isError: true, reason: `Failed to open backup artifact descriptor: ${err.message}` };
   }
@@ -160,6 +171,15 @@ function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact) {
 
     // Pathname-to-descriptor identity consistency
     const pathCheck = getPathLstat(cPath);
+    if (pathCheck.error) {
+      if (pathCheck.error.code === 'ENOENT') {
+        return { ok: false, isIncomplete: true, reason: `Backup artifact was unlinked during inspection: "${relArtifact}"` };
+      }
+      return { ok: false, isError: true, reason: `Failed to inspect backup pathname: ${pathCheck.error.message}` };
+    }
+    if (!pathCheck.exists) {
+      return { ok: false, isIncomplete: true, reason: `Backup artifact was unlinked during inspection: "${relArtifact}"` };
+    }
     if (pathCheck.isSymbolicLink) {
       return { ok: false, isSymlink: true, reason: `Backup artifact was replaced by a symbolic link: "${relArtifact}"` };
     }
@@ -202,8 +222,10 @@ function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact) {
  * Detects orphaned artifacts, dangling symlinks, and ambiguous metadata.
  *
  * @param {string} repoRoot
+ * @param {object} [options]
+ * @param {object} [options._fsConstants]
  * @returns {{
- *   state: 'none' | 'ownership-unverified' | 'orphaned-journal' | 'corrupted-journal' | 'corrupted-lock' | 'mismatched-metadata' | 'foreign-content' | 'unsafe-symlink' | 'orphaned-artifact' | 'incomplete-transaction',
+ *   state: 'none' | 'ownership-unverified' | 'orphaned-journal' | 'corrupted-journal' | 'corrupted-lock' | 'mismatched-metadata' | 'foreign-content' | 'unsafe-symlink' | 'orphaned-artifact' | 'incomplete-transaction' | 'inspection-error',
  *   hasLock: boolean,
  *   hasJournal: boolean,
  *   isPending: boolean,
@@ -214,7 +236,7 @@ function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact) {
  *   reasons: string[]
  * }}
  */
-export function inspectTransactionState(repoRoot) {
+export function inspectTransactionState(repoRoot, options = {}) {
   const reasons = [];
   const foreignEntries = [];
   const orphanedArtifacts = [];
@@ -658,7 +680,8 @@ export function inspectTransactionState(repoRoot) {
                           cPath,
                           journalObj.expectedInitialSha256,
                           journalObj.phase,
-                          relArtifact
+                          relArtifact,
+                          options?._fsConstants || fs.constants
                         );
                         if (!inspectRes.ok) {
                           if (inspectRes.isSymlink) {

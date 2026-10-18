@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 
 import {
   acquireLock,
@@ -32,6 +33,7 @@ import {
 
 import {
   inspectTransactionState,
+  inspectBackupArtifactFile,
   getPermittedArtifactNames,
 } from '../src/patch-installer/transaction-state.js';
 
@@ -3745,6 +3747,236 @@ describe('P3B-2B-F1: Read-Only Backup Inspection Hardening (Finding C)', () => {
         state.reasons.some((r) => r.includes(`Missing backup artifact in phase "${phase}"`)),
         `Expected missing backup artifact reason for phase "${phase}"`
       );
+    }
+  });
+});
+
+describe('P3B-2B-F2: Finding B — Read-Only Inspection Error Classification & Unsupported O_NOFOLLOW', () => {
+  const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
+  const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
+
+  function setupValidBackupState(prefix = 'insp-f2-') {
+    const dummyContent = 'authentic test backup content\n';
+    const dummySha = crypto.createHash('sha256').update(dummyContent).digest('hex');
+    const repo = createTempDir(prefix);
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: dummySha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: {
+        backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+        targetMode: '0644',
+      },
+      lease,
+    });
+
+    const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+    fs.mkdirSync(txStagingDir, { recursive: true });
+    fs.writeFileSync(path.join(txStagingDir, 'stable-diffusion.js'), 'code', 'utf8');
+
+    const txBackupDir = path.join(repo, '.ci-patch/backup', txId);
+    fs.mkdirSync(txBackupDir, { recursive: true });
+    const backupFile = path.join(txBackupDir, 'stable-diffusion.js');
+    fs.writeFileSync(backupFile, dummyContent);
+
+    return { repo, txId, lease, backupFile, dummyContent, dummySha };
+  }
+
+  test('classifies EACCES during backup inspection as inspection-error with isPending true', () => {
+    const { repo, txId } = setupValidBackupState('insp-f2-eacces-');
+    const origLstatSync = fs.lstatSync;
+    try {
+      fs.lstatSync = (p, ...args) => {
+        if (typeof p === 'string' && p.endsWith(path.join('.ci-patch/backup', txId, 'stable-diffusion.js'))) {
+          const err = new Error('Permission denied');
+          err.code = 'EACCES';
+          throw err;
+        }
+        return origLstatSync(p, ...args);
+      };
+
+      const state = inspectTransactionState(repo);
+      assert.equal(state.state, 'inspection-error');
+      assert.equal(state.isPending, true);
+      assert.ok(
+        state.reasons.some((r) => r.includes('EACCES') || r.includes('Permission denied') || r.includes('Failed to inspect backup artifact')),
+        'Expected inspection-error reason for EACCES'
+      );
+    } finally {
+      fs.lstatSync = origLstatSync;
+    }
+  });
+
+  test('classifies EIO during backup inspection as inspection-error with isPending true', () => {
+    const { repo, txId } = setupValidBackupState('insp-f2-eio-');
+    const origLstatSync = fs.lstatSync;
+    try {
+      fs.lstatSync = (p, ...args) => {
+        if (typeof p === 'string' && p.endsWith(path.join('.ci-patch/backup', txId, 'stable-diffusion.js'))) {
+          const err = new Error('I/O error reading backup file');
+          err.code = 'EIO';
+          throw err;
+        }
+        return origLstatSync(p, ...args);
+      };
+
+      const state = inspectTransactionState(repo);
+      assert.equal(state.state, 'inspection-error');
+      assert.equal(state.isPending, true);
+      assert.ok(
+        state.reasons.some((r) => r.includes('EIO') || r.includes('I/O error') || r.includes('Failed to inspect backup artifact')),
+        'Expected inspection-error reason for EIO'
+      );
+    } finally {
+      fs.lstatSync = origLstatSync;
+    }
+  });
+
+  test('distinguishes missing backup file (ENOENT) as incomplete-transaction', () => {
+    const { repo, backupFile } = setupValidBackupState('insp-f2-missing-');
+    fs.unlinkSync(backupFile);
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+    assert.ok(
+      state.reasons.some((r) => r.includes('Missing backup artifact in phase "BACKUP_CREATED"')),
+      'Expected incomplete-transaction reason for missing backup'
+    );
+  });
+
+  test('fails closed with inspection-error when O_NOFOLLOW is missing or unsupported in fsConstants option', () => {
+    const { repo } = setupValidBackupState('insp-f2-nofollow-opt-');
+
+    // Override _fsConstants without O_NOFOLLOW
+    const customConstants = {
+      O_RDONLY: fs.constants.O_RDONLY,
+      O_NOFOLLOW: 0,
+    };
+
+    const state = inspectTransactionState(repo, { _fsConstants: customConstants });
+    assert.equal(state.state, 'inspection-error');
+    assert.equal(state.isPending, true);
+    assert.ok(
+      state.reasons.some((r) => r.includes('O_NOFOLLOW file open flag is required')),
+      'Expected unsupported platform reason for missing O_NOFOLLOW'
+    );
+  });
+
+  test('direct inspectBackupArtifactFile refuses inspection when constants lacks O_NOFOLLOW', () => {
+    const { backupFile, dummySha } = setupValidBackupState('insp-f2-direct-');
+
+    // Test with O_NOFOLLOW = 0
+    const res1 = inspectBackupArtifactFile(
+      backupFile,
+      dummySha,
+      'BACKUP_CREATED',
+      'backup/txId/stable-diffusion.js',
+      { O_RDONLY: 0, O_NOFOLLOW: 0 }
+    );
+    assert.equal(res1.ok, false);
+    assert.equal(res1.isError, true);
+    assert.match(res1.reason, /Unsupported platform: O_NOFOLLOW file open flag is required/);
+
+    // Test with missing O_NOFOLLOW property
+    const res2 = inspectBackupArtifactFile(
+      backupFile,
+      dummySha,
+      'BACKUP_CREATED',
+      'backup/txId/stable-diffusion.js',
+      {}
+    );
+    assert.equal(res2.ok, false);
+    assert.equal(res2.isError, true);
+    assert.match(res2.reason, /Unsupported platform: O_NOFOLLOW file open flag is required/);
+
+    // Test with null constants
+    const res3 = inspectBackupArtifactFile(
+      backupFile,
+      dummySha,
+      'BACKUP_CREATED',
+      'backup/txId/stable-diffusion.js',
+      null
+    );
+    assert.equal(res3.ok, false);
+    assert.equal(res3.isError, true);
+    assert.match(res3.reason, /Unsupported platform: O_NOFOLLOW file open flag is required/);
+  });
+
+  test('direct inspectBackupArtifactFile distinguishes pathCheck EACCES from ENOENT unlinking', () => {
+    const { backupFile, dummySha } = setupValidBackupState('insp-f2-direct-errs-');
+
+    const origLstatSync = fs.lstatSync;
+    // 1. EACCES during post-descriptor getPathLstat
+    let lstatCount = 0;
+    try {
+      fs.lstatSync = (p, ...args) => {
+        lstatCount++;
+        // First lstat is inside inspectBackupArtifactFile post-read
+        if (lstatCount === 1) {
+          const err = new Error('Permission denied');
+          err.code = 'EACCES';
+          throw err;
+        }
+        return origLstatSync(p, ...args);
+      };
+
+      const res = inspectBackupArtifactFile(
+        backupFile,
+        dummySha,
+        'BACKUP_CREATED',
+        'backup/txId/stable-diffusion.js'
+      );
+      assert.equal(res.ok, false);
+      assert.equal(res.isError, true);
+      assert.match(res.reason, /Failed to inspect backup pathname/);
+    } finally {
+      fs.lstatSync = origLstatSync;
+    }
+
+    // 2. ENOENT unlinked during inspection
+    lstatCount = 0;
+    try {
+      fs.lstatSync = (p, ...args) => {
+        lstatCount++;
+        if (lstatCount === 1) {
+          const err = new Error('No such file or directory');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return origLstatSync(p, ...args);
+      };
+
+      const res = inspectBackupArtifactFile(
+        backupFile,
+        dummySha,
+        'BACKUP_CREATED',
+        'backup/txId/stable-diffusion.js'
+      );
+      assert.equal(res.ok, false);
+      assert.equal(res.isIncomplete, true);
+      assert.match(res.reason, /Backup artifact was unlinked during inspection/);
+    } finally {
+      fs.lstatSync = origLstatSync;
     }
   });
 });

@@ -1950,3 +1950,342 @@ describe('P3B-2B-F1: Finding B — Late Staging Changes at before-journal-advanc
     assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
   });
 });
+
+describe('P3B-2B-F2: Finding A — Structured Filesystem Failure Handling during Final Reauthentication', () => {
+  test('converts unexpected EIO during final live source fstatSync into structured failure result', async () => {
+    const repo = setupDisposableRepo('f2-src-fstat-eio-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const origFstatSync = fs.fstatSync;
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        const liveIno = fs.statSync(liveTarget).ino;
+        fs.fstatSync = (fd, ...args) => {
+          const realStat = origFstatSync(fd, ...args);
+          if (realStat.ino === liveIno) {
+            const err = new Error('Simulated live fstat EIO');
+            err.code = 'EIO';
+            throw err;
+          }
+          return realStat;
+        };
+      }
+    };
+
+    try {
+      const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EIO');
+      assert.equal(res.stage, 'final-source-reauth');
+      assert.match(res.error, /Simulated live fstat EIO/);
+
+      const jInspect = inspectJournal(repo);
+      assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+    } finally {
+      fs.fstatSync = origFstatSync;
+    }
+  });
+
+  test('converts unexpected EIO during final live source readSync into structured failure result', async () => {
+    const repo = setupDisposableRepo('f2-src-read-eio-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const origReadSync = fs.readSync;
+    const origFstatSync = fs.fstatSync;
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        const liveIno = fs.statSync(liveTarget).ino;
+        fs.readSync = (fd, ...args) => {
+          let isLiveFd = false;
+          try {
+            isLiveFd = origFstatSync(fd).ino === liveIno;
+          } catch {
+            // ignore
+          }
+          if (isLiveFd) {
+            const err = new Error('Simulated live readSync EIO');
+            err.code = 'EIO';
+            throw err;
+          }
+          return origReadSync(fd, ...args);
+        };
+      }
+    };
+
+    try {
+      const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EIO');
+      assert.equal(res.stage, 'final-source-reauth');
+      assert.match(res.error, /Simulated live readSync EIO/);
+
+      const jInspect = inspectJournal(repo);
+      assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+    } finally {
+      fs.readSync = origReadSync;
+    }
+  });
+
+  test('converts unexpected EACCES during final live source lstatSync into structured failure result', async () => {
+    const repo = setupDisposableRepo('f2-src-lstat-eacces-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const origLstatSync = fs.lstatSync;
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.lstatSync = (targetPath, ...args) => {
+          if (typeof targetPath === 'string' && targetPath.endsWith('stable-diffusion.js') && !targetPath.includes('.ci-patch')) {
+            const err = new Error('Simulated live lstat EACCES');
+            err.code = 'EACCES';
+            throw err;
+          }
+          return origLstatSync(targetPath, ...args);
+        };
+      }
+    };
+
+    try {
+      const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EACCES');
+      assert.equal(res.stage, 'final-source-reauth');
+      assert.match(res.error, /Simulated live lstat EACCES/);
+
+      const jInspect = inspectJournal(repo);
+      assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+    } finally {
+      fs.lstatSync = origLstatSync;
+    }
+  });
+
+  test('converts unexpected EIO during final backup fstatSync into structured failure result', async () => {
+    const repo = setupDisposableRepo('f2-bak-fstat-eio-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const origFstatSync = fs.fstatSync;
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        const backupFile = path.join(repo, '.ci-patch/backup', txId, 'stable-diffusion.js');
+        const backupIno = fs.statSync(backupFile).ino;
+        fs.fstatSync = (fd, ...args) => {
+          const realStat = origFstatSync(fd, ...args);
+          if (realStat.ino === backupIno) {
+            const err = new Error('Simulated backup fstat EIO');
+            err.code = 'EIO';
+            throw err;
+          }
+          return realStat;
+        };
+      }
+    };
+
+    try {
+      const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EIO');
+      assert.equal(res.stage, 'final-backup-reauth');
+      assert.match(res.error, /Simulated backup fstat EIO/);
+
+      const jInspect = inspectJournal(repo);
+      assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+    } finally {
+      fs.fstatSync = origFstatSync;
+    }
+  });
+
+  test('converts unexpected EIO during final backup readSync into structured failure result', async () => {
+    const repo = setupDisposableRepo('f2-bak-read-eio-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const origReadSync = fs.readSync;
+    const origFstatSync = fs.fstatSync;
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        const backupFile = path.join(repo, '.ci-patch/backup', txId, 'stable-diffusion.js');
+        const backupIno = fs.statSync(backupFile).ino;
+        fs.readSync = (fd, ...args) => {
+          let isBackupFd = false;
+          try {
+            isBackupFd = origFstatSync(fd).ino === backupIno;
+          } catch {
+            // ignore
+          }
+          if (isBackupFd) {
+            const err = new Error('Simulated backup readSync EIO');
+            err.code = 'EIO';
+            throw err;
+          }
+          return origReadSync(fd, ...args);
+        };
+      }
+    };
+
+    try {
+      const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EIO');
+      assert.equal(res.stage, 'final-backup-reauth');
+      assert.match(res.error, /Simulated backup readSync EIO/);
+
+      const jInspect = inspectJournal(repo);
+      assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+    } finally {
+      fs.readSync = origReadSync;
+    }
+  });
+
+  test('converts unexpected EACCES during final backup lstatSync into structured failure result', async () => {
+    const repo = setupDisposableRepo('f2-bak-lstat-eacces-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const origLstatSync = fs.lstatSync;
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.lstatSync = (targetPath, ...args) => {
+          if (typeof targetPath === 'string' && targetPath.includes('/backup/')) {
+            const err = new Error('Simulated backup lstat EACCES');
+            err.code = 'EACCES';
+            throw err;
+          }
+          return origLstatSync(targetPath, ...args);
+        };
+      }
+    };
+
+    try {
+      const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EACCES');
+      assert.equal(res.stage, 'final-backup-reauth');
+      assert.match(res.error, /Simulated backup lstat EACCES/);
+
+      const jInspect = inspectJournal(repo);
+      assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+    } finally {
+      fs.lstatSync = origLstatSync;
+    }
+  });
+
+  test('deliberate _isFault error inside fault hook propagates without being caught', async () => {
+    const repo = setupDisposableRepo('f2-fault-propagate-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        const err = new Error('Deliberate process crash simulation');
+        err._isFault = true;
+        throw err;
+      }
+    };
+
+    await assert.rejects(
+      createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook }),
+      (err) => {
+        assert.equal(err._isFault, true);
+        assert.match(err.message, /Deliberate process crash simulation/);
+        return true;
+      }
+    );
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+});

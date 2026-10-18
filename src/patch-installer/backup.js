@@ -436,12 +436,29 @@ function reauthenticateLiveSource({
   originalMode,
   authenticatedBuffer,
 }) {
-  const lstatCheck = getPathLstat(absLiveTarget);
+  const stage = 'final-source-reauth';
+
+  let lstatCheck;
+  try {
+    lstatCheck = getPathLstat(absLiveTarget);
+  } catch (err) {
+    if (err?._isFault) throw err;
+    return {
+      ok: false,
+      error: `Live target inspection error before journal advancement: ${err.message}`,
+      code: err.code || 'source-fs-error',
+      stage,
+    };
+  }
+
   if (lstatCheck.error) {
+    if (lstatCheck.error?._isFault) throw lstatCheck.error;
+    const isMissing = lstatCheck.error.code === 'ENOENT';
     return {
       ok: false,
       error: `Live target missing or inaccessible before journal advancement: ${lstatCheck.error.message}`,
-      code: 'source-missing-before-advancement',
+      code: isMissing ? 'source-missing-before-advancement' : (lstatCheck.error.code || 'source-fs-error'),
+      stage,
     };
   }
   if (!lstatCheck.exists) {
@@ -449,6 +466,7 @@ function reauthenticateLiveSource({
       ok: false,
       error: `Live target "${absLiveTarget}" missing before journal advancement`,
       code: 'source-missing-before-advancement',
+      stage,
     };
   }
   if (lstatCheck.isSymbolicLink) {
@@ -456,6 +474,7 @@ function reauthenticateLiveSource({
       ok: false,
       error: `Live target "${absLiveTarget}" was replaced by a symbolic link before journal advancement`,
       code: 'unsafe-symlink',
+      stage,
     };
   }
   if (!lstatCheck.isFile) {
@@ -463,6 +482,7 @@ function reauthenticateLiveSource({
       ok: false,
       error: `Live target "${absLiveTarget}" is not a regular file before journal advancement`,
       code: 'invalid-source-before-advancement',
+      stage,
     };
   }
   if (!lstatCheck.stat || lstatCheck.stat.dev !== expectedDev || lstatCheck.stat.ino !== expectedIno) {
@@ -470,6 +490,7 @@ function reauthenticateLiveSource({
       ok: false,
       error: `Live target "${absLiveTarget}" inode identity changed before journal advancement (dev: ${lstatCheck.stat?.dev} vs ${expectedDev}, ino: ${lstatCheck.stat?.ino} vs ${expectedIno})`,
       code: 'source-identity-replaced',
+      stage,
     };
   }
 
@@ -477,10 +498,12 @@ function reauthenticateLiveSource({
   try {
     fd = fs.openSync(absLiveTarget, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   } catch (openErr) {
+    if (openErr?._isFault) throw openErr;
     return {
       ok: false,
       error: `Failed to open live target descriptor before journal advancement: ${openErr.message}`,
-      code: openErr.code === 'ELOOP' ? 'unsafe-symlink' : 'source-read-failed',
+      code: openErr.code === 'ELOOP' ? 'unsafe-symlink' : (openErr.code || 'source-read-failed'),
+      stage,
     };
   }
 
@@ -491,6 +514,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: 'Live target descriptor is not a regular file before journal advancement',
         code: 'invalid-source-before-advancement',
+        stage,
       };
     }
     if (!isValidDeviceIdentifier(preStat.dev) || !isValidInodeIdentifier(preStat.ino)) {
@@ -498,6 +522,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: 'Live target descriptor has invalid device or inode identity before journal advancement',
         code: 'invalid-file-identity',
+        stage,
       };
     }
     if (preStat.dev !== expectedDev || preStat.ino !== expectedIno) {
@@ -505,6 +530,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: `Live target descriptor identity changed before journal advancement (dev: ${preStat.dev} vs ${expectedDev}, ino: ${preStat.ino} vs ${expectedIno})`,
         code: 'source-identity-replaced',
+        stage,
       };
     }
 
@@ -517,6 +543,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: `Live target permission check failed before journal advancement: ${modeErr.message}`,
         code: modeErr.code || 'invalid-target-mode',
+        stage,
       };
     }
     if (currentMode !== originalMode) {
@@ -524,6 +551,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: `Live target file mode changed before journal advancement: expected "${originalMode}", observed "${currentMode}"`,
         code: 'source-mode-changed',
+        stage,
       };
     }
 
@@ -533,6 +561,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: `Live target file size (${preStat.size} bytes) exceeds limit (${MAX_SOURCE_FILE_BYTES} bytes)`,
         code: 'file-too-large',
+        stage,
       };
     }
     if (preStat.size !== authenticatedBuffer.length) {
@@ -540,6 +569,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: `Live target size changed in place before journal advancement: expected ${authenticatedBuffer.length}, observed ${preStat.size}`,
         code: 'source-content-changed',
+        stage,
       };
     }
 
@@ -553,6 +583,7 @@ function reauthenticateLiveSource({
           ok: false,
           error: `Unexpected EOF reading live target descriptor before journal advancement: read ${readBytes} of ${expectedSize} bytes`,
           code: 'unexpected-eof',
+          stage,
         };
       }
       readBytes += chunk;
@@ -566,6 +597,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: 'Live target expanded concurrently during descriptor read before journal advancement',
         code: 'concurrent-expansion',
+        stage,
       };
     }
 
@@ -580,6 +612,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: 'Live target identity or size changed concurrently during descriptor read before journal advancement',
         code: 'source-identity-changed',
+        stage,
       };
     }
 
@@ -592,6 +625,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: `Live target content SHA-256 changed before journal advancement: got "${actualSha}", expected "${expectedInitialSha}"`,
         code: 'source-content-changed',
+        stage,
       };
     }
 
@@ -600,6 +634,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: `Live target Git blob SHA changed before journal advancement: got "${actualBlob}", expected "${expectedInitialBlob}"`,
         code: 'source-content-changed',
+        stage,
       };
     }
 
@@ -608,6 +643,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: 'Live target content altered in place before journal advancement',
         code: 'source-content-changed',
+        stage,
       };
     }
 
@@ -616,10 +652,13 @@ function reauthenticateLiveSource({
     try {
       finalPathStat = fs.lstatSync(absLiveTarget);
     } catch (lstatErr) {
+      if (lstatErr?._isFault) throw lstatErr;
+      const isMissing = lstatErr.code === 'ENOENT';
       return {
         ok: false,
         error: `Live target pathname missing before journal advancement: ${lstatErr.message}`,
-        code: 'source-missing-before-advancement',
+        code: isMissing ? 'source-missing-before-advancement' : (lstatErr.code || 'source-fs-error'),
+        stage,
       };
     }
 
@@ -628,6 +667,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: `Live target "${absLiveTarget}" was replaced by a symbolic link before journal advancement`,
         code: 'unsafe-symlink',
+        stage,
       };
     }
 
@@ -636,6 +676,7 @@ function reauthenticateLiveSource({
         ok: false,
         error: `Live target "${absLiveTarget}" is not a regular file before journal advancement`,
         code: 'invalid-source-before-advancement',
+        stage,
       };
     }
 
@@ -644,10 +685,19 @@ function reauthenticateLiveSource({
         ok: false,
         error: `Live target "${absLiveTarget}" inode identity changed before journal advancement`,
         code: 'source-identity-replaced',
+        stage,
       };
     }
 
-    return { ok: true };
+    return { ok: true, stage };
+  } catch (fsErr) {
+    if (fsErr?._isFault) throw fsErr;
+    return {
+      ok: false,
+      error: `Live target descriptor verification failed: ${fsErr.message}`,
+      code: fsErr.code || 'source-fs-error',
+      stage,
+    };
   } finally {
     if (fd !== null) {
       try {
@@ -687,16 +737,19 @@ function reauthenticateBackupFile({
   authenticatedBuffer,
   doFsync = false,
   runFault = null,
+  stage = 'final-backup-reauth',
 }) {
   // Confirm transaction directory contains exactly the single expected backup file
   let backupChildren;
   try {
     backupChildren = fs.readdirSync(backupTxDir);
   } catch (dirErr) {
+    if (dirErr?._isFault) throw dirErr;
     return {
       ok: false,
       error: `Failed to inspect backup directory: ${dirErr.message}`,
-      code: 'inspection-error',
+      code: dirErr.code || 'inspection-error',
+      stage,
     };
   }
 
@@ -705,15 +758,31 @@ function reauthenticateBackupFile({
       ok: false,
       error: `Backup directory contains unexpected artifacts: ${backupChildren.join(', ')}`,
       code: 'unexpected-backup-artifacts',
+      stage,
     };
   }
 
-  const pathStatCheck = getPathLstat(backupFile);
+  let pathStatCheck;
+  try {
+    pathStatCheck = getPathLstat(backupFile);
+  } catch (err) {
+    if (err?._isFault) throw err;
+    return {
+      ok: false,
+      error: `Failed to inspect backup pathname: ${err.message}`,
+      code: err.code || 'backup-fs-error',
+      stage,
+    };
+  }
+
   if (pathStatCheck.error) {
+    if (pathStatCheck.error?._isFault) throw pathStatCheck.error;
+    const isMissing = pathStatCheck.error.code === 'ENOENT';
     return {
       ok: false,
       error: `Backup pathname missing or unreadable: ${pathStatCheck.error.message}`,
-      code: 'backup-pathname-missing',
+      code: isMissing ? 'backup-pathname-missing' : (pathStatCheck.error.code || 'backup-fs-error'),
+      stage,
     };
   }
   if (!pathStatCheck.exists) {
@@ -721,6 +790,7 @@ function reauthenticateBackupFile({
       ok: false,
       error: `Backup pathname "${backupFile}" does not exist`,
       code: 'backup-pathname-missing',
+      stage,
     };
   }
   if (pathStatCheck.isSymbolicLink) {
@@ -728,6 +798,7 @@ function reauthenticateBackupFile({
       ok: false,
       error: `Backup pathname "${backupFile}" was replaced by a symbolic link before journal advancement`,
       code: 'unsafe-symlink',
+      stage,
     };
   }
   if (!pathStatCheck.isFile) {
@@ -735,6 +806,7 @@ function reauthenticateBackupFile({
       ok: false,
       error: `Backup pathname "${backupFile}" is not a regular file`,
       code: 'invalid-backup-result',
+      stage,
     };
   }
   if (!pathStatCheck.stat || pathStatCheck.stat.dev !== createdBackupDev || pathStatCheck.stat.ino !== createdBackupIno) {
@@ -742,6 +814,7 @@ function reauthenticateBackupFile({
       ok: false,
       error: `Backup pathname "${backupFile}" inode identity changed`,
       code: 'backup-identity-replaced',
+      stage,
     };
   }
 
@@ -750,10 +823,12 @@ function reauthenticateBackupFile({
     try {
       readFd = fs.openSync(backupFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     } catch (openErr) {
+      if (openErr?._isFault) throw openErr;
       return {
         ok: false,
         error: `Failed to open backup file descriptor for verification: ${openErr.message}`,
-        code: openErr.code === 'ELOOP' ? 'unsafe-symlink' : 'backup-open-failed',
+        code: openErr.code === 'ELOOP' ? 'unsafe-symlink' : (openErr.code || 'backup-open-failed'),
+        stage,
       };
     }
 
@@ -763,6 +838,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: 'Backup file descriptor is not a regular file',
         code: 'invalid-backup-result',
+        stage,
       };
     }
     if (!isValidDeviceIdentifier(preStat.dev) || !isValidInodeIdentifier(preStat.ino)) {
@@ -770,6 +846,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: 'Backup file descriptor has invalid device or inode identity',
         code: 'invalid-file-identity',
+        stage,
       };
     }
     if (preStat.dev !== createdBackupDev || preStat.ino !== createdBackupIno) {
@@ -777,6 +854,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: 'Backup file descriptor identity differs from created descriptor',
         code: 'backup-identity-replaced',
+        stage,
       };
     }
     if ((preStat.mode & 0o777) !== 0o600) {
@@ -784,6 +862,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: `Backup file mode mismatch: got 0o${(preStat.mode & 0o777).toString(8)}, expected 0o600`,
         code: 'backup-mode-mismatch',
+        stage,
       };
     }
     if (preStat.size !== authenticatedBuffer.length) {
@@ -791,6 +870,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: `Backup file size mismatch: read ${preStat.size}, expected ${authenticatedBuffer.length}`,
         code: 'backup-size-mismatch',
+        stage,
       };
     }
 
@@ -804,6 +884,7 @@ function reauthenticateBackupFile({
           ok: false,
           error: `Unexpected EOF reading backup descriptor: read ${readBytes} of ${expectedSize} bytes`,
           code: 'unexpected-eof',
+          stage,
         };
       }
       readBytes += chunk;
@@ -816,6 +897,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: 'Backup file expanded concurrently during descriptor read',
         code: 'concurrent-expansion',
+        stage,
       };
     }
 
@@ -832,6 +914,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: `Backup SHA-256 digest mismatch: got "${actualBackupSha256}", expected "${expectedInitialSha}"`,
         code: 'backup-sha256-mismatch',
+        stage,
       };
     }
 
@@ -840,6 +923,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: `Backup Git blob SHA mismatch: got "${actualBackupBlobSha}", expected "${expectedInitialBlob}"`,
         code: 'backup-blob-mismatch',
+        stage,
       };
     }
 
@@ -849,6 +933,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: 'Backup content does not match authenticated live source buffer byte-for-byte',
         code: 'backup-content-mismatch',
+        stage,
       };
     }
 
@@ -884,6 +969,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: 'Backup file descriptor identity changed during verification',
         code: 'backup-identity-changed',
+        stage,
       };
     }
 
@@ -893,10 +979,12 @@ function reauthenticateBackupFile({
       pathStat = fs.lstatSync(backupFile);
     } catch (lstatErr) {
       if (lstatErr?._isFault) throw lstatErr;
+      const isMissing = lstatErr.code === 'ENOENT';
       return {
         ok: false,
         error: `Backup pathname missing or unreadable before journal advancement: ${lstatErr.message}`,
-        code: 'backup-pathname-missing',
+        code: isMissing ? 'backup-pathname-missing' : (lstatErr.code || 'backup-fs-error'),
+        stage,
       };
     }
 
@@ -905,6 +993,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: `Backup pathname "${backupFile}" was replaced by a symbolic link before journal advancement`,
         code: 'unsafe-symlink',
+        stage,
       };
     }
 
@@ -913,6 +1002,7 @@ function reauthenticateBackupFile({
         ok: false,
         error: `Backup pathname "${backupFile}" is not a regular file`,
         code: 'invalid-backup-result',
+        stage,
       };
     }
 
@@ -921,10 +1011,24 @@ function reauthenticateBackupFile({
         ok: false,
         error: `Backup pathname "${backupFile}" inode identity changed`,
         code: 'backup-identity-replaced',
+        stage,
       };
     }
 
-    return { ok: true, actualBackupSha256, actualBackupBlobSha };
+    return {
+      ok: true,
+      stage,
+      actualBackupSha256,
+      actualBackupBlobSha,
+    };
+  } catch (fsErr) {
+    if (fsErr?._isFault) throw fsErr;
+    return {
+      ok: false,
+      error: `Backup descriptor verification failed: ${fsErr.message}`,
+      code: fsErr.code || 'backup-fs-error',
+      stage,
+    };
   } finally {
     if (readFd !== null) {
       try {
@@ -1489,6 +1593,7 @@ export async function createVerifiedBackup(options = {}) {
     authenticatedBuffer: liveSource.buffer,
     doFsync: true,
     runFault,
+    stage: 'backup-readback',
   });
   if (!initialBackupVerify.ok) {
     return initialBackupVerify;
@@ -1552,47 +1657,84 @@ export async function createVerifiedBackup(options = {}) {
   }
 
   // C. Reauthenticate prepared staging output
-  const finalStagingReauth = reauthenticatePreparedStaging(
-    repoRoot,
-    txId,
-    journal,
-    patchEntry,
-    expectedResultSha,
-    expectedResultBlob,
-    authenticatedStagedDev,
-    authenticatedStagedIno
-  );
+  let finalStagingReauth;
+  try {
+    finalStagingReauth = reauthenticatePreparedStaging(
+      repoRoot,
+      txId,
+      journal,
+      patchEntry,
+      expectedResultSha,
+      expectedResultBlob,
+      authenticatedStagedDev,
+      authenticatedStagedIno
+    );
+  } catch (err) {
+    if (err?._isFault) throw err;
+    return {
+      ok: false,
+      error: `Pre-publication staging reauthentication failed: ${err.message}`,
+      code: err.code || 'staging-fs-error',
+      stage: 'final-staging-reauth',
+    };
+  }
   if (!finalStagingReauth.ok) {
+    if (!finalStagingReauth.stage) {
+      finalStagingReauth.stage = 'final-staging-reauth';
+    }
     return finalStagingReauth;
   }
 
   // D. Reauthenticate live target source content, mode, and identity
-  const finalSourceReauth = reauthenticateLiveSource({
-    absLiveTarget,
-    expectedDev: authenticatedSourceDev,
-    expectedIno: authenticatedSourceIno,
-    expectedInitialSha,
-    expectedInitialBlob,
-    originalMode,
-    authenticatedBuffer: liveSource.buffer,
-  });
+  let finalSourceReauth;
+  try {
+    finalSourceReauth = reauthenticateLiveSource({
+      absLiveTarget,
+      expectedDev: authenticatedSourceDev,
+      expectedIno: authenticatedSourceIno,
+      expectedInitialSha,
+      expectedInitialBlob,
+      originalMode,
+      authenticatedBuffer: liveSource.buffer,
+    });
+  } catch (err) {
+    if (err?._isFault) throw err;
+    return {
+      ok: false,
+      error: `Pre-publication live source reauthentication failed: ${err.message}`,
+      code: err.code || 'source-fs-error',
+      stage: 'final-source-reauth',
+    };
+  }
   if (!finalSourceReauth.ok) {
     return finalSourceReauth;
   }
 
   // E. Reauthenticate backup content, mode, directory cleanliness, and identity
-  const finalBackupReauth = reauthenticateBackupFile({
-    backupFile,
-    backupTxDir,
-    targetBase,
-    createdBackupDev,
-    createdBackupIno,
-    expectedInitialSha,
-    expectedInitialBlob,
-    authenticatedBuffer: liveSource.buffer,
-    doFsync: false,
-    runFault: null,
-  });
+  let finalBackupReauth;
+  try {
+    finalBackupReauth = reauthenticateBackupFile({
+      backupFile,
+      backupTxDir,
+      targetBase,
+      createdBackupDev,
+      createdBackupIno,
+      expectedInitialSha,
+      expectedInitialBlob,
+      authenticatedBuffer: liveSource.buffer,
+      doFsync: false,
+      runFault: null,
+      stage: 'final-backup-reauth',
+    });
+  } catch (err) {
+    if (err?._isFault) throw err;
+    return {
+      ok: false,
+      error: `Pre-publication backup reauthentication failed: ${err.message}`,
+      code: err.code || 'backup-fs-error',
+      stage: 'final-backup-reauth',
+    };
+  }
   if (!finalBackupReauth.ok) {
     return finalBackupReauth;
   }
