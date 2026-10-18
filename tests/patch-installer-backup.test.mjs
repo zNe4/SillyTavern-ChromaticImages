@@ -1952,6 +1952,11 @@ describe('P3B-2B-F1: Finding B — Late Staging Changes at before-journal-advanc
 });
 
 describe('P3B-2B-F2: Finding A — Structured Filesystem Failure Handling during Final Reauthentication', () => {
+  if (!authenticStock || !authenticPatched) {
+    test.skip('Skipping authentic tests (authentic stock or patched fixture unavailable)', () => {});
+    return;
+  }
+
   test('converts unexpected EIO during final live source fstatSync into structured failure result', async () => {
     const repo = setupDisposableRepo('f2-src-fstat-eio-');
     const txId = generateTxId();

@@ -72,6 +72,22 @@ export function getPermittedArtifactNames(journal, kind) {
 export const MAX_BACKUP_INSPECT_BYTES = 50 * 1024 * 1024; // 50 MiB
 
 /**
+ * Pure capability predicate that checks whether a constants object satisfies
+ * the required platform O_NOFOLLOW capability.
+ *
+ * @param {object|null|undefined} constants
+ * @returns {boolean}
+ */
+export function hasRequiredNoFollow(constants) {
+  return Boolean(
+    constants &&
+    typeof constants.O_NOFOLLOW === 'number' &&
+    Number.isInteger(constants.O_NOFOLLOW) &&
+    constants.O_NOFOLLOW !== 0
+  );
+}
+
+/**
  * Bounded, descriptor-based readback and SHA-256 verification of a backup artifact.
  * Strictly read-only; imposes size bounds before allocating buffer.
  *
@@ -91,8 +107,8 @@ export const MAX_BACKUP_INSPECT_BYTES = 50 * 1024 * 1024; // 50 MiB
  *   reason?: string
  * }}
  */
-export function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact, constants = fs.constants) {
-  if (!constants || typeof constants.O_NOFOLLOW !== 'number' || constants.O_NOFOLLOW === 0) {
+export function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact) {
+  if (!hasRequiredNoFollow(fs.constants)) {
     return {
       ok: false,
       isError: true,
@@ -102,7 +118,7 @@ export function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact
 
   let fd = null;
   try {
-    fd = fs.openSync(cPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = fs.openSync(cPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   } catch (err) {
     if (err?.code === 'ELOOP') {
       return { ok: false, isSymlink: true, reason: `Backup artifact is a symbolic link: "${relArtifact}"` };
@@ -222,8 +238,6 @@ export function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact
  * Detects orphaned artifacts, dangling symlinks, and ambiguous metadata.
  *
  * @param {string} repoRoot
- * @param {object} [options]
- * @param {object} [options._fsConstants]
  * @returns {{
  *   state: 'none' | 'ownership-unverified' | 'orphaned-journal' | 'corrupted-journal' | 'corrupted-lock' | 'mismatched-metadata' | 'foreign-content' | 'unsafe-symlink' | 'orphaned-artifact' | 'incomplete-transaction' | 'inspection-error',
  *   hasLock: boolean,
@@ -236,7 +250,7 @@ export function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact
  *   reasons: string[]
  * }}
  */
-export function inspectTransactionState(repoRoot, options = {}) {
+export function inspectTransactionState(repoRoot) {
   const reasons = [];
   const foreignEntries = [];
   const orphanedArtifacts = [];
@@ -680,8 +694,7 @@ export function inspectTransactionState(repoRoot, options = {}) {
                           cPath,
                           journalObj.expectedInitialSha256,
                           journalObj.phase,
-                          relArtifact,
-                          options?._fsConstants || fs.constants
+                          relArtifact
                         );
                         if (!inspectRes.ok) {
                           if (inspectRes.isSymlink) {

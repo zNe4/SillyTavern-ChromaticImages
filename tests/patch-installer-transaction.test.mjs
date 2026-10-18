@@ -34,6 +34,7 @@ import {
 import {
   inspectTransactionState,
   inspectBackupArtifactFile,
+  hasRequiredNoFollow,
   getPermittedArtifactNames,
 } from '../src/patch-installer/transaction-state.js';
 
@@ -3751,11 +3752,11 @@ describe('P3B-2B-F1: Read-Only Backup Inspection Hardening (Finding C)', () => {
   });
 });
 
-describe('P3B-2B-F2: Finding B — Read-Only Inspection Error Classification & Unsupported O_NOFOLLOW', () => {
+describe('P3B-2B-F3: Finding A — Production Inspector Isolation & Pure No-Follow Capability Check', () => {
   const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
   const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
 
-  function setupValidBackupState(prefix = 'insp-f2-') {
+  function setupValidBackupState(prefix = 'insp-f3-') {
     const dummyContent = 'authentic test backup content\n';
     const dummySha = crypto.createHash('sha256').update(dummyContent).digest('hex');
     const repo = createTempDir(prefix);
@@ -3801,8 +3802,86 @@ describe('P3B-2B-F2: Finding B — Read-Only Inspection Error Classification & U
     return { repo, txId, lease, backupFile, dummyContent, dummySha };
   }
 
+  test('pure predicate hasRequiredNoFollow strictly validates platform capability', () => {
+    // 1. Valid on real platform constants
+    assert.equal(hasRequiredNoFollow(fs.constants), true);
+    assert.equal(hasRequiredNoFollow({ O_NOFOLLOW: 131072 }), true);
+    assert.equal(hasRequiredNoFollow({ O_NOFOLLOW: 1 }), true);
+
+    // 2. Missing or zero-valued rejected
+    assert.equal(hasRequiredNoFollow({ O_NOFOLLOW: 0 }), false);
+    assert.equal(hasRequiredNoFollow({}), false);
+    assert.equal(hasRequiredNoFollow(null), false);
+    assert.equal(hasRequiredNoFollow(undefined), false);
+
+    // 3. Non-integer or non-number rejected
+    assert.equal(hasRequiredNoFollow({ O_NOFOLLOW: '131072' }), false);
+    assert.equal(hasRequiredNoFollow({ O_NOFOLLOW: NaN }), false);
+    assert.equal(hasRequiredNoFollow({ O_NOFOLLOW: Infinity }), false);
+    assert.equal(hasRequiredNoFollow({ O_NOFOLLOW: 131072.5 }), false);
+    assert.equal(hasRequiredNoFollow({ O_NOFOLLOW: true }), false);
+  });
+
+  test('production inspectTransactionState always uses real platform constants and ignores caller _fsConstants', () => {
+    const { repo } = setupValidBackupState('insp-f3-prod-flags-');
+    const origOpenSync = fs.openSync;
+    let observedFlags = null;
+    let openCount = 0;
+    try {
+      fs.openSync = (p, flags, ...args) => {
+        openCount++;
+        observedFlags = flags;
+        return origOpenSync(p, flags, ...args);
+      };
+
+      // Caller attempts to pass _fsConstants override
+      const state = inspectTransactionState(repo, {
+        _fsConstants: { O_RDONLY: 0x1111, O_NOFOLLOW: 0x2222 },
+      });
+
+      assert.equal(state.state, 'ownership-unverified');
+      assert.equal(state.isPending, true);
+      assert.equal(openCount, 1);
+      // Real platform constants must be used, NOT caller-supplied numbers
+      assert.equal(observedFlags, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      assert.notEqual(observedFlags, 0x1111 | 0x2222);
+    } finally {
+      fs.openSync = origOpenSync;
+    }
+  });
+
+  test('production inspectBackupArtifactFile always uses real platform constants and ignores extra caller arguments', () => {
+    const { backupFile, dummySha } = setupValidBackupState('insp-f3-direct-flags-');
+    const origOpenSync = fs.openSync;
+    let observedFlags = null;
+    let openCount = 0;
+    try {
+      fs.openSync = (p, flags, ...args) => {
+        openCount++;
+        observedFlags = flags;
+        return origOpenSync(p, flags, ...args);
+      };
+
+      // Caller attempts to supply synthetic constants as a 5th argument
+      const res = inspectBackupArtifactFile(
+        backupFile,
+        dummySha,
+        'BACKUP_CREATED',
+        'backup/txId/stable-diffusion.js',
+        { O_RDONLY: 0x1111, O_NOFOLLOW: 0x2222 }
+      );
+
+      assert.equal(res.ok, true);
+      assert.equal(openCount, 1);
+      assert.equal(observedFlags, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      assert.notEqual(observedFlags, 0x1111 | 0x2222);
+    } finally {
+      fs.openSync = origOpenSync;
+    }
+  });
+
   test('classifies EACCES during backup inspection as inspection-error with isPending true', () => {
-    const { repo, txId } = setupValidBackupState('insp-f2-eacces-');
+    const { repo, txId } = setupValidBackupState('insp-f3-eacces-');
     const origLstatSync = fs.lstatSync;
     try {
       fs.lstatSync = (p, ...args) => {
@@ -3827,7 +3906,7 @@ describe('P3B-2B-F2: Finding B — Read-Only Inspection Error Classification & U
   });
 
   test('classifies EIO during backup inspection as inspection-error with isPending true', () => {
-    const { repo, txId } = setupValidBackupState('insp-f2-eio-');
+    const { repo, txId } = setupValidBackupState('insp-f3-eio-');
     const origLstatSync = fs.lstatSync;
     try {
       fs.lstatSync = (p, ...args) => {
@@ -3852,7 +3931,7 @@ describe('P3B-2B-F2: Finding B — Read-Only Inspection Error Classification & U
   });
 
   test('distinguishes missing backup file (ENOENT) as incomplete-transaction', () => {
-    const { repo, backupFile } = setupValidBackupState('insp-f2-missing-');
+    const { repo, backupFile } = setupValidBackupState('insp-f3-missing-');
     fs.unlinkSync(backupFile);
 
     const state = inspectTransactionState(repo);
@@ -3864,66 +3943,8 @@ describe('P3B-2B-F2: Finding B — Read-Only Inspection Error Classification & U
     );
   });
 
-  test('fails closed with inspection-error when O_NOFOLLOW is missing or unsupported in fsConstants option', () => {
-    const { repo } = setupValidBackupState('insp-f2-nofollow-opt-');
-
-    // Override _fsConstants without O_NOFOLLOW
-    const customConstants = {
-      O_RDONLY: fs.constants.O_RDONLY,
-      O_NOFOLLOW: 0,
-    };
-
-    const state = inspectTransactionState(repo, { _fsConstants: customConstants });
-    assert.equal(state.state, 'inspection-error');
-    assert.equal(state.isPending, true);
-    assert.ok(
-      state.reasons.some((r) => r.includes('O_NOFOLLOW file open flag is required')),
-      'Expected unsupported platform reason for missing O_NOFOLLOW'
-    );
-  });
-
-  test('direct inspectBackupArtifactFile refuses inspection when constants lacks O_NOFOLLOW', () => {
-    const { backupFile, dummySha } = setupValidBackupState('insp-f2-direct-');
-
-    // Test with O_NOFOLLOW = 0
-    const res1 = inspectBackupArtifactFile(
-      backupFile,
-      dummySha,
-      'BACKUP_CREATED',
-      'backup/txId/stable-diffusion.js',
-      { O_RDONLY: 0, O_NOFOLLOW: 0 }
-    );
-    assert.equal(res1.ok, false);
-    assert.equal(res1.isError, true);
-    assert.match(res1.reason, /Unsupported platform: O_NOFOLLOW file open flag is required/);
-
-    // Test with missing O_NOFOLLOW property
-    const res2 = inspectBackupArtifactFile(
-      backupFile,
-      dummySha,
-      'BACKUP_CREATED',
-      'backup/txId/stable-diffusion.js',
-      {}
-    );
-    assert.equal(res2.ok, false);
-    assert.equal(res2.isError, true);
-    assert.match(res2.reason, /Unsupported platform: O_NOFOLLOW file open flag is required/);
-
-    // Test with null constants
-    const res3 = inspectBackupArtifactFile(
-      backupFile,
-      dummySha,
-      'BACKUP_CREATED',
-      'backup/txId/stable-diffusion.js',
-      null
-    );
-    assert.equal(res3.ok, false);
-    assert.equal(res3.isError, true);
-    assert.match(res3.reason, /Unsupported platform: O_NOFOLLOW file open flag is required/);
-  });
-
   test('direct inspectBackupArtifactFile distinguishes pathCheck EACCES from ENOENT unlinking', () => {
-    const { backupFile, dummySha } = setupValidBackupState('insp-f2-direct-errs-');
+    const { backupFile, dummySha } = setupValidBackupState('insp-f3-direct-errs-');
 
     const origLstatSync = fs.lstatSync;
     // 1. EACCES during post-descriptor getPathLstat
