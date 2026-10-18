@@ -232,6 +232,176 @@ export function inspectBackupArtifactFile(cPath, expectedSha, phase, relArtifact
   }
 }
 
+export const MAX_DESTINATION_INSPECT_BYTES = 50 * 1024 * 1024; // 50 MiB
+
+/**
+ * Bounded, descriptor-based readback and verification of a destination candidate artifact.
+ * Strictly read-only; imposes size bounds before allocating buffer.
+ *
+ * @param {string} cPath - Absolute path to candidate artifact
+ * @param {string} expectedSha - Expected result SHA-256 hex digest
+ * @param {string} expectedMode - Expected 4-character octal targetMode (e.g. "0644")
+ * @param {string} phase - Current journal phase
+ * @param {string} relArtifact - Human-readable relative artifact name for error messages
+ * @returns {{
+ *   ok: boolean,
+ *   isSymlink?: boolean,
+ *   isForeign?: boolean,
+ *   isError?: boolean,
+ *   isOversized?: boolean,
+ *   isIncomplete?: boolean,
+ *   isCorrupt?: boolean,
+ *   actualSha?: string,
+ *   actualMode?: string,
+ *   reason?: string
+ * }}
+ */
+export function inspectDestinationCandidateFile(cPath, expectedSha, expectedMode, phase, relArtifact) {
+  if (!hasRequiredNoFollow(fs.constants)) {
+    return {
+      ok: false,
+      isError: true,
+      reason: `Unsupported platform: O_NOFOLLOW file open flag is required for safe candidate inspection of "${relArtifact}"`,
+    };
+  }
+
+  let fd = null;
+  try {
+    fd = fs.openSync(cPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (err) {
+    if (err?.code === 'ELOOP') {
+      return { ok: false, isSymlink: true, reason: `Destination candidate is a symbolic link: "${relArtifact}"` };
+    }
+    if (err?.code === 'ENOENT') {
+      return { ok: false, isIncomplete: true, reason: `Destination candidate was not found when opening: "${relArtifact}"` };
+    }
+    return { ok: false, isError: true, reason: `Failed to open destination candidate descriptor: ${err.message}` };
+  }
+
+  try {
+    const preStat = fs.fstatSync(fd);
+    if (!preStat.isFile() || preStat.isSymbolicLink()) {
+      return { ok: false, isForeign: true, reason: `Destination candidate descriptor is not a regular file: "${relArtifact}"` };
+    }
+    if (!isValidDeviceIdentifier(preStat.dev) || !isValidInodeIdentifier(preStat.ino)) {
+      return { ok: false, isError: true, reason: `Destination candidate descriptor has invalid device or inode identity: "${relArtifact}"` };
+    }
+    if (preStat.size > MAX_DESTINATION_INSPECT_BYTES) {
+      return {
+        ok: false,
+        isOversized: true,
+        reason: `Destination candidate size (${preStat.size} bytes) exceeds safety limit (${MAX_DESTINATION_INSPECT_BYTES} bytes): "${relArtifact}"`,
+      };
+    }
+    if (preStat.size === 0) {
+      return {
+        ok: false,
+        isIncomplete: true,
+        reason: `Destination candidate file is unexpectedly empty (0 bytes): "${relArtifact}"`,
+      };
+    }
+
+    if (typeof expectedMode === 'string' && expectedMode.trim() !== '') {
+      const expectedModeInt = parseInt(expectedMode, 8);
+      if ((preStat.mode & 0o777) !== expectedModeInt) {
+        const actualOctal = '0' + (preStat.mode & 0o777).toString(8).padStart(3, '0');
+        return {
+          ok: false,
+          isIncomplete: true,
+          actualMode: actualOctal,
+          reason: `Destination candidate mode mismatch in phase "${phase}": expected ${expectedMode}, observed ${actualOctal}: "${relArtifact}"`,
+        };
+      }
+    }
+
+    const expectedSize = preStat.size;
+    const buffer = Buffer.alloc(expectedSize);
+    let totalRead = 0;
+    while (totalRead < expectedSize) {
+      const chunk = fs.readSync(fd, buffer, totalRead, expectedSize - totalRead, totalRead);
+      if (chunk === 0) {
+        return {
+          ok: false,
+          isIncomplete: true,
+          reason: `Unexpected EOF reading destination candidate: read ${totalRead} of ${expectedSize} bytes: "${relArtifact}"`,
+        };
+      }
+      totalRead += chunk;
+    }
+
+    // Concurrent expansion check
+    const extraCheck = Buffer.alloc(1);
+    const extra = fs.readSync(fd, extraCheck, 0, 1, expectedSize);
+    if (extra !== 0) {
+      return {
+        ok: false,
+        isIncomplete: true,
+        reason: `Destination candidate expanded concurrently during inspection: "${relArtifact}"`,
+      };
+    }
+
+    const postStat = fs.fstatSync(fd);
+    if (
+      postStat.dev !== preStat.dev ||
+      postStat.ino !== preStat.ino ||
+      postStat.size !== expectedSize ||
+      !postStat.isFile()
+    ) {
+      return {
+        ok: false,
+        isIncomplete: true,
+        reason: `Destination candidate identity or size changed concurrently during inspection: "${relArtifact}"`,
+      };
+    }
+
+    // Pathname-to-descriptor identity consistency
+    const pathCheck = getPathLstat(cPath);
+    if (pathCheck.error) {
+      if (pathCheck.error.code === 'ENOENT') {
+        return { ok: false, isIncomplete: true, reason: `Destination candidate was unlinked during inspection: "${relArtifact}"` };
+      }
+      return { ok: false, isError: true, reason: `Failed to inspect destination candidate pathname: ${pathCheck.error.message}` };
+    }
+    if (!pathCheck.exists) {
+      return { ok: false, isIncomplete: true, reason: `Destination candidate was unlinked during inspection: "${relArtifact}"` };
+    }
+    if (pathCheck.isSymbolicLink) {
+      return { ok: false, isSymlink: true, reason: `Destination candidate was replaced by a symbolic link: "${relArtifact}"` };
+    }
+    if (!pathCheck.isFile) {
+      return { ok: false, isForeign: true, reason: `Destination candidate pathname is no longer a regular file: "${relArtifact}"` };
+    }
+    if (!pathCheck.stat || pathCheck.stat.dev !== preStat.dev || pathCheck.stat.ino !== preStat.ino) {
+      return { ok: false, isIncomplete: true, reason: `Destination candidate pathname inode identity changed during inspection: "${relArtifact}"` };
+    }
+
+    if (typeof expectedSha === 'string' && expectedSha.trim() !== '') {
+      const actualSha = crypto.createHash('sha256').update(buffer).digest('hex');
+      if (actualSha.toLowerCase() !== expectedSha.toLowerCase()) {
+        return {
+          ok: false,
+          isCorrupt: true,
+          actualSha,
+          reason: `Corrupted destination candidate in phase "${phase}": "${relArtifact}" SHA-256 (${actualSha}) does not match expected result SHA-256 (${expectedSha})`,
+        };
+      }
+    }
+
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, isError: true, reason: `Error during destination candidate descriptor inspection: ${err.message}` };
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+
 /**
  * Perform comprehensive read-only inspection of installer transaction metadata.
  * Never mutates, acquires, steals, or deletes locks or journals.
@@ -287,44 +457,37 @@ export function inspectTransactionState(repoRoot) {
     };
   }
 
-  if (!ciPathCheck.exists) {
-    return {
-      state: 'none',
-      hasLock: false,
-      hasJournal: false,
-      isPending: false,
-      lock: null,
-      journal: null,
-      foreignEntries: [],
-      orphanedArtifacts: [],
-      reasons: [],
-    };
-  }
-
-  const ciPatchDir = getCiPatchDir(repoRoot);
   let dirEntries = [];
-  try {
-    dirEntries = fs.readdirSync(ciPatchDir);
-  } catch (err) {
-    return {
-      state: 'inspection-error',
-      hasLock: false,
-      hasJournal: false,
-      isPending: true,
-      lock: null,
-      journal: null,
-      foreignEntries: [],
-      orphanedArtifacts: [],
-      reasons: [`Failed to read installer directory: ${err.message}`],
-    };
-  }
+  let lockInspection = { hasLock: false, isValid: true, isSymlink: false, owner: null, lockDirPath: '', errors: [] };
+  let journalInspection = { hasJournal: false, isValid: true, isSymlink: false, journal: null, journalPath: '', errors: [] };
+  let hasLock = false;
+  let hasJournal = false;
+  let isMismatched = false;
 
-  // Inspect lock and journal first
-  const lockInspection = inspectLock(repoRoot);
-  const journalInspection = inspectJournal(repoRoot);
+  if (ciPathCheck.exists) {
+    const ciPatchDir = getCiPatchDir(repoRoot);
+    try {
+      dirEntries = fs.readdirSync(ciPatchDir);
+    } catch (err) {
+      return {
+        state: 'inspection-error',
+        hasLock: false,
+        hasJournal: false,
+        isPending: true,
+        lock: null,
+        journal: null,
+        foreignEntries: [],
+        orphanedArtifacts: [],
+        reasons: [`Failed to read installer directory: ${err.message}`],
+      };
+    }
 
-  const hasLock = lockInspection.hasLock;
-  const hasJournal = journalInspection.hasJournal;
+    // Inspect lock and journal first
+    lockInspection = inspectLock(repoRoot);
+    journalInspection = inspectJournal(repoRoot);
+
+    hasLock = lockInspection.hasLock;
+    hasJournal = journalInspection.hasJournal;
 
   if (lockInspection.isSymlink || journalInspection.isSymlink) {
     hasUnsafeSymlink = true;
@@ -356,7 +519,6 @@ export function inspectTransactionState(repoRoot) {
   }
 
   // Full lock/journal transaction consistency
-  let isMismatched = false;
   if (hasLock && hasJournal && lockInspection.isValid && journalInspection.isValid && lockInspection.owner && journalInspection.journal) {
     const lockOwner = lockInspection.owner;
     const journalObj = journalInspection.journal;
@@ -734,9 +896,114 @@ export function inspectTransactionState(repoRoot) {
     }
   }
 
-  // Foreign content
+  // Foreign content inside .ci-patch
   if (foreignEntries.length > 0) {
     reasons.push(`Installer directory contains unexpected foreign files: ${foreignEntries.join(', ')}`);
+  }
+  }
+
+  // Inspect destination parent directory for candidate artifacts
+  const targetRelDir = 'src/endpoints';
+  const targetBase = 'stable-diffusion.js';
+  const absParentDir = path.join(repoRoot, targetRelDir);
+  const candidateRegex = /^\.stable-diffusion\.js\.ci-staged-(.+)\.tmp$/;
+
+  const parentCheck = getPathLstat(absParentDir);
+  const srcCheck = getPathLstat(path.join(repoRoot, 'src'));
+
+  if (srcCheck.isSymbolicLink || parentCheck.isSymbolicLink) {
+    hasUnsafeSymlink = true;
+    reasons.push('Destination parent directory contains a symbolic link');
+  } else if (parentCheck.error && parentCheck.error.code !== 'ENOENT') {
+    hasInspectionError = true;
+    inspectionErrors.push(`Failed to inspect destination parent directory: ${parentCheck.error.message}`);
+    reasons.push(`Failed to inspect destination parent directory: ${parentCheck.error.message}`);
+  } else if (!parentCheck.exists) {
+    if (hasLock && lockInspection.isValid && hasJournal && journalInspection.isValid && !isMismatched) {
+      const jObj = journalInspection.journal;
+      if (jObj && jObj.phase === 'READY_TO_SWAP') {
+        isIncompleteTransaction = true;
+        reasons.push('Missing destination directory in phase "READY_TO_SWAP": "src/endpoints" does not exist');
+      }
+    }
+  } else if (parentCheck.exists && !parentCheck.isDirectory) {
+    hasInspectionError = true;
+    inspectionErrors.push('Destination parent path exists but is not a directory: src/endpoints');
+    reasons.push('Destination parent path exists but is not a directory: src/endpoints');
+  } else if (parentCheck.exists && parentCheck.isDirectory) {
+    try {
+      const endpointEntries = fs.readdirSync(absParentDir);
+      const activeTxId = (hasLock && lockInspection.isValid && lockInspection.owner) ? lockInspection.owner.txId : null;
+      const journalObj = (hasJournal && journalInspection.isValid && !isMismatched) ? journalInspection.journal : null;
+      let foundRegisteredCandidate = false;
+
+      for (const entry of endpointEntries) {
+        const match = entry.match(candidateRegex);
+        if (!match) continue; // Ordinary endpoint files ignored
+
+        const cPath = path.join(absParentDir, entry);
+        const relArtifact = `${targetRelDir}/${entry}`;
+        const cCheck = getPathLstat(cPath);
+
+        if (cCheck.error) {
+          hasInspectionError = true;
+          inspectionErrors.push(`Failed to inspect destination candidate (${relArtifact}): ${cCheck.error.message}`);
+          reasons.push(`Failed to inspect destination candidate (${relArtifact}): ${cCheck.error.message}`);
+        } else if (cCheck.isSymbolicLink) {
+          hasUnsafeSymlink = true;
+          reasons.push(`Destination candidate (${relArtifact}) is a symbolic link`);
+        } else if (cCheck.isDirectory || !cCheck.isFile) {
+          orphanedArtifacts.push(relArtifact);
+          reasons.push(`Unsupported filesystem object type at destination candidate path: "${relArtifact}"`);
+        } else {
+          const fileTxId = match[1];
+          if (activeTxId && fileTxId === activeTxId && journalObj && journalObj.txId === activeTxId) {
+            if (journalObj.phase === 'LOCKED' || journalObj.phase === 'ISOLATED_PREPARED' || journalObj.phase === 'BACKUP_CREATED') {
+              isIncompleteTransaction = true;
+              reasons.push(`Interrupted destination staging detected: candidate file for active transaction "${activeTxId}" exists in phase "${journalObj.phase}" prior to journal advancement`);
+            } else if (journalObj.phase === 'READY_TO_SWAP') {
+              foundRegisteredCandidate = true;
+              const inspectRes = inspectDestinationCandidateFile(
+                cPath,
+                journalObj.expectedResultSha256,
+                journalObj.targetMode,
+                journalObj.phase,
+                relArtifact
+              );
+              if (!inspectRes.ok) {
+                if (inspectRes.isSymlink) {
+                  hasUnsafeSymlink = true;
+                } else if (inspectRes.isError || inspectRes.isOversized) {
+                  hasInspectionError = true;
+                  inspectionErrors.push(inspectRes.reason);
+                } else if (inspectRes.isForeign) {
+                  orphanedArtifacts.push(relArtifact);
+                } else if (inspectRes.isIncomplete || inspectRes.isCorrupt) {
+                  isIncompleteTransaction = true;
+                }
+                reasons.push(inspectRes.reason);
+              }
+            } else if (journalObj.phase === 'SWAPPED' || journalObj.phase === 'COMPLETED') {
+              orphanedArtifacts.push(relArtifact);
+              reasons.push(`Unexpected destination candidate remains present in phase "${journalObj.phase}": "${relArtifact}"`);
+            }
+          } else {
+            orphanedArtifacts.push(relArtifact);
+            reasons.push(`Orphaned destination staging candidate detected without active valid transaction: "${relArtifact}"`);
+          }
+        }
+      }
+
+      if (journalObj && journalObj.phase === 'READY_TO_SWAP' && !foundRegisteredCandidate) {
+        isIncompleteTransaction = true;
+        const expectedCandidateName = `.${targetBase}.ci-staged-${journalObj.txId}.tmp`;
+        reasons.push(`Missing destination candidate in phase "READY_TO_SWAP": "${expectedCandidateName}" not found in destination parent directory`);
+      }
+    } catch (readDirErr) {
+      hasInspectionError = true;
+      inspectionErrors.push(`Failed to read destination parent directory: ${readDirErr.message}`);
+      reasons.push(`Failed to read destination parent directory: ${readDirErr.message}`);
+    }
   }
 
   // Determine overall classification state
