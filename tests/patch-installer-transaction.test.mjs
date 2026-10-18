@@ -3519,3 +3519,232 @@ describe('P3B-2B: Read-Only Incomplete and Corrupted Backup State Classification
     assert.ok(state.reasons.some((r) => r.includes('Corrupted backup artifact in phase "BACKUP_CREATED"')));
   });
 });
+
+describe('P3B-2B-F1: Read-Only Backup Inspection Hardening (Finding C)', () => {
+  const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
+  const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
+
+  function setupBackupCreatedRepo(prefix = 'tx-inspect-f1-') {
+    const repo = createTempDir(prefix);
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: {
+        backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+        targetMode: '0644',
+      },
+      lease,
+    });
+
+    const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+    fs.mkdirSync(txStagingDir, { recursive: true });
+    fs.writeFileSync(path.join(txStagingDir, 'stable-diffusion.js'), 'code', 'utf8');
+
+    const txBackupDir = path.join(repo, '.ci-patch/backup', txId);
+    fs.mkdirSync(txBackupDir, { recursive: true });
+
+    return { repo, txId, txBackupDir };
+  }
+
+  test('oversized backup file (> 50 MiB) fails closed with inspection-error without OOM', () => {
+    const { repo, txBackupDir } = setupBackupCreatedRepo('tx-oversized-backup-');
+    const backupFile = path.join(txBackupDir, 'stable-diffusion.js');
+
+    const fd = fs.openSync(backupFile, 'w');
+    fs.ftruncateSync(fd, 51 * 1024 * 1024);
+    fs.closeSync(fd);
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'inspection-error');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('exceeds safety limit')));
+  });
+
+  test('unreadable backup file descriptor / permission error fails closed with inspection-error', () => {
+    const { repo, txBackupDir } = setupBackupCreatedRepo('tx-unreadable-backup-');
+    const backupFile = path.join(txBackupDir, 'stable-diffusion.js');
+    fs.writeFileSync(backupFile, 'stock-data', 'utf8');
+
+    const originalOpenSync = fs.openSync;
+    fs.openSync = (...args) => {
+      const [targetPath, flags] = args;
+      if (typeof targetPath === 'string' && targetPath.includes('.ci-patch/backup') && flags === (fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)) {
+        const err = new Error('Simulated EACCES on backup file');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return originalOpenSync(...args);
+    };
+
+    try {
+      const state = inspectTransactionState(repo);
+      assert.equal(state.state, 'inspection-error');
+      assert.equal(state.isPending, true);
+      assert.ok(state.reasons.some((r) => r.includes('Failed to open backup artifact')));
+    } finally {
+      fs.openSync = originalOpenSync;
+    }
+  });
+
+  test('legacy .bak filename in current-schema backup directory is rejected as orphaned-artifact', () => {
+    const { repo, txBackupDir } = setupBackupCreatedRepo('tx-bak-reject-');
+    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js'), 'something', 'utf8');
+    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js.bak'), 'legacy-content', 'utf8');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.ok(state.orphanedArtifacts.some((a) => a.endsWith('stable-diffusion.js.bak')));
+    assert.ok(state.reasons.some((r) => r.includes('Unexpected regular file in backup') && r.includes('expected only: stable-diffusion.js')));
+  });
+
+  test('legacy .orig filename in current-schema backup directory is rejected as orphaned-artifact', () => {
+    const { repo, txBackupDir } = setupBackupCreatedRepo('tx-orig-reject-');
+    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js'), 'something', 'utf8');
+    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js.orig'), 'legacy-content', 'utf8');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.ok(state.orphanedArtifacts.some((a) => a.endsWith('stable-diffusion.js.orig')));
+  });
+
+  test('foreign file alongside canonical backup in current-schema backup directory is rejected as orphaned-artifact', () => {
+    const { repo, txBackupDir } = setupBackupCreatedRepo('tx-foreign-reject-');
+    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js'), 'something', 'utf8');
+    fs.writeFileSync(path.join(txBackupDir, 'random-unrelated.txt'), 'intruder', 'utf8');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.ok(state.orphanedArtifacts.some((a) => a.endsWith('random-unrelated.txt')));
+  });
+
+  test('legacy journal schema permits legacy .bak in backup directory without orphaned-artifact classification', () => {
+    const repo = createTempDir('tx-legacy-bak-');
+    const txId = generateTxId();
+    acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    // Manually write a legacy journal containing stagedPath
+    const ciPatchDir = path.join(repo, '.ci-patch');
+    fs.mkdirSync(ciPatchDir, { recursive: true });
+    const legacyJournal = {
+      schemaVersion: '1.0.0',
+      txId,
+      op: 'apply',
+      phase: 'BACKUP_CREATED',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      stagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(path.join(ciPatchDir, 'journal.json'), JSON.stringify(legacyJournal, null, 2) + '\n', 'utf8');
+
+    const txBackupDir = path.join(repo, '.ci-patch/backup', txId);
+    fs.mkdirSync(txBackupDir, { recursive: true });
+    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js.bak'), 'legacy-backup-bytes', 'utf8');
+
+    const state = inspectTransactionState(repo);
+    // Legacy journal allows .bak without marking as orphaned-artifact
+    assert.ok(!state.orphanedArtifacts.some((a) => a.endsWith('stable-diffusion.js.bak')));
+  });
+
+  test('backup requirement enforced in READY_TO_SWAP, SWAPPED, and COMPLETED phases', () => {
+    for (const phase of ['READY_TO_SWAP', 'SWAPPED', 'COMPLETED']) {
+      const repo = createTempDir(`tx-phase-${phase.toLowerCase()}-`);
+      const txId = generateTxId();
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+      advanceJournalPhase({
+        repoRoot: repo,
+        txId,
+        nextPhase: 'ISOLATED_PREPARED',
+        metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+        lease,
+      });
+      advanceJournalPhase({
+        repoRoot: repo,
+        txId,
+        nextPhase: 'BACKUP_CREATED',
+        metadataUpdate: {
+          backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+          targetMode: '0644',
+        },
+        lease,
+      });
+      advanceJournalPhase({
+        repoRoot: repo,
+        txId,
+        nextPhase: 'READY_TO_SWAP',
+        metadataUpdate: {
+          destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`,
+        },
+        lease,
+      });
+
+      if (phase === 'SWAPPED' || phase === 'COMPLETED') {
+        advanceJournalPhase({
+          repoRoot: repo,
+          txId,
+          nextPhase: 'SWAPPED',
+          lease,
+        });
+      }
+      if (phase === 'COMPLETED') {
+        advanceJournalPhase({
+          repoRoot: repo,
+          txId,
+          nextPhase: 'COMPLETED',
+          lease,
+        });
+      }
+
+      const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+      fs.mkdirSync(txStagingDir, { recursive: true });
+      fs.writeFileSync(path.join(txStagingDir, 'stable-diffusion.js'), 'code', 'utf8');
+
+      // Empty backup directory
+      const txBackupDir = path.join(repo, '.ci-patch/backup', txId);
+      fs.mkdirSync(txBackupDir, { recursive: true });
+
+      const state = inspectTransactionState(repo);
+      assert.equal(state.state, 'incomplete-transaction');
+      assert.equal(state.isPending, true);
+      assert.ok(
+        state.reasons.some((r) => r.includes(`Missing backup artifact in phase "${phase}"`)),
+        `Expected missing backup artifact reason for phase "${phase}"`
+      );
+    }
+  });
+});

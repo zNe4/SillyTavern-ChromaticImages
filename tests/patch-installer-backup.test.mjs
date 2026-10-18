@@ -1326,3 +1326,627 @@ describe('P3B-2B: Read-Only Backup Inspection (transaction-state.js)', () => {
     assert.match(preflight.reason, /incomplete-transaction/);
   });
 });
+
+describe('P3B-2B-F1: Finding A — Late Backup-Path Substitutions at before-journal-advancement', () => {
+  if (!authenticStock || !authenticPatched) {
+    test.skip('Skipping tests (authentic stock or patched content unavailable)', () => {});
+    return;
+  }
+
+  test('backup file deleted at before-journal-advancement hook refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-bpath-del-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const backupFile = path.join(repo, '.ci-patch/backup', txId, 'stable-diffusion.js');
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.unlinkSync(backupFile);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unexpected-backup-artifacts');
+
+    // Journal remains in ISOLATED_PREPARED
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+
+    // Live target is completely unchanged
+    assert.equal(Buffer.compare(fs.readFileSync(liveTarget), authenticStock), 0);
+  });
+
+  test('backup file replaced with symlink at before-journal-advancement hook preserves symlink and refuses', async () => {
+    const repo = setupDisposableRepo('f1-bpath-sym-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const backupFile = path.join(repo, '.ci-patch/backup', txId, 'stable-diffusion.js');
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.unlinkSync(backupFile);
+        fs.symlinkSync(liveTarget, backupFile);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unsafe-symlink');
+
+    // Substituted artifact is NOT deleted
+    assert.equal(fs.lstatSync(backupFile).isSymbolicLink(), true);
+
+    // Journal remains in ISOLATED_PREPARED
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+
+    // Live target unchanged
+    assert.equal(Buffer.compare(fs.readFileSync(liveTarget), authenticStock), 0);
+  });
+
+  test('backup file replaced with different regular file at before-journal-advancement hook preserves file and refuses', async () => {
+    const repo = setupDisposableRepo('f1-bpath-diff-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const backupFile = path.join(repo, '.ci-patch/backup', txId, 'stable-diffusion.js');
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.unlinkSync(backupFile);
+        fs.writeFileSync(backupFile, 'foreign-substituted-content', { mode: 0o600 });
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'backup-identity-replaced');
+
+    // Substituted artifact preserved
+    assert.equal(fs.readFileSync(backupFile, 'utf8'), 'foreign-substituted-content');
+
+    // Journal remains in ISOLATED_PREPARED
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('backup file replaced with identical bytes on new inode at before-journal-advancement hook refuses', async () => {
+    const repo = setupDisposableRepo('f1-bpath-samebytes-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const backupFile = path.join(repo, '.ci-patch/backup', txId, 'stable-diffusion.js');
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        // Same content, but replaced (new inode)
+        fs.unlinkSync(backupFile);
+        fs.writeFileSync(backupFile, authenticStock, { mode: 0o600 });
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'backup-identity-replaced');
+
+    // Journal remains in ISOLATED_PREPARED
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('foreign artifact added to backup directory at before-journal-advancement hook preserves artifact and refuses', async () => {
+    const repo = setupDisposableRepo('f1-bpath-foreign-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const foreignFile = path.join(repo, '.ci-patch/backup', txId, 'unexpected.txt');
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.writeFileSync(foreignFile, 'unexpected-payload');
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unexpected-backup-artifacts');
+
+    // Foreign file is preserved
+    assert.equal(fs.existsSync(foreignFile), true);
+
+    // Journal remains in ISOLATED_PREPARED
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+});
+
+describe('P3B-2B-F1: Finding B — Late Live Source Changes at before-journal-advancement', () => {
+  if (!authenticStock || !authenticPatched) {
+    test.skip('Skipping tests (authentic stock or patched content unavailable)', () => {});
+    return;
+  }
+
+  test('live target inode replacement at before-journal-advancement hook refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-src-inode-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.unlinkSync(liveTarget);
+        fs.writeFileSync(liveTarget, authenticStock);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'source-identity-replaced');
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('live target symlink replacement at before-journal-advancement hook refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-src-sym-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.unlinkSync(liveTarget);
+        fs.symlinkSync(path.join(repo, 'package.json'), liveTarget);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unsafe-symlink');
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('live target removal at before-journal-advancement hook refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-src-rem-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.unlinkSync(liveTarget);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'source-missing-before-advancement');
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('live target in-place content mutation (preserving inode) at before-journal-advancement hook refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-src-inplace-mut-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const initialStat = fs.statSync(liveTarget);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        // Mutate in place without unlinking: keeps inode identical!
+        const fd = fs.openSync(liveTarget, 'r+');
+        fs.writeSync(fd, Buffer.from('MUTATED-STOCK-BYTES-IN-PLACE'), 0, 'MUTATED-STOCK-BYTES-IN-PLACE'.length, 0);
+        fs.closeSync(fd);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'source-content-changed');
+
+    // Confirm inode was preserved by the test mutation
+    const postStat = fs.statSync(liveTarget);
+    assert.equal(postStat.ino, initialStat.ino);
+
+    // Journal remains in ISOLATED_PREPARED
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('live target mode change (0644 -> 0600) without content change at before-journal-advancement refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-src-mode-change-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock, { mode: 0o644 });
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        // Change permissions only; content unchanged
+        fs.chmodSync(liveTarget, 0o600);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'source-mode-changed');
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('live target mode change (0600 -> 0644) when initial target was 0600 refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-src-mode-rev-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock, { mode: 0o600 });
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.chmodSync(liveTarget, 0o644);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'source-mode-changed');
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('live target special permission bits added (setuid 0o4644) at before-journal-advancement refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-src-setuid-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock, { mode: 0o644 });
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.chmodSync(liveTarget, 0o4644);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'special-permission-bits-unsupported');
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+});
+
+describe('P3B-2B-F1: Finding B — Late Staging Changes at before-journal-advancement', () => {
+  if (!authenticStock || !authenticPatched) {
+    test.skip('Skipping tests (authentic stock or patched content unavailable)', () => {});
+    return;
+  }
+
+  test('staged file removed at before-journal-advancement hook refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-stg-rem-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const stagedFile = path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js');
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.unlinkSync(stagedFile);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unexpected-staging-artifacts');
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('staged file replaced with symlink at before-journal-advancement hook refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-stg-sym-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const stagedFile = path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js');
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.unlinkSync(stagedFile);
+        fs.symlinkSync(liveTarget, stagedFile);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unsafe-symlink');
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('staged file replaced with different regular file at before-journal-advancement hook refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-stg-diff-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const stagedFile = path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js');
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        fs.unlinkSync(stagedFile);
+        fs.writeFileSync(stagedFile, 'tampered-staged-content', { mode: 0o600 });
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'staged-identity-replaced');
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('staged file content mutated in place (same inode) at before-journal-advancement hook refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-stg-mut-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const stagedFile = path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js');
+    const initialStat = fs.statSync(stagedFile);
+
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        const fd = fs.openSync(stagedFile, 'r+');
+        fs.writeSync(fd, Buffer.from('MUTATED-STAGED-IN-PLACE'), 0, 'MUTATED-STAGED-IN-PLACE'.length, 0);
+        fs.closeSync(fd);
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'result-sha256-mismatch');
+
+    // Confirm inode was preserved
+    const postStat = fs.statSync(stagedFile);
+    assert.equal(postStat.ino, initialStat.ino);
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+
+  test('staged file replaced with identical bytes on new inode at before-journal-advancement hook refuses advancement', async () => {
+    const repo = setupDisposableRepo('f1-stg-samebytes-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+
+    const stagedFile = path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js');
+    const faultHook = (stage) => {
+      if (stage === 'before-journal-advancement') {
+        const originalBytes = fs.readFileSync(stagedFile);
+        fs.unlinkSync(stagedFile);
+        fs.writeFileSync(stagedFile, originalBytes, { mode: 0o600 });
+      }
+    };
+
+    const res = await createVerifiedBackup({ repoRoot: repo, txId, op: 'apply', lease, faultHook });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'staged-identity-replaced');
+
+    const jInspect = inspectJournal(repo);
+    assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+  });
+});

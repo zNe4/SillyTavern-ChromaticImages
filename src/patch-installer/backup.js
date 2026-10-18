@@ -145,7 +145,9 @@ function reauthenticatePreparedStaging(
   journal,
   patchEntry,
   expectedResultSha,
-  expectedResultBlob
+  expectedResultBlob,
+  expectedDev = null,
+  expectedIno = null
 ) {
   const targetBase = path.basename(journal.targetFile);
   const expectedRelStaged = `.ci-patch/staging/${txId}/${targetBase}`;
@@ -280,6 +282,15 @@ function reauthenticatePreparedStaging(
         code: 'invalid-file-identity',
       };
     }
+    if (expectedDev !== null && expectedIno !== null) {
+      if (preStat.dev !== expectedDev || preStat.ino !== expectedIno) {
+        return {
+          ok: false,
+          error: `Staged file descriptor identity changed before journal advancement (dev: ${preStat.dev} vs ${expectedDev}, ino: ${preStat.ino} vs ${expectedIno})`,
+          code: 'staged-identity-replaced',
+        };
+      }
+    }
     if ((preStat.mode & 0o777) !== 0o600) {
       return {
         ok: false,
@@ -394,6 +405,530 @@ function reauthenticatePreparedStaging(
     if (stagedFd !== null) {
       try {
         fs.closeSync(stagedFd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+/**
+ * Reauthenticate live target source descriptor, mode, content, and pathname identity
+ * immediately before journal advancement.
+ * Strictly read-only; bounded reading with O_NOFOLLOW.
+ *
+ * @param {object} params
+ * @param {string} params.absLiveTarget
+ * @param {number} params.expectedDev
+ * @param {number} params.expectedIno
+ * @param {string} params.expectedInitialSha
+ * @param {string} params.expectedInitialBlob
+ * @param {string} params.originalMode
+ * @param {Buffer} params.authenticatedBuffer
+ * @returns {{ ok: boolean, error?: string, code?: string }}
+ */
+function reauthenticateLiveSource({
+  absLiveTarget,
+  expectedDev,
+  expectedIno,
+  expectedInitialSha,
+  expectedInitialBlob,
+  originalMode,
+  authenticatedBuffer,
+}) {
+  const lstatCheck = getPathLstat(absLiveTarget);
+  if (lstatCheck.error) {
+    return {
+      ok: false,
+      error: `Live target missing or inaccessible before journal advancement: ${lstatCheck.error.message}`,
+      code: 'source-missing-before-advancement',
+    };
+  }
+  if (!lstatCheck.exists) {
+    return {
+      ok: false,
+      error: `Live target "${absLiveTarget}" missing before journal advancement`,
+      code: 'source-missing-before-advancement',
+    };
+  }
+  if (lstatCheck.isSymbolicLink) {
+    return {
+      ok: false,
+      error: `Live target "${absLiveTarget}" was replaced by a symbolic link before journal advancement`,
+      code: 'unsafe-symlink',
+    };
+  }
+  if (!lstatCheck.isFile) {
+    return {
+      ok: false,
+      error: `Live target "${absLiveTarget}" is not a regular file before journal advancement`,
+      code: 'invalid-source-before-advancement',
+    };
+  }
+  if (!lstatCheck.stat || lstatCheck.stat.dev !== expectedDev || lstatCheck.stat.ino !== expectedIno) {
+    return {
+      ok: false,
+      error: `Live target "${absLiveTarget}" inode identity changed before journal advancement (dev: ${lstatCheck.stat?.dev} vs ${expectedDev}, ino: ${lstatCheck.stat?.ino} vs ${expectedIno})`,
+      code: 'source-identity-replaced',
+    };
+  }
+
+  let fd = null;
+  try {
+    fd = fs.openSync(absLiveTarget, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (openErr) {
+    return {
+      ok: false,
+      error: `Failed to open live target descriptor before journal advancement: ${openErr.message}`,
+      code: openErr.code === 'ELOOP' ? 'unsafe-symlink' : 'source-read-failed',
+    };
+  }
+
+  try {
+    const preStat = fs.fstatSync(fd);
+    if (!preStat.isFile() || preStat.isSymbolicLink()) {
+      return {
+        ok: false,
+        error: 'Live target descriptor is not a regular file before journal advancement',
+        code: 'invalid-source-before-advancement',
+      };
+    }
+    if (!isValidDeviceIdentifier(preStat.dev) || !isValidInodeIdentifier(preStat.ino)) {
+      return {
+        ok: false,
+        error: 'Live target descriptor has invalid device or inode identity before journal advancement',
+        code: 'invalid-file-identity',
+      };
+    }
+    if (preStat.dev !== expectedDev || preStat.ino !== expectedIno) {
+      return {
+        ok: false,
+        error: `Live target descriptor identity changed before journal advancement (dev: ${preStat.dev} vs ${expectedDev}, ino: ${preStat.ino} vs ${expectedIno})`,
+        code: 'source-identity-replaced',
+      };
+    }
+
+    // Permission mode check: verify exact mode and absence of special bits
+    let currentMode;
+    try {
+      currentMode = extractCanonicalTargetMode(preStat.mode);
+    } catch (modeErr) {
+      return {
+        ok: false,
+        error: `Live target permission check failed before journal advancement: ${modeErr.message}`,
+        code: modeErr.code || 'invalid-target-mode',
+      };
+    }
+    if (currentMode !== originalMode) {
+      return {
+        ok: false,
+        error: `Live target file mode changed before journal advancement: expected "${originalMode}", observed "${currentMode}"`,
+        code: 'source-mode-changed',
+      };
+    }
+
+    // Bounded read check
+    if (preStat.size > MAX_SOURCE_FILE_BYTES) {
+      return {
+        ok: false,
+        error: `Live target file size (${preStat.size} bytes) exceeds limit (${MAX_SOURCE_FILE_BYTES} bytes)`,
+        code: 'file-too-large',
+      };
+    }
+    if (preStat.size !== authenticatedBuffer.length) {
+      return {
+        ok: false,
+        error: `Live target size changed in place before journal advancement: expected ${authenticatedBuffer.length}, observed ${preStat.size}`,
+        code: 'source-content-changed',
+      };
+    }
+
+    const expectedSize = preStat.size;
+    const buffer = Buffer.alloc(expectedSize);
+    let readBytes = 0;
+    while (readBytes < expectedSize) {
+      const chunk = fs.readSync(fd, buffer, readBytes, expectedSize - readBytes, readBytes);
+      if (chunk === 0) {
+        return {
+          ok: false,
+          error: `Unexpected EOF reading live target descriptor before journal advancement: read ${readBytes} of ${expectedSize} bytes`,
+          code: 'unexpected-eof',
+        };
+      }
+      readBytes += chunk;
+    }
+
+    // Concurrent expansion check
+    const extraCheck = Buffer.alloc(1);
+    const extra = fs.readSync(fd, extraCheck, 0, 1, expectedSize);
+    if (extra !== 0) {
+      return {
+        ok: false,
+        error: 'Live target expanded concurrently during descriptor read before journal advancement',
+        code: 'concurrent-expansion',
+      };
+    }
+
+    const postStat = fs.fstatSync(fd);
+    if (
+      postStat.dev !== preStat.dev ||
+      postStat.ino !== preStat.ino ||
+      postStat.size !== expectedSize ||
+      !postStat.isFile()
+    ) {
+      return {
+        ok: false,
+        error: 'Live target identity or size changed concurrently during descriptor read before journal advancement',
+        code: 'source-identity-changed',
+      };
+    }
+
+    // Fingerprint verification
+    const actualSha = computeSha256(buffer);
+    const actualBlob = computeGitBlobSha(buffer);
+
+    if (actualSha.toLowerCase() !== expectedInitialSha.toLowerCase()) {
+      return {
+        ok: false,
+        error: `Live target content SHA-256 changed before journal advancement: got "${actualSha}", expected "${expectedInitialSha}"`,
+        code: 'source-content-changed',
+      };
+    }
+
+    if (actualBlob.toLowerCase() !== expectedInitialBlob.toLowerCase()) {
+      return {
+        ok: false,
+        error: `Live target Git blob SHA changed before journal advancement: got "${actualBlob}", expected "${expectedInitialBlob}"`,
+        code: 'source-content-changed',
+      };
+    }
+
+    if (Buffer.compare(buffer, authenticatedBuffer) !== 0) {
+      return {
+        ok: false,
+        error: 'Live target content altered in place before journal advancement',
+        code: 'source-content-changed',
+      };
+    }
+
+    // Pathname identity consistency
+    let finalPathStat;
+    try {
+      finalPathStat = fs.lstatSync(absLiveTarget);
+    } catch (lstatErr) {
+      return {
+        ok: false,
+        error: `Live target pathname missing before journal advancement: ${lstatErr.message}`,
+        code: 'source-missing-before-advancement',
+      };
+    }
+
+    if (finalPathStat.isSymbolicLink()) {
+      return {
+        ok: false,
+        error: `Live target "${absLiveTarget}" was replaced by a symbolic link before journal advancement`,
+        code: 'unsafe-symlink',
+      };
+    }
+
+    if (!finalPathStat.isFile()) {
+      return {
+        ok: false,
+        error: `Live target "${absLiveTarget}" is not a regular file before journal advancement`,
+        code: 'invalid-source-before-advancement',
+      };
+    }
+
+    if (finalPathStat.dev !== preStat.dev || finalPathStat.ino !== preStat.ino) {
+      return {
+        ok: false,
+        error: `Live target "${absLiveTarget}" inode identity changed before journal advancement`,
+        code: 'source-identity-replaced',
+      };
+    }
+
+    return { ok: true };
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+/**
+ * Reauthenticate backup artifact descriptor, mode, content, directory cleanliness, and pathname identity.
+ * Strictly read-only; bounded reading with O_NOFOLLOW.
+ *
+ * @param {object} params
+ * @param {string} params.backupFile
+ * @param {string} params.backupTxDir
+ * @param {string} params.targetBase
+ * @param {number} params.createdBackupDev
+ * @param {number} params.createdBackupIno
+ * @param {string} params.expectedInitialSha
+ * @param {string} params.expectedInitialBlob
+ * @param {Buffer} params.authenticatedBuffer
+ * @param {boolean} [params.doFsync=false] - Whether to fsync verified descriptor
+ * @param {(stage: string, context?: object) => void} [params.runFault]
+ * @returns {{ ok: boolean, error?: string, code?: string, stage?: string, actualBackupSha256?: string, actualBackupBlobSha?: string }}
+ */
+function reauthenticateBackupFile({
+  backupFile,
+  backupTxDir,
+  targetBase,
+  createdBackupDev,
+  createdBackupIno,
+  expectedInitialSha,
+  expectedInitialBlob,
+  authenticatedBuffer,
+  doFsync = false,
+  runFault = null,
+}) {
+  // Confirm transaction directory contains exactly the single expected backup file
+  let backupChildren;
+  try {
+    backupChildren = fs.readdirSync(backupTxDir);
+  } catch (dirErr) {
+    return {
+      ok: false,
+      error: `Failed to inspect backup directory: ${dirErr.message}`,
+      code: 'inspection-error',
+    };
+  }
+
+  if (backupChildren.length !== 1 || backupChildren[0] !== targetBase) {
+    return {
+      ok: false,
+      error: `Backup directory contains unexpected artifacts: ${backupChildren.join(', ')}`,
+      code: 'unexpected-backup-artifacts',
+    };
+  }
+
+  const pathStatCheck = getPathLstat(backupFile);
+  if (pathStatCheck.error) {
+    return {
+      ok: false,
+      error: `Backup pathname missing or unreadable: ${pathStatCheck.error.message}`,
+      code: 'backup-pathname-missing',
+    };
+  }
+  if (!pathStatCheck.exists) {
+    return {
+      ok: false,
+      error: `Backup pathname "${backupFile}" does not exist`,
+      code: 'backup-pathname-missing',
+    };
+  }
+  if (pathStatCheck.isSymbolicLink) {
+    return {
+      ok: false,
+      error: `Backup pathname "${backupFile}" was replaced by a symbolic link before journal advancement`,
+      code: 'unsafe-symlink',
+    };
+  }
+  if (!pathStatCheck.isFile) {
+    return {
+      ok: false,
+      error: `Backup pathname "${backupFile}" is not a regular file`,
+      code: 'invalid-backup-result',
+    };
+  }
+  if (!pathStatCheck.stat || pathStatCheck.stat.dev !== createdBackupDev || pathStatCheck.stat.ino !== createdBackupIno) {
+    return {
+      ok: false,
+      error: `Backup pathname "${backupFile}" inode identity changed`,
+      code: 'backup-identity-replaced',
+    };
+  }
+
+  let readFd = null;
+  try {
+    try {
+      readFd = fs.openSync(backupFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    } catch (openErr) {
+      return {
+        ok: false,
+        error: `Failed to open backup file descriptor for verification: ${openErr.message}`,
+        code: openErr.code === 'ELOOP' ? 'unsafe-symlink' : 'backup-open-failed',
+      };
+    }
+
+    const preStat = fs.fstatSync(readFd);
+    if (!preStat.isFile() || preStat.isSymbolicLink()) {
+      return {
+        ok: false,
+        error: 'Backup file descriptor is not a regular file',
+        code: 'invalid-backup-result',
+      };
+    }
+    if (!isValidDeviceIdentifier(preStat.dev) || !isValidInodeIdentifier(preStat.ino)) {
+      return {
+        ok: false,
+        error: 'Backup file descriptor has invalid device or inode identity',
+        code: 'invalid-file-identity',
+      };
+    }
+    if (preStat.dev !== createdBackupDev || preStat.ino !== createdBackupIno) {
+      return {
+        ok: false,
+        error: 'Backup file descriptor identity differs from created descriptor',
+        code: 'backup-identity-replaced',
+      };
+    }
+    if ((preStat.mode & 0o777) !== 0o600) {
+      return {
+        ok: false,
+        error: `Backup file mode mismatch: got 0o${(preStat.mode & 0o777).toString(8)}, expected 0o600`,
+        code: 'backup-mode-mismatch',
+      };
+    }
+    if (preStat.size !== authenticatedBuffer.length) {
+      return {
+        ok: false,
+        error: `Backup file size mismatch: read ${preStat.size}, expected ${authenticatedBuffer.length}`,
+        code: 'backup-size-mismatch',
+      };
+    }
+
+    const expectedSize = preStat.size;
+    const readBuffer = Buffer.alloc(expectedSize);
+    let readBytes = 0;
+    while (readBytes < expectedSize) {
+      const chunk = fs.readSync(readFd, readBuffer, readBytes, expectedSize - readBytes, readBytes);
+      if (chunk === 0) {
+        return {
+          ok: false,
+          error: `Unexpected EOF reading backup descriptor: read ${readBytes} of ${expectedSize} bytes`,
+          code: 'unexpected-eof',
+        };
+      }
+      readBytes += chunk;
+    }
+
+    const extraCheck = Buffer.alloc(1);
+    const extra = fs.readSync(readFd, extraCheck, 0, 1, expectedSize);
+    if (extra !== 0) {
+      return {
+        ok: false,
+        error: 'Backup file expanded concurrently during descriptor read',
+        code: 'concurrent-expansion',
+      };
+    }
+
+    if (typeof runFault === 'function') {
+      runFault('after-backup-readback', { readBuffer });
+      runFault('before-fingerprint-verification', { readBuffer });
+    }
+
+    const actualBackupSha256 = computeSha256(readBuffer);
+    const actualBackupBlobSha = computeGitBlobSha(readBuffer);
+
+    if (actualBackupSha256.toLowerCase() !== expectedInitialSha.toLowerCase()) {
+      return {
+        ok: false,
+        error: `Backup SHA-256 digest mismatch: got "${actualBackupSha256}", expected "${expectedInitialSha}"`,
+        code: 'backup-sha256-mismatch',
+      };
+    }
+
+    if (actualBackupBlobSha.toLowerCase() !== expectedInitialBlob.toLowerCase()) {
+      return {
+        ok: false,
+        error: `Backup Git blob SHA mismatch: got "${actualBackupBlobSha}", expected "${expectedInitialBlob}"`,
+        code: 'backup-blob-mismatch',
+      };
+    }
+
+    // Exact byte-for-byte comparison against authenticated live source snapshot
+    if (Buffer.compare(readBuffer, authenticatedBuffer) !== 0) {
+      return {
+        ok: false,
+        error: 'Backup content does not match authenticated live source buffer byte-for-byte',
+        code: 'backup-content-mismatch',
+      };
+    }
+
+    if (typeof runFault === 'function') {
+      runFault('after-fingerprint-verification', { actualBackupSha256, actualBackupBlobSha });
+    }
+
+    if (doFsync) {
+      if (typeof runFault === 'function') {
+        runFault('sync-backup-file', { readFd });
+      }
+      try {
+        fs.fsyncSync(readFd);
+      } catch (syncErr) {
+        if (syncErr?._isFault) throw syncErr;
+        return {
+          ok: false,
+          error: `Failed to synchronize verified backup file: ${syncErr.message}`,
+          code: syncErr.code || 'fsync-failed',
+          stage: 'sync-backup-file',
+        };
+      }
+    }
+
+    const postStat = fs.fstatSync(readFd);
+    if (
+      postStat.dev !== preStat.dev ||
+      postStat.ino !== preStat.ino ||
+      postStat.size !== expectedSize ||
+      !postStat.isFile()
+    ) {
+      return {
+        ok: false,
+        error: 'Backup file descriptor identity changed during verification',
+        code: 'backup-identity-changed',
+      };
+    }
+
+    // Pathname identity check before closing descriptor
+    let pathStat;
+    try {
+      pathStat = fs.lstatSync(backupFile);
+    } catch (lstatErr) {
+      if (lstatErr?._isFault) throw lstatErr;
+      return {
+        ok: false,
+        error: `Backup pathname missing or unreadable before journal advancement: ${lstatErr.message}`,
+        code: 'backup-pathname-missing',
+      };
+    }
+
+    if (pathStat.isSymbolicLink()) {
+      return {
+        ok: false,
+        error: `Backup pathname "${backupFile}" was replaced by a symbolic link before journal advancement`,
+        code: 'unsafe-symlink',
+      };
+    }
+
+    if (!pathStat.isFile()) {
+      return {
+        ok: false,
+        error: `Backup pathname "${backupFile}" is not a regular file`,
+        code: 'invalid-backup-result',
+      };
+    }
+
+    if (pathStat.dev !== preStat.dev || pathStat.ino !== preStat.ino) {
+      return {
+        ok: false,
+        error: `Backup pathname "${backupFile}" inode identity changed`,
+        code: 'backup-identity-replaced',
+      };
+    }
+
+    return { ok: true, actualBackupSha256, actualBackupBlobSha };
+  } finally {
+    if (readFd !== null) {
+      try {
+        fs.closeSync(readFd);
       } catch {
         // ignore
       }
@@ -631,6 +1166,9 @@ export async function createVerifiedBackup(options = {}) {
   if (!stagingReauth.ok) {
     return stagingReauth;
   }
+
+  const authenticatedStagedDev = stagingReauth.stagedDev;
+  const authenticatedStagedIno = stagingReauth.stagedIno;
 
   runFault('after-staging-reauth', { stagingReauth });
 
@@ -938,210 +1476,22 @@ export async function createVerifiedBackup(options = {}) {
   runFault('after-file-create', { backupFile });
 
   // 8. Backup Independent Readback and Durability Verification
-  // Confirm transaction directory contains exactly the single expected backup file
-  let backupChildren;
-  try {
-    backupChildren = fs.readdirSync(backupTxDir);
-  } catch (dirErr) {
-    return {
-      ok: false,
-      error: `Failed to inspect backup directory after writing: ${dirErr.message}`,
-      code: 'inspection-error',
-    };
-  }
-
-  if (backupChildren.length !== 1 || backupChildren[0] !== targetBase) {
-    return {
-      ok: false,
-      error: `Backup directory contains unexpected artifacts: ${backupChildren.join(', ')}`,
-      code: 'unexpected-backup-artifacts',
-    };
-  }
-
   runFault('before-backup-readback', { backupFile });
 
-  let readFd = null;
-  try {
-    const openFlags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
-    try {
-      readFd = fs.openSync(backupFile, openFlags);
-    } catch (openErr) {
-      if (openErr?._isFault) throw openErr;
-      return {
-        ok: false,
-        error: `Failed to open backup file descriptor for verification: ${openErr.message}`,
-        code: openErr.code === 'ELOOP' ? 'unsafe-symlink' : 'backup-open-failed',
-      };
-    }
-
-    const preStat = fs.fstatSync(readFd);
-    if (!preStat.isFile() || preStat.isSymbolicLink()) {
-      return {
-        ok: false,
-        error: 'Backup file descriptor is not a regular file',
-        code: 'invalid-backup-result',
-      };
-    }
-    if (!isValidDeviceIdentifier(preStat.dev) || !isValidInodeIdentifier(preStat.ino)) {
-      return {
-        ok: false,
-        error: 'Backup file descriptor has invalid device or inode identity',
-        code: 'invalid-file-identity',
-      };
-    }
-    if (preStat.dev !== createdBackupDev || preStat.ino !== createdBackupIno) {
-      return {
-        ok: false,
-        error: 'Backup file descriptor identity differs from created descriptor',
-        code: 'backup-identity-replaced',
-      };
-    }
-    if ((preStat.mode & 0o777) !== 0o600) {
-      return {
-        ok: false,
-        error: `Backup file mode mismatch: got 0o${(preStat.mode & 0o777).toString(8)}, expected 0o600`,
-        code: 'backup-mode-mismatch',
-      };
-    }
-    if (preStat.size !== liveSource.buffer.length) {
-      return {
-        ok: false,
-        error: `Backup file size mismatch: read ${preStat.size}, expected ${liveSource.buffer.length}`,
-        code: 'backup-size-mismatch',
-      };
-    }
-
-    const expectedSize = preStat.size;
-    const readBuffer = Buffer.alloc(expectedSize);
-    let readBytes = 0;
-    while (readBytes < expectedSize) {
-      const chunk = fs.readSync(readFd, readBuffer, readBytes, expectedSize - readBytes, readBytes);
-      if (chunk === 0) {
-        return {
-          ok: false,
-          error: `Unexpected EOF reading backup descriptor: read ${readBytes} of ${expectedSize} bytes`,
-          code: 'unexpected-eof',
-        };
-      }
-      readBytes += chunk;
-    }
-
-    const extraCheck = Buffer.alloc(1);
-    const extra = fs.readSync(readFd, extraCheck, 0, 1, expectedSize);
-    if (extra !== 0) {
-      return {
-        ok: false,
-        error: 'Backup file expanded concurrently during descriptor read',
-        code: 'concurrent-expansion',
-      };
-    }
-
-    runFault('after-backup-readback', { readBuffer });
-
-    runFault('before-fingerprint-verification', { readBuffer });
-
-    const actualBackupSha256 = computeSha256(readBuffer);
-    const actualBackupBlobSha = computeGitBlobSha(readBuffer);
-
-    if (actualBackupSha256.toLowerCase() !== expectedInitialSha) {
-      return {
-        ok: false,
-        error: `Backup SHA-256 digest mismatch: got "${actualBackupSha256}", expected "${expectedInitialSha}"`,
-        code: 'backup-sha256-mismatch',
-      };
-    }
-
-    if (actualBackupBlobSha.toLowerCase() !== expectedInitialBlob) {
-      return {
-        ok: false,
-        error: `Backup Git blob SHA mismatch: got "${actualBackupBlobSha}", expected "${expectedInitialBlob}"`,
-        code: 'backup-blob-mismatch',
-      };
-    }
-
-    // Exact byte-for-byte comparison against authenticated live source snapshot
-    if (Buffer.compare(readBuffer, liveSource.buffer) !== 0) {
-      return {
-        ok: false,
-        error: 'Backup content does not match authenticated live source buffer byte-for-byte',
-        code: 'backup-content-mismatch',
-      };
-    }
-
-    runFault('after-fingerprint-verification', { actualBackupSha256, actualBackupBlobSha });
-
-    // Fsync the verified backup descriptor
-    try {
-      fs.fsyncSync(readFd);
-    } catch (syncErr) {
-      if (syncErr?._isFault) throw syncErr;
-      return {
-        ok: false,
-        error: `Failed to synchronize verified backup file: ${syncErr.message}`,
-        code: syncErr.code || 'fsync-failed',
-        stage: 'sync-backup-file',
-      };
-    }
-
-    const postStat = fs.fstatSync(readFd);
-    if (
-      postStat.dev !== preStat.dev ||
-      postStat.ino !== preStat.ino ||
-      postStat.size !== expectedSize ||
-      !postStat.isFile()
-    ) {
-      return {
-        ok: false,
-        error: 'Backup file descriptor identity changed during readback synchronization',
-        code: 'backup-identity-changed',
-      };
-    }
-
-    // Pathname identity check before closing descriptor
-    let pathStat;
-    try {
-      pathStat = fs.lstatSync(backupFile);
-    } catch (lstatErr) {
-      if (lstatErr?._isFault) throw lstatErr;
-      return {
-        ok: false,
-        error: `Backup pathname missing or unreadable before journal advancement: ${lstatErr.message}`,
-        code: 'backup-pathname-missing',
-      };
-    }
-
-    if (pathStat.isSymbolicLink()) {
-      return {
-        ok: false,
-        error: `Backup pathname "${backupFile}" was replaced by a symbolic link`,
-        code: 'unsafe-symlink',
-      };
-    }
-
-    if (!pathStat.isFile()) {
-      return {
-        ok: false,
-        error: `Backup pathname "${backupFile}" is not a regular file`,
-        code: 'invalid-backup-result',
-      };
-    }
-
-    if (pathStat.dev !== preStat.dev || pathStat.ino !== preStat.ino) {
-      return {
-        ok: false,
-        error: `Backup pathname "${backupFile}" inode identity changed before journal advancement`,
-        code: 'backup-identity-replaced',
-      };
-    }
-  } finally {
-    if (readFd !== null) {
-      try {
-        fs.closeSync(readFd);
-      } catch {
-        // ignore
-      }
-      readFd = null;
-    }
+  const initialBackupVerify = reauthenticateBackupFile({
+    backupFile,
+    backupTxDir,
+    targetBase,
+    createdBackupDev,
+    createdBackupIno,
+    expectedInitialSha,
+    expectedInitialBlob,
+    authenticatedBuffer: liveSource.buffer,
+    doFsync: true,
+    runFault,
+  });
+  if (!initialBackupVerify.ok) {
+    return initialBackupVerify;
   }
 
   // Synchronize backup containing directories
@@ -1160,7 +1510,12 @@ export async function createVerifiedBackup(options = {}) {
     return syncCiPatch;
   }
 
-  // 9. Pre-Publication Revalidations
+  const relBackupPath = `.ci-patch/backup/${txId}/${targetBase}`;
+
+  // 9. Fault Hook Executed BEFORE Final Publication Integrity Checks
+  runFault('before-journal-advancement', { relBackupPath, originalMode });
+
+  // 10. Complete Final Publication Integrity Checks (NO fault hook after this point)
   // A. Revalidate lock ownership and lease
   const reLockAuth = verifyLockOwnershipForMutation(repoRoot, txId, op, lease);
   if (!reLockAuth.ok) {
@@ -1171,93 +1526,78 @@ export async function createVerifiedBackup(options = {}) {
     };
   }
 
-  // B. Revalidate live target source identity (prevent advancement if live target was altered/replaced)
-  let liveTargetCheck;
-  try {
-    liveTargetCheck = fs.lstatSync(absLiveTarget);
-  } catch (targetStatErr) {
+  // B. Revalidate journal state and transaction consistency
+  const currentJournalInspect = inspectJournal(repoRoot);
+  if (!currentJournalInspect.isValid || !currentJournalInspect.journal) {
     return {
       ok: false,
-      error: `Live target missing or inaccessible before journal advancement: ${targetStatErr.message}`,
-      code: 'source-missing-before-advancement',
+      error: 'Journal missing or invalid before journal advancement',
+      code: 'invalid-journal',
+    };
+  }
+  const currentJournal = currentJournalInspect.journal;
+  if (currentJournal.txId !== txId || currentJournal.op !== op) {
+    return {
+      ok: false,
+      error: `Journal transaction mismatch before advancement: expected txId "${txId}" op "${op}", got txId "${currentJournal.txId}" op "${currentJournal.op}"`,
+      code: 'journal-mismatch',
+    };
+  }
+  if (currentJournal.phase !== 'ISOLATED_PREPARED') {
+    return {
+      ok: false,
+      error: `Journal phase mismatch before advancement: expected "ISOLATED_PREPARED", got "${currentJournal.phase}"`,
+      code: 'invalid-journal-phase',
     };
   }
 
-  if (liveTargetCheck.isSymbolicLink()) {
-    return {
-      ok: false,
-      error: `Live target "${absLiveTarget}" was replaced by a symbolic link before journal advancement`,
-      code: 'unsafe-symlink',
-    };
+  // C. Reauthenticate prepared staging output
+  const finalStagingReauth = reauthenticatePreparedStaging(
+    repoRoot,
+    txId,
+    journal,
+    patchEntry,
+    expectedResultSha,
+    expectedResultBlob,
+    authenticatedStagedDev,
+    authenticatedStagedIno
+  );
+  if (!finalStagingReauth.ok) {
+    return finalStagingReauth;
   }
 
-  if (!liveTargetCheck.isFile()) {
-    return {
-      ok: false,
-      error: `Live target "${absLiveTarget}" is no longer a regular file before journal advancement`,
-      code: 'invalid-source-before-advancement',
-    };
+  // D. Reauthenticate live target source content, mode, and identity
+  const finalSourceReauth = reauthenticateLiveSource({
+    absLiveTarget,
+    expectedDev: authenticatedSourceDev,
+    expectedIno: authenticatedSourceIno,
+    expectedInitialSha,
+    expectedInitialBlob,
+    originalMode,
+    authenticatedBuffer: liveSource.buffer,
+  });
+  if (!finalSourceReauth.ok) {
+    return finalSourceReauth;
   }
 
-  if (
-    liveTargetCheck.dev !== authenticatedSourceDev ||
-    liveTargetCheck.ino !== authenticatedSourceIno
-  ) {
-    return {
-      ok: false,
-      error: `Live target "${absLiveTarget}" inode identity changed before journal advancement (dev: ${liveTargetCheck.dev} vs ${authenticatedSourceDev}, ino: ${liveTargetCheck.ino} vs ${authenticatedSourceIno})`,
-      code: 'source-identity-replaced',
-    };
+  // E. Reauthenticate backup content, mode, directory cleanliness, and identity
+  const finalBackupReauth = reauthenticateBackupFile({
+    backupFile,
+    backupTxDir,
+    targetBase,
+    createdBackupDev,
+    createdBackupIno,
+    expectedInitialSha,
+    expectedInitialBlob,
+    authenticatedBuffer: liveSource.buffer,
+    doFsync: false,
+    runFault: null,
+  });
+  if (!finalBackupReauth.ok) {
+    return finalBackupReauth;
   }
 
-  // C. Revalidate backup pathname identity
-  let finalBackupStat;
-  try {
-    finalBackupStat = fs.lstatSync(backupFile);
-  } catch (backupLstatErr) {
-    if (backupLstatErr?.code === 'ENOENT') {
-      return {
-        ok: false,
-        error: `Backup pathname "${backupFile}" missing immediately before journal advancement: ${backupLstatErr.message}`,
-        code: 'backup-pathname-missing',
-      };
-    }
-    return {
-      ok: false,
-      error: `Filesystem error inspecting backup pathname "${backupFile}": ${backupLstatErr.message}`,
-      code: 'inspection-error',
-    };
-  }
-
-  if (finalBackupStat.isSymbolicLink()) {
-    return {
-      ok: false,
-      error: `Backup pathname "${backupFile}" was replaced by a symbolic link before journal advancement`,
-      code: 'unsafe-symlink',
-    };
-  }
-
-  if (!finalBackupStat.isFile()) {
-    return {
-      ok: false,
-      error: `Backup pathname "${backupFile}" is not a regular file before journal advancement`,
-      code: 'invalid-backup-result',
-    };
-  }
-
-  if (finalBackupStat.dev !== createdBackupDev || finalBackupStat.ino !== createdBackupIno) {
-    return {
-      ok: false,
-      error: `Backup pathname "${backupFile}" inode identity changed before journal advancement`,
-      code: 'backup-identity-replaced',
-    };
-  }
-
-  const relBackupPath = `.ci-patch/backup/${txId}/${targetBase}`;
-
-  runFault('before-journal-advancement', { relBackupPath, originalMode });
-
-  // 10. Atomic Journal Advancement
+  // 11. Atomic Journal Advancement
   const advanceRes = advanceJournalPhase({
     repoRoot,
     txId,
