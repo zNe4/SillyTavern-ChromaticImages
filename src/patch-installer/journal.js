@@ -42,9 +42,30 @@ export const IMMUTABLE_JOURNAL_FIELDS = Object.freeze([
 ]);
 
 export const ALLOWED_AUXILIARY_FIELDS = Object.freeze([
-  'stagedPath',
+  'isolatedStagedPath',
   'backupPath',
+  'targetMode',
+  'destinationStagedPath',
+  'stagedPath',
 ]);
+
+export const TARGET_MODE_REGEX = /^0[0-7]{3}$/;
+
+export const FIELD_INTRODUCTION_PHASE = Object.freeze({
+  isolatedStagedPath: 'ISOLATED_PREPARED',
+  backupPath: 'BACKUP_CREATED',
+  targetMode: 'BACKUP_CREATED',
+  destinationStagedPath: 'READY_TO_SWAP',
+});
+
+export const PHASE_REQUIRED_AUXILIARY_FIELDS = Object.freeze({
+  LOCKED: Object.freeze([]),
+  ISOLATED_PREPARED: Object.freeze(['isolatedStagedPath']),
+  BACKUP_CREATED: Object.freeze(['backupPath', 'targetMode']),
+  READY_TO_SWAP: Object.freeze(['destinationStagedPath']),
+  SWAPPED: Object.freeze([]),
+  COMPLETED: Object.freeze([]),
+});
 
 const SHA256_REGEX = /^[0-9a-f]{64}$/i;
 const TX_ID_REGEX = /^ci-tx-[0-9]+-[0-9a-f]+$/i;
@@ -155,6 +176,18 @@ export function validateAuxiliaryMetadata(auxiliary, isCreation = false) {
         error: `Cannot ${action} journal field: "${key}"`,
       };
     }
+    if (isCreation) {
+      return {
+        valid: false,
+        error: `Disallowed auxiliary journal field at creation: "${key}" (no auxiliary fields permitted in LOCKED phase)`,
+      };
+    }
+    if (key === 'stagedPath') {
+      return {
+        valid: false,
+        error: 'Disallowed auxiliary journal field: legacy "stagedPath" is rejected for mutation',
+      };
+    }
     if (!ALLOWED_AUXILIARY_FIELDS.includes(key)) {
       return {
         valid: false,
@@ -165,6 +198,12 @@ export function validateAuxiliaryMetadata(auxiliary, isCreation = false) {
       return {
         valid: false,
         error: `Auxiliary journal field "${key}" must be a string`,
+      };
+    }
+    if (key === 'targetMode' && !TARGET_MODE_REGEX.test(auxiliary[key])) {
+      return {
+        valid: false,
+        error: `Invalid targetMode "${auxiliary[key]}": must be a 4-character octal string matching /^0[0-7]{3}$/`,
       };
     }
   }
@@ -226,8 +265,10 @@ export function validateJournalStructure(journal) {
     }
     if (!ALLOWED_AUXILIARY_FIELDS.includes(k)) {
       errors.push(`Unexpected journal property: "${k}"`);
-    } else if (typeof v !== 'string') {
-      errors.push(`Auxiliary property "${k}" must be a string`);
+    } else if (typeof v !== 'string' || v.trim() === '') {
+      errors.push(`Auxiliary property "${k}" must be a non-empty string`);
+    } else if (k === 'targetMode' && !TARGET_MODE_REGEX.test(v)) {
+      errors.push(`Invalid targetMode "${v}": must be a 4-character octal string matching /^0[0-7]{3}$/`);
     }
   }
 
@@ -782,19 +823,118 @@ export function advanceJournalPhase(options = {}) {
     return { ok: false, error: lockAuth.reason || lockAuth.error, code: lockAuth.error, reason: lockAuth.reason };
   }
 
-  // 2. Prevent overriding immutable identity or phase fields via metadataUpdate
+  // 2. Refuse phase advancement for legacy journals containing stagedPath
+  if (typeof inspection.journal.stagedPath === 'string') {
+    return {
+      ok: false,
+      error: 'Cannot advance journal: legacy journals containing "stagedPath" are refused for automatic phase advancement',
+      code: 'legacy-schema',
+    };
+  }
+
+  // 3. Prevent overriding immutable identity or phase fields via metadataUpdate
   const metaCheck = validateAuxiliaryMetadata(metadataUpdate, false);
   if (!metaCheck.valid) {
     return { ok: false, error: metaCheck.error };
   }
 
-  // 3. Strict phase transition validation
+  // 4. Strict phase transition validation
   const transitionCheck = validatePhaseTransition(inspection.journal.phase, nextPhase);
   if (!transitionCheck.ok) {
     return { ok: false, error: transitionCheck.error };
   }
 
-  // 4. Construct updated journal with immutable fields protected
+  // 5. Premature metadata enforcement
+  for (const key of Object.keys(metadataUpdate)) {
+    if (key in FIELD_INTRODUCTION_PHASE) {
+      if (!(key in inspection.journal) && nextPhase !== FIELD_INTRODUCTION_PHASE[key]) {
+        return {
+          ok: false,
+          error: `Premature auxiliary metadata: field "${key}" cannot be introduced before phase "${FIELD_INTRODUCTION_PHASE[key]}" (attempted at "${nextPhase}")`,
+          code: 'premature-metadata',
+        };
+      }
+    }
+  }
+
+  // 6. Mandatory metadata enforcement for nextPhase
+  const requiredFields = PHASE_REQUIRED_AUXILIARY_FIELDS[nextPhase] || [];
+  for (const reqField of requiredFields) {
+    const val = (reqField in metadataUpdate) ? metadataUpdate[reqField] : inspection.journal[reqField];
+    if (typeof val !== 'string' || val.trim() === '') {
+      return {
+        ok: false,
+        error: `Missing mandatory auxiliary metadata for transition to "${nextPhase}": "${reqField}"`,
+        code: 'missing-mandatory-metadata',
+      };
+    }
+  }
+
+  // 7. Permanent immutability enforcement
+  for (const key of ALLOWED_AUXILIARY_FIELDS) {
+    if (key in inspection.journal) {
+      if (key in metadataUpdate && metadataUpdate[key] !== inspection.journal[key]) {
+        return {
+          ok: false,
+          error: `Immutable auxiliary field conflict: "${key}" cannot be modified once set (current: "${inspection.journal[key]}", update: "${metadataUpdate[key]}")`,
+          code: 'immutable-field-conflict',
+        };
+      }
+    }
+  }
+
+  // 8. Strict resource path containment & format validation
+  const targetBase = path.basename(inspection.journal.targetFile.trim());
+  const targetDir = path.dirname(inspection.journal.targetFile.trim());
+
+  const effectiveIsolatedPath = metadataUpdate.isolatedStagedPath || inspection.journal.isolatedStagedPath;
+  if (effectiveIsolatedPath !== undefined) {
+    const expectedIsolated = `.ci-patch/staging/${inspection.journal.txId}/${targetBase}`;
+    if (effectiveIsolatedPath !== expectedIsolated) {
+      return {
+        ok: false,
+        error: `Invalid isolatedStagedPath "${effectiveIsolatedPath}": must strictly equal "${expectedIsolated}"`,
+        code: 'invalid-resource-path',
+      };
+    }
+  }
+
+  const effectiveBackupPath = metadataUpdate.backupPath || inspection.journal.backupPath;
+  if (effectiveBackupPath !== undefined) {
+    const expectedBackup = `.ci-patch/backup/${inspection.journal.txId}/${targetBase}`;
+    if (effectiveBackupPath !== expectedBackup) {
+      return {
+        ok: false,
+        error: `Invalid backupPath "${effectiveBackupPath}": must strictly equal "${expectedBackup}"`,
+        code: 'invalid-resource-path',
+      };
+    }
+  }
+
+  const effectiveDestPath = metadataUpdate.destinationStagedPath || inspection.journal.destinationStagedPath;
+  if (effectiveDestPath !== undefined) {
+    const expectedDest = `${targetDir}/.${targetBase}.ci-staged-${inspection.journal.txId}.tmp`;
+    if (effectiveDestPath !== expectedDest) {
+      return {
+        ok: false,
+        error: `Invalid destinationStagedPath "${effectiveDestPath}": must strictly equal "${expectedDest}"`,
+        code: 'invalid-resource-path',
+      };
+    }
+  }
+
+  const effectiveTargetMode = metadataUpdate.targetMode || inspection.journal.targetMode;
+  if (effectiveTargetMode !== undefined) {
+    if (!TARGET_MODE_REGEX.test(effectiveTargetMode)) {
+      return {
+        ok: false,
+        error: `Invalid targetMode "${effectiveTargetMode}": must be 4-character octal string matching /^0[0-7]{3}$/`,
+        code: 'invalid-target-mode',
+      };
+    }
+  }
+
+  // 9. Construct updated journal with immutable fields protected
   const updatedJournal = {
     ...inspection.journal,
     ...metadataUpdate,

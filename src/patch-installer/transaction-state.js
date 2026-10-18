@@ -43,8 +43,13 @@ export function getPermittedArtifactNames(journal, kind) {
     }
   }
 
-  if (kind === 'staging' && typeof journal.stagedPath === 'string' && journal.stagedPath.trim() !== '') {
-    permitted.add(path.basename(journal.stagedPath.trim()));
+  if (kind === 'staging') {
+    if (typeof journal.isolatedStagedPath === 'string' && journal.isolatedStagedPath.trim() !== '') {
+      permitted.add(path.basename(journal.isolatedStagedPath.trim()));
+    }
+    if (typeof journal.stagedPath === 'string' && journal.stagedPath.trim() !== '') {
+      permitted.add(path.basename(journal.stagedPath.trim()));
+    }
   }
   if (kind === 'backup' && typeof journal.backupPath === 'string' && journal.backupPath.trim() !== '') {
     permitted.add(path.basename(journal.backupPath.trim()));
@@ -60,7 +65,7 @@ export function getPermittedArtifactNames(journal, kind) {
  *
  * @param {string} repoRoot
  * @returns {{
- *   state: 'none' | 'ownership-unverified' | 'orphaned-journal' | 'corrupted-journal' | 'corrupted-lock' | 'mismatched-metadata' | 'foreign-content' | 'unsafe-symlink' | 'orphaned-artifact',
+ *   state: 'none' | 'ownership-unverified' | 'orphaned-journal' | 'corrupted-journal' | 'corrupted-lock' | 'mismatched-metadata' | 'foreign-content' | 'unsafe-symlink' | 'orphaned-artifact' | 'incomplete-transaction',
  *   hasLock: boolean,
  *   hasJournal: boolean,
  *   isPending: boolean,
@@ -78,6 +83,7 @@ export function inspectTransactionState(repoRoot) {
   const inspectionErrors = [];
   let hasUnsafeSymlink = false;
   let hasInspectionError = false;
+  let isIncompleteTransaction = false;
 
   const ciPathCheck = validateCiPatchPath(repoRoot);
   if (!ciPathCheck.ok) {
@@ -223,6 +229,13 @@ export function inspectTransactionState(repoRoot) {
     );
   }
 
+  // Legacy journal schema note
+  if (hasJournal && journalInspection.isValid && journalInspection.journal) {
+    if (typeof journalInspection.journal.stagedPath === 'string') {
+      reasons.push('Legacy journal schema detected: journal contains deprecated "stagedPath"');
+    }
+  }
+
   // Inspect recognized directory: staging
   const stagingPath = path.join(ciPatchDir, 'staging');
   const stagingCheck = getPathLstat(stagingPath);
@@ -278,8 +291,30 @@ export function inspectTransactionState(repoRoot) {
 
                       // Phase consistency: in 'LOCKED', staging has not been prepared yet!
                       if (journalObj.phase === 'LOCKED') {
-                        orphanedArtifacts.push(...txChildren.map((c) => `staging/${sEntry}/${c}`));
-                        reasons.push(`Staging directory contains artifacts in phase "${journalObj.phase}" before staging preparation: ${txChildren.join(', ')}`);
+                        const expectedTargetBase = path.basename(journalObj.targetFile || '');
+                        for (const cEntry of txChildren) {
+                          const cPath = path.join(sSubPath, cEntry);
+                          const cCheck = getPathLstat(cPath);
+
+                          if (cCheck.error) {
+                            hasInspectionError = true;
+                            inspectionErrors.push(`Failed to inspect staging artifact (staging/${sEntry}/${cEntry}): ${cCheck.error.message}`);
+                            reasons.push(`Failed to inspect staging artifact (staging/${sEntry}/${cEntry}): ${cCheck.error.message}`);
+                          } else if (cCheck.isSymbolicLink) {
+                            hasUnsafeSymlink = true;
+                            reasons.push(`Staging artifact (staging/${sEntry}/${cEntry}) is a symbolic link`);
+                          } else if (cCheck.isDirectory || !cCheck.isFile) {
+                            orphanedArtifacts.push(`staging/${sEntry}/${cEntry}`);
+                            reasons.push(`Unexpected filesystem object in staging during LOCKED phase: "staging/${sEntry}/${cEntry}"`);
+                          } else if (cEntry !== expectedTargetBase) {
+                            orphanedArtifacts.push(`staging/${sEntry}/${cEntry}`);
+                            reasons.push(`Unexpected regular file in staging during LOCKED phase: "staging/${sEntry}/${cEntry}" (expected: ${expectedTargetBase})`);
+                          } else {
+                            // Structurally consistent incomplete staging preparation
+                            isIncompleteTransaction = true;
+                            reasons.push(`Interrupted staging preparation detected: staging directory for active transaction "${expectedTxId}" contains target artifact "${cEntry}" in phase "LOCKED" prior to journal advancement`);
+                          }
+                        }
                       } else {
                         const permittedStagingNames = getPermittedArtifactNames(journalObj, 'staging');
                         for (const cEntry of txChildren) {
@@ -446,6 +481,8 @@ export function inspectTransactionState(repoRoot) {
     state = 'foreign-content';
   } else if (orphanedArtifacts.length > 0) {
     state = 'orphaned-artifact';
+  } else if (isIncompleteTransaction) {
+    state = 'incomplete-transaction';
   } else if (hasLock && !lockInspection.isValid) {
     state = 'corrupted-lock';
   } else if (hasJournal && !journalInspection.isValid) {

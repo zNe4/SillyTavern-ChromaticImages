@@ -482,15 +482,33 @@ describe('Installer Journal Primitives (journal.js)', () => {
     assert.match(illegalJump.error, /Illegal phase transition/);
 
     // Legal progression:
-    const p1 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'ISOLATED_PREPARED', lease });
+    const p1 = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
     assert.equal(p1.ok, true);
     assert.equal(p1.journal?.phase, 'ISOLATED_PREPARED');
 
-    const p2 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'BACKUP_CREATED', lease });
+    const p2 = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: { backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`, targetMode: '0644' },
+      lease,
+    });
     assert.equal(p2.ok, true);
     assert.equal(p2.journal?.phase, 'BACKUP_CREATED');
 
-    const p3 = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP', lease });
+    const p3 = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'READY_TO_SWAP',
+      metadataUpdate: { destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp` },
+      lease,
+    });
     assert.equal(p3.ok, true);
     assert.equal(p3.journal?.phase, 'READY_TO_SWAP');
 
@@ -499,7 +517,13 @@ describe('Installer Journal Primitives (journal.js)', () => {
     assert.equal(p4.journal?.phase, 'SWAPPED');
 
     // Backward transition: SWAPPED -> READY_TO_SWAP
-    const backward = advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP', lease });
+    const backward = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'READY_TO_SWAP',
+      metadataUpdate: { destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp` },
+      lease,
+    });
     assert.equal(backward.ok, false);
     assert.match(backward.error, /Illegal phase transition/);
 
@@ -556,17 +580,28 @@ describe('Installer Journal Primitives (journal.js)', () => {
     assert.equal(resHash.ok, false);
     assert.match(resHash.error, /Cannot overwrite immutable journal field: "expectedResultSha256"/);
 
+    // Disallowed legacy stagedPath update is rejected
+    const resLegacy = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { stagedPath: `/path/to/staged` },
+      lease,
+    });
+    assert.equal(resLegacy.ok, false);
+    assert.match(resLegacy.error, /legacy "stagedPath" is rejected/);
+
     // Allowed auxiliary metadata update succeeds
     const resAux = advanceJournalPhase({
       repoRoot: repo,
       txId,
       nextPhase: 'ISOLATED_PREPARED',
-      metadataUpdate: { stagedPath: '/path/to/staged' },
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
       lease,
     });
     assert.equal(resAux.ok, true);
     assert.equal(resAux.journal?.phase, 'ISOLATED_PREPARED');
-    assert.equal(resAux.journal?.stagedPath, '/path/to/staged');
+    assert.equal(resAux.journal?.isolatedStagedPath, `.ci-patch/staging/${txId}/stable-diffusion.js`);
     assert.equal(resAux.journal?.txId, txId);
   });
 
@@ -619,9 +654,27 @@ describe('Installer Journal Primitives (journal.js)', () => {
     assert.match(refuseRes.error, /Refusing to remove incomplete journal/);
 
     // Advance to COMPLETED
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'ISOLATED_PREPARED', lease });
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'BACKUP_CREATED', lease });
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP', lease });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: { backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`, targetMode: '0644' },
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'READY_TO_SWAP',
+      metadataUpdate: { destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp` },
+      lease,
+    });
     advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'SWAPPED', lease });
     advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'COMPLETED', lease });
 
@@ -712,7 +765,13 @@ describe('Installer Journal Primitives (journal.js)', () => {
       fs.chmodSync(ciPatchDir, 0o500); // read-only
 
       try {
-        const res = advanceJournalPhase({ repoRoot: repo, txId, lease, nextPhase: 'ISOLATED_PREPARED' });
+        const res = advanceJournalPhase({
+          repoRoot: repo,
+          txId,
+          lease,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+        });
         assert.equal(res.ok, false);
         assert.equal(res.stage, 'pre-rename');
         assert.match(res.error, /Failed to prepare journal update before rename/);
@@ -864,6 +923,7 @@ describe('Installer Journal Primitives (journal.js)', () => {
           txId,
           lease,
           nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
         });
 
         assert.equal(res.ok, false);
@@ -1371,9 +1431,27 @@ describe('Transaction Lease Capability Security & Multi-Process Hardening', () =
     assert.equal(createRes.ok, true);
 
     // Advance to COMPLETED and remove journal
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'ISOLATED_PREPARED', lease });
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'BACKUP_CREATED', lease });
-    advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'READY_TO_SWAP', lease });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: { backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`, targetMode: '0644' },
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'READY_TO_SWAP',
+      metadataUpdate: { destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp` },
+      lease,
+    });
     advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'SWAPPED', lease });
     advanceJournalPhase({ repoRoot: repo, txId, nextPhase: 'COMPLETED', lease });
     removeJournal({ repoRoot: repo, txId, lease });
@@ -1725,6 +1803,7 @@ describe('P3B-1-F: Temporary Journal Preservation and Ownership (journal.js)', (
       repoRoot: repo,
       txId,
       nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
       lease,
     });
 
@@ -2053,12 +2132,21 @@ describe('P3B-1-F: Temporary Journal Preservation and Ownership (journal.js)', (
     assert.equal(createRes.ok, true);
     assert.equal(createRes.journal.phase, 'LOCKED');
 
+    const phaseMetadata = {
+      ISOLATED_PREPARED: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      BACKUP_CREATED: { backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`, targetMode: '0644' },
+      READY_TO_SWAP: { destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp` },
+      SWAPPED: {},
+      COMPLETED: {},
+    };
+
     for (let i = 1; i < phases.length; i++) {
       const nextPhase = phases[i];
       const advRes = advanceJournalPhase({
         repoRoot: repo,
         txId,
         nextPhase,
+        metadataUpdate: phaseMetadata[nextPhase],
         lease,
       });
       assert.equal(advRes.ok, true);
@@ -2100,7 +2188,7 @@ describe('P3B-1-F: Strict Validation of Recognized Transaction Artifacts (transa
       repoRoot: repo,
       txId,
       nextPhase: 'ISOLATED_PREPARED',
-      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
       lease,
     });
 
@@ -2139,7 +2227,7 @@ describe('P3B-1-F: Strict Validation of Recognized Transaction Artifacts (transa
       repoRoot: repo,
       txId,
       nextPhase: 'ISOLATED_PREPARED',
-      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
       lease,
     });
 
@@ -2172,21 +2260,21 @@ describe('P3B-1-F: Strict Validation of Recognized Transaction Artifacts (transa
       repoRoot: repo,
       txId,
       nextPhase: 'ISOLATED_PREPARED',
-      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
       lease,
     });
     advanceJournalPhase({
       repoRoot: repo,
       txId,
       nextPhase: 'BACKUP_CREATED',
-      metadataUpdate: { backupPath: path.join(repo, '.ci-patch/backup', txId, 'stable-diffusion.js.bak') },
+      metadataUpdate: { backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`, targetMode: '0644' },
       lease,
     });
 
     const txBackupDir = path.join(repo, '.ci-patch/backup', txId);
     fs.mkdirSync(txBackupDir, { recursive: true });
     // Permitted file
-    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js.bak'), 'stock', 'utf8');
+    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js'), 'stock', 'utf8');
     // Intruder regular file
     fs.writeFileSync(path.join(txBackupDir, 'unrelated.png'), 'png', 'utf8');
 
@@ -2235,7 +2323,7 @@ describe('P3B-1-F: Strict Validation of Recognized Transaction Artifacts (transa
       repoRoot: repo,
       txId,
       nextPhase: 'ISOLATED_PREPARED',
-      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
       lease,
     });
 
@@ -2272,7 +2360,7 @@ describe('P3B-1-F: Strict Validation of Recognized Transaction Artifacts (transa
       repoRoot: repo,
       txId,
       nextPhase: 'ISOLATED_PREPARED',
-      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
       lease,
     });
 
@@ -2303,7 +2391,7 @@ describe('P3B-1-F: Strict Validation of Recognized Transaction Artifacts (transa
     }
   });
 
-  test('premature staging or backup artifacts in LOCKED phase are rejected as orphaned-artifact', () => {
+  test('matching staging artifact in LOCKED phase reports incomplete-transaction', () => {
     const repo = setupRepo('st-premature-artifacts-');
     const txId = generateTxId();
     const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
@@ -2324,10 +2412,16 @@ describe('P3B-1-F: Strict Validation of Recognized Transaction Artifacts (transa
     fs.writeFileSync(path.join(txStagingDir, 'stable-diffusion.js'), 'code', 'utf8');
 
     const state = inspectTransactionState(repo);
-    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.state, 'incomplete-transaction');
     assert.equal(state.isPending, true);
-    assert.ok(state.orphanedArtifacts.some((p) => p.endsWith('stable-diffusion.js')));
-    assert.ok(state.reasons.some((r) => r.includes('before staging preparation')));
+    assert.ok(state.reasons.some((r) => r.includes('Interrupted staging preparation detected')));
+
+    // If an unexpected artifact is also present, it becomes orphaned-artifact
+    fs.writeFileSync(path.join(txStagingDir, 'intruder.txt'), 'unexpected', 'utf8');
+    const state2 = inspectTransactionState(repo);
+    assert.equal(state2.state, 'orphaned-artifact');
+    assert.equal(state2.isPending, true);
+    assert.ok(state2.orphanedArtifacts.some((p) => p.endsWith('intruder.txt')));
   });
 
   test('legitimate empty recognized directories report state: none and isPending: false', () => {
@@ -2361,7 +2455,7 @@ describe('P3B-1-F: Strict Validation of Recognized Transaction Artifacts (transa
       repoRoot: repo,
       txId,
       nextPhase: 'ISOLATED_PREPARED',
-      metadataUpdate: { stagedPath: path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js') },
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
       lease,
     });
 
@@ -2378,6 +2472,7 @@ describe('P3B-1-F: Strict Validation of Recognized Transaction Artifacts (transa
   test('getPermittedArtifactNames helper returns exact allowable filenames for staging and backup', () => {
     const journal = {
       targetFile: 'src/endpoints/stable-diffusion.js',
+      isolatedStagedPath: '.ci-patch/staging/ci-tx-123-abc/stable-diffusion.js',
       stagedPath: '/path/to/custom-staged.js',
       backupPath: '/path/to/custom-backup.js.bak',
     };
@@ -2759,4 +2854,359 @@ describe('P3B-1-F: Full Lock/Journal Transaction Consistency', () => {
     assert.equal(uncertainLeaseRes.code, 'lease-uncertain');
   });
 });
+
+describe('P3B-2A: Journal Phase-Bound Resource Contracts & Metadata Immutability (journal.js)', () => {
+  const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
+  const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
+
+  test('createJournal rejects any auxiliary metadata fields at creation time', () => {
+    const repo = createTempDir('j-meta-create-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    const resAux = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      extraMetadata: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+    assert.equal(resAux.ok, false);
+    assert.match(resAux.error, /Disallowed auxiliary journal field at creation/);
+
+    const resLegacy = createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      extraMetadata: { stagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+    assert.equal(resLegacy.ok, false);
+    assert.match(resLegacy.error, /Disallowed auxiliary journal field at creation/);
+  });
+
+  test('advanceJournalPhase enforces mandatory metadata and rejects premature fields', () => {
+    const repo = createTempDir('j-meta-phases-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    // 1. Omission of isolatedStagedPath at LOCKED -> ISOLATED_PREPARED
+    const resOmit1 = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      lease,
+    });
+    assert.equal(resOmit1.ok, false);
+    assert.equal(resOmit1.code, 'missing-mandatory-metadata');
+    assert.match(resOmit1.error, /isolatedStagedPath/);
+
+    // 2. Premature introduction of backupPath at LOCKED -> ISOLATED_PREPARED
+    const resPremature = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: {
+        isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+        backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+      },
+      lease,
+    });
+    assert.equal(resPremature.ok, false);
+    assert.equal(resPremature.code, 'premature-metadata');
+    assert.match(resPremature.error, /backupPath/);
+
+    // 3. Valid advance to ISOLATED_PREPARED
+    const resAdv1 = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+    assert.equal(resAdv1.ok, true);
+
+    // 4. Omission of targetMode at ISOLATED_PREPARED -> BACKUP_CREATED
+    const resOmitMode = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: { backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js` },
+      lease,
+    });
+    assert.equal(resOmitMode.ok, false);
+    assert.equal(resOmitMode.code, 'missing-mandatory-metadata');
+    assert.match(resOmitMode.error, /targetMode/);
+
+    // 5. Premature destinationStagedPath at ISOLATED_PREPARED -> BACKUP_CREATED
+    const resPrematureDest = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: {
+        backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+        targetMode: '0644',
+        destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`,
+      },
+      lease,
+    });
+    assert.equal(resPrematureDest.ok, false);
+    assert.equal(resPrematureDest.code, 'premature-metadata');
+    assert.match(resPrematureDest.error, /destinationStagedPath/);
+
+    // 6. Valid advance to BACKUP_CREATED
+    const resAdv2 = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: {
+        backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+        targetMode: '0644',
+      },
+      lease,
+    });
+    assert.equal(resAdv2.ok, true);
+
+    // 7. Omission of destinationStagedPath at BACKUP_CREATED -> READY_TO_SWAP
+    const resOmitDest = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'READY_TO_SWAP',
+      lease,
+    });
+    assert.equal(resOmitDest.ok, false);
+    assert.equal(resOmitDest.code, 'missing-mandatory-metadata');
+
+    // 8. Valid advance to READY_TO_SWAP
+    const resAdv3 = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'READY_TO_SWAP',
+      metadataUpdate: {
+        destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`,
+      },
+      lease,
+    });
+    assert.equal(resAdv3.ok, true);
+  });
+
+  test('advanceJournalPhase strictly enforces resource path containment and matching txId', () => {
+    const repo = createTempDir('j-meta-containment-');
+    const txId = generateTxId();
+    const otherTxId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    // Foreign txId in path
+    const resForeignTx = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${otherTxId}/stable-diffusion.js` },
+      lease,
+    });
+    assert.equal(resForeignTx.ok, false);
+    assert.equal(resForeignTx.code, 'invalid-resource-path');
+
+    // Directory traversal
+    const resTraversal = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/../escape.js` },
+      lease,
+    });
+    assert.equal(resTraversal.ok, false);
+    assert.equal(resTraversal.code, 'invalid-resource-path');
+
+    // Absolute path
+    const resAbs = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: path.resolve(repo, `.ci-patch/staging/${txId}/stable-diffusion.js`) },
+      lease,
+    });
+    assert.equal(resAbs.ok, false);
+    assert.equal(resAbs.code, 'invalid-resource-path');
+  });
+
+  test('advanceJournalPhase validates canonical targetMode octal string', () => {
+    const repo = createTempDir('j-meta-mode-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+
+    const invalidModes = ['644', '07777', '0abc', '0888', '064', '', '0100644'];
+    for (const badMode of invalidModes) {
+      const resBad = advanceJournalPhase({
+        repoRoot: repo,
+        txId,
+        nextPhase: 'BACKUP_CREATED',
+        metadataUpdate: {
+          backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+          targetMode: badMode,
+        },
+        lease,
+      });
+      assert.equal(resBad.ok, false);
+      assert.match(resBad.error, /targetMode/i);
+    }
+
+    const resValid = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: {
+        backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+        targetMode: '0644',
+      },
+      lease,
+    });
+    assert.equal(resValid.ok, true);
+    assert.equal(resValid.journal?.targetMode, '0644');
+  });
+
+  test('advanceJournalPhase enforces permanent immutability and permits identical resubmission', () => {
+    const repo = createTempDir('j-meta-immutability-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+
+    // Conflicting resubmission of isolatedStagedPath during BACKUP_CREATED
+    const resConflict = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: {
+        isolatedStagedPath: `.ci-patch/staging/${txId}/other-name.js`,
+        backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+        targetMode: '0644',
+      },
+      lease,
+    });
+    assert.equal(resConflict.ok, false);
+    assert.equal(resConflict.code, 'immutable-field-conflict');
+
+    // Identical resubmission of isolatedStagedPath succeeds idempotently
+    const resIdentical = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: {
+        isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+        backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+        targetMode: '0644',
+      },
+      lease,
+    });
+    assert.equal(resIdentical.ok, true);
+    assert.equal(resIdentical.journal?.isolatedStagedPath, `.ci-patch/staging/${txId}/stable-diffusion.js`);
+  });
+
+  test('advanceJournalPhase refuses to advance legacy journal containing stagedPath', () => {
+    const repo = createTempDir('j-legacy-refusal-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    // Manually create a legacy journal with stagedPath on disk
+    const jPath = path.join(repo, '.ci-patch/journal.json');
+    fs.mkdirSync(path.join(repo, '.ci-patch'), { recursive: true });
+    const legacyJournal = {
+      schemaVersion: '1.0.0',
+      txId,
+      op: 'apply',
+      phase: 'LOCKED',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      stagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+    };
+    fs.writeFileSync(jPath, JSON.stringify(legacyJournal, null, 2) + '\n');
+
+    // Inspecting legacy journal succeeds with note
+    const inspection = inspectJournal(repo);
+    assert.equal(inspection.hasJournal, true);
+    assert.equal(inspection.isValid, true);
+    assert.equal(inspection.journal?.stagedPath, legacyJournal.stagedPath);
+
+    // State inspection recognizes legacy schema
+    const txState = inspectTransactionState(repo);
+    assert.ok(txState.reasons.some((r) => r.includes('Legacy journal schema detected')));
+
+    // Attempting to advance legacy journal is strictly refused
+    const advRes = advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+    assert.equal(advRes.ok, false);
+    assert.equal(advRes.code, 'legacy-schema');
+    assert.match(advRes.error, /legacy journals containing "stagedPath" are refused/);
+  });
+});
+
 
