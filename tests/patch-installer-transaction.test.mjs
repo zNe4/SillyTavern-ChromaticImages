@@ -3209,4 +3209,214 @@ describe('P3B-2A: Journal Phase-Bound Resource Contracts & Metadata Immutability
   });
 });
 
+describe('P3B-2A-F1: Phase-Aware Persisted Journal Validation (validateJournalStructure)', () => {
+  const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
+  const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
+
+  const baseValidJournal = (phase = 'LOCKED', txId = generateTxId()) => ({
+    schemaVersion: '1.0.0',
+    txId,
+    op: 'apply',
+    phase,
+    targetFile: 'src/endpoints/stable-diffusion.js',
+    expectedInitialSha256: stockSha,
+    expectedResultSha256: patchedSha,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  test('validates journals across every permitted phase when exact mandatory metadata is present', () => {
+    const txId = generateTxId();
+
+    // 1. LOCKED (no auxiliary metadata)
+    const jLocked = baseValidJournal('LOCKED', txId);
+    assert.equal(validateJournalStructure(jLocked).valid, true);
+
+    // 2. ISOLATED_PREPARED
+    const jPrep = {
+      ...baseValidJournal('ISOLATED_PREPARED', txId),
+      isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+    };
+    assert.equal(validateJournalStructure(jPrep).valid, true);
+
+    // 3. BACKUP_CREATED
+    const jBak = {
+      ...jPrep,
+      phase: 'BACKUP_CREATED',
+      backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+      targetMode: '0644',
+    };
+    assert.equal(validateJournalStructure(jBak).valid, true);
+
+    // 4. READY_TO_SWAP
+    const jSwap = {
+      ...jBak,
+      phase: 'READY_TO_SWAP',
+      destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`,
+    };
+    assert.equal(validateJournalStructure(jSwap).valid, true);
+
+    // 5. SWAPPED
+    const jSwapped = { ...jSwap, phase: 'SWAPPED' };
+    assert.equal(validateJournalStructure(jSwapped).valid, true);
+
+    // 6. COMPLETED
+    const jDone = { ...jSwap, phase: 'COMPLETED' };
+    assert.equal(validateJournalStructure(jDone).valid, true);
+  });
+
+  test('rejects ISOLATED_PREPARED when isolatedStagedPath is missing', () => {
+    const j = baseValidJournal('ISOLATED_PREPARED');
+    const res = validateJournalStructure(j);
+    assert.equal(res.valid, false);
+    assert.ok(res.errors.some((e) => e.includes('Missing mandatory auxiliary field for phase "ISOLATED_PREPARED": "isolatedStagedPath"')));
+  });
+
+  test('rejects BACKUP_CREATED when backupPath or targetMode is missing', () => {
+    const txId = generateTxId();
+    // Missing backupPath
+    const jNoBak = {
+      ...baseValidJournal('BACKUP_CREATED', txId),
+      isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+      targetMode: '0644',
+    };
+    const resNoBak = validateJournalStructure(jNoBak);
+    assert.equal(resNoBak.valid, false);
+    assert.ok(resNoBak.errors.some((e) => e.includes('Missing mandatory auxiliary field for phase "BACKUP_CREATED": "backupPath"')));
+
+    // Missing targetMode
+    const jNoMode = {
+      ...baseValidJournal('BACKUP_CREATED', txId),
+      isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+      backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+    };
+    const resNoMode = validateJournalStructure(jNoMode);
+    assert.equal(resNoMode.valid, false);
+    assert.ok(resNoMode.errors.some((e) => e.includes('Missing mandatory auxiliary field for phase "BACKUP_CREATED": "targetMode"')));
+  });
+
+  test('rejects READY_TO_SWAP when destinationStagedPath is missing', () => {
+    const txId = generateTxId();
+    const j = {
+      ...baseValidJournal('READY_TO_SWAP', txId),
+      isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+      backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+      targetMode: '0644',
+    };
+    const res = validateJournalStructure(j);
+    assert.equal(res.valid, false);
+    assert.ok(res.errors.some((e) => e.includes('Missing mandatory auxiliary field for phase "READY_TO_SWAP": "destinationStagedPath"')));
+  });
+
+  test('rejects premature auxiliary metadata in early phases', () => {
+    const txId = generateTxId();
+
+    // LOCKED with isolatedStagedPath
+    const jLockWithPrep = {
+      ...baseValidJournal('LOCKED', txId),
+      isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+    };
+    const resLock = validateJournalStructure(jLockWithPrep);
+    assert.equal(resLock.valid, false);
+    assert.ok(resLock.errors.some((e) => e.includes('Disallowed premature or extraneous auxiliary field in phase "LOCKED"')));
+
+    // ISOLATED_PREPARED with backupPath
+    const jPrepWithBak = {
+      ...baseValidJournal('ISOLATED_PREPARED', txId),
+      isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+      backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+    };
+    const resPrep = validateJournalStructure(jPrepWithBak);
+    assert.equal(resPrep.valid, false);
+    assert.ok(resPrep.errors.some((e) => e.includes('Disallowed premature or extraneous auxiliary field in phase "ISOLATED_PREPARED"')));
+
+    // BACKUP_CREATED with destinationStagedPath
+    const jBakWithDest = {
+      ...baseValidJournal('BACKUP_CREATED', txId),
+      isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+      backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+      targetMode: '0644',
+      destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`,
+    };
+    const resBak = validateJournalStructure(jBakWithDest);
+    assert.equal(resBak.valid, false);
+    assert.ok(resBak.errors.some((e) => e.includes('Disallowed premature or extraneous auxiliary field in phase "BACKUP_CREATED"')));
+  });
+
+  test('rejects resource paths with wrong txId binding, directory traversal, or wrong directory', () => {
+    const txId = generateTxId();
+    const otherTxId = generateTxId();
+
+    // Wrong txId in isolatedStagedPath
+    const jForeignTx = {
+      ...baseValidJournal('ISOLATED_PREPARED', txId),
+      isolatedStagedPath: `.ci-patch/staging/${otherTxId}/stable-diffusion.js`,
+    };
+    const resForeign = validateJournalStructure(jForeignTx);
+    assert.equal(resForeign.valid, false);
+    assert.ok(resForeign.errors.some((e) => e.includes('Invalid isolatedStagedPath')));
+
+    // Directory traversal in backupPath
+    const jTraversal = {
+      ...baseValidJournal('BACKUP_CREATED', txId),
+      isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+      backupPath: `.ci-patch/backup/${txId}/../escape.js`,
+      targetMode: '0644',
+    };
+    const resTraversal = validateJournalStructure(jTraversal);
+    assert.equal(resTraversal.valid, false);
+    assert.ok(resTraversal.errors.some((e) => e.includes('Invalid backupPath')));
+
+    // Wrong filename in destinationStagedPath
+    const jWrongFile = {
+      ...baseValidJournal('READY_TO_SWAP', txId),
+      isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+      backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+      targetMode: '0644',
+      destinationStagedPath: `src/endpoints/.other-file.js.ci-staged-${txId}.tmp`,
+    };
+    const resWrongFile = validateJournalStructure(jWrongFile);
+    assert.equal(resWrongFile.valid, false);
+    assert.ok(resWrongFile.errors.some((e) => e.includes('Invalid destinationStagedPath')));
+  });
+
+  test('rejects malformed targetMode format', () => {
+    const txId = generateTxId();
+    const invalidModes = ['644', '07777', '0abc', '0888', '064', ''];
+    for (const badMode of invalidModes) {
+      const j = {
+        ...baseValidJournal('BACKUP_CREATED', txId),
+        isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js`,
+        backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+        targetMode: badMode,
+      };
+      const res = validateJournalStructure(j);
+      assert.equal(res.valid, false);
+      assert.ok(res.errors.some((e) => /targetMode/i.test(e)));
+    }
+  });
+
+  test('inspectJournal detects on-disk phase-inconsistent journals as invalid', () => {
+    const repo = createTempDir('inspect-phase-invalid-');
+    const txId = generateTxId();
+    const jPath = path.join(repo, '.ci-patch/journal.json');
+    fs.mkdirSync(path.join(repo, '.ci-patch'), { recursive: true });
+
+    // On-disk journal claiming ISOLATED_PREPARED without isolatedStagedPath
+    const corruptJournal = baseValidJournal('ISOLATED_PREPARED', txId);
+    fs.writeFileSync(jPath, JSON.stringify(corruptJournal, null, 2) + '\n');
+
+    const inspection = inspectJournal(repo);
+    assert.equal(inspection.hasJournal, true);
+    assert.equal(inspection.isValid, false);
+    assert.ok(inspection.errors.some((e) => e.includes('Missing mandatory auxiliary field for phase "ISOLATED_PREPARED"')));
+
+    // Read-only state inspection detects corrupted-journal
+    const txState = inspectTransactionState(repo);
+    assert.equal(txState.state, 'corrupted-journal');
+    assert.equal(txState.isPending, true);
+  });
+});
+
+
 

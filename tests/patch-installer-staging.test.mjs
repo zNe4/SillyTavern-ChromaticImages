@@ -61,11 +61,33 @@ function createTempDir(prefix = 'ci-staging-test-') {
   return dir;
 }
 
-function getAuthenticStockContent() {
-  const localRepo = '/home/zzzne4/SillyTavern';
-  if (fs.existsSync(localRepo)) {
+function getVerifiedAuthenticStockContent(targetManifest) {
+  const candidateDirs = [
+    process.env.SILLYTAVERN_TEST_REPO,
+    process.env.SILLYTAVERN_DIR,
+    '/home/zzzne4/SillyTavern',
+  ].filter(Boolean);
+
+  const expectedSha = targetManifest.patches?.runtime?.original?.sha256?.toLowerCase();
+  const expectedBlob = targetManifest.patches?.runtime?.original?.gitBlobSha?.toLowerCase();
+  const releaseCommit = targetManifest.releaseCommit;
+  const targetFile = targetManifest.patches?.runtime?.targetFile;
+
+  for (const candidate of candidateDirs) {
+    if (!fs.existsSync(candidate)) continue;
     try {
-      return child_process.execFileSync('git', ['-C', localRepo, 'show', '06bde939f:src/endpoints/stable-diffusion.js']);
+      const buf = child_process.execFileSync(
+        'git',
+        ['-C', candidate, 'show', `${releaseCommit}:${targetFile}`],
+        { stdio: ['ignore', 'pipe', 'ignore'] }
+      );
+      if (buf && buf.length > 0) {
+        const actualSha = computeSha256(buf).toLowerCase();
+        const actualBlob = computeGitBlobSha(buf).toLowerCase();
+        if (actualSha === expectedSha && actualBlob === expectedBlob) {
+          return buf;
+        }
+      }
     } catch {
       // ignore
     }
@@ -94,7 +116,7 @@ const stockSha = manifest.patches.runtime.original.sha256;
 const stockBlob = manifest.patches.runtime.original.gitBlobSha;
 const patchedSha = manifest.patches.runtime.expected.sha256;
 const patchedBlob = manifest.patches.runtime.expected.gitBlobSha;
-const authenticStock = getAuthenticStockContent();
+const authenticStock = getVerifiedAuthenticStockContent(manifest);
 
 describe('P3B-2A: Isolated Patch Preparation Primitive (staging.js)', () => {
   test('computeSha256 and computeGitBlobSha produce standard cryptographic digests', () => {
@@ -130,6 +152,12 @@ describe('P3B-2A: Isolated Patch Preparation Primitive (staging.js)', () => {
     assert.throws(() => {
       readLiveSourceFile(path.join(repo, 'missing.js'));
     }, /does not exist/);
+  });
+
+  test('readLiveSourceFile fails closed when O_NOFOLLOW is unsupported', () => {
+    assert.throws(() => {
+      readLiveSourceFile('/tmp/any', { _testConstants: {} });
+    }, /O_NOFOLLOW/);
   });
 
   test('prepareIsolatedPatch validates required parameters and fails closed', async () => {
@@ -505,3 +533,437 @@ describe('P3B-2A: Isolated Patch Preparation Primitive (staging.js)', () => {
     });
   }
 });
+
+describe('P3B-2A-F1: Strict Filesystem Durability (Finding A)', () => {
+  if (!authenticStock) {
+    test.skip('Skipping authentic durability tests (authentic stock unavailable)', () => {});
+    return;
+  }
+
+  test('fails closed with explicit stage error when directory synchronization fails during staging-parent creation', async () => {
+    const repo = setupDisposableRepo('durability-staging-parent-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const origFsync = fs.fsyncSync;
+    try {
+      let callCount = 0;
+      fs.fsyncSync = (fd) => {
+        callCount++;
+        // Fail the first directory sync (staging-parent)
+        if (callCount === 1) {
+          const err = new Error('I/O error during parent sync');
+          err.code = 'EIO';
+          throw err;
+        }
+        return origFsync(fd);
+      };
+
+      const res = await prepareIsolatedPatch({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EIO');
+      assert.equal(res.stage, 'sync-staging-parent');
+      assert.match(res.error, /Filesystem synchronization failed during "staging-parent"/);
+
+      // Journal remains strictly in phase LOCKED
+      const jInspection = inspectJournal(repo);
+      assert.equal(jInspection.journal?.phase, 'LOCKED');
+      assert.equal(jInspection.journal?.isolatedStagedPath, undefined);
+    } finally {
+      fs.fsyncSync = origFsync;
+    }
+  });
+
+  test('fails closed when initial staged file synchronization fails', async () => {
+    const repo = setupDisposableRepo('durability-file-sync-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const origFsync = fs.fsyncSync;
+    try {
+      let syncIndex = 0;
+      fs.fsyncSync = (fd) => {
+        syncIndex++;
+        // Call 1: staging-parent, Call 2: staging-txdir-parent, Call 3: staged file fsync
+        if (syncIndex === 3) {
+          const err = new Error('Disk write sync failed');
+          err.code = 'ENOSPC';
+          throw err;
+        }
+        return origFsync(fd);
+      };
+
+      const res = await prepareIsolatedPatch({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'ENOSPC');
+      assert.equal(res.stage, 'sync-initial-staged-file');
+
+      // Journal remains in LOCKED
+      const jInspection = inspectJournal(repo);
+      assert.equal(jInspection.journal?.phase, 'LOCKED');
+
+      // Incomplete transaction detected with isPending true
+      const state = inspectTransactionState(repo);
+      assert.equal(state.isPending, true);
+    } finally {
+      fs.fsyncSync = origFsync;
+    }
+  });
+
+  test('fails closed when prepared output synchronization fails', async () => {
+    const repo = setupDisposableRepo('durability-output-sync-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const origFsync = fs.fsyncSync;
+    try {
+      let syncIndex = 0;
+      fs.fsyncSync = (fd) => {
+        syncIndex++;
+        // Calls: 1: staging-parent, 2: txdir-parent, 3: initial staged file, 4: initial txdir
+        // Call 5: output file fchmod/fsync
+        if (syncIndex === 5) {
+          const err = new Error('I/O failure during output sync');
+          err.code = 'EIO';
+          throw err;
+        }
+        return origFsync(fd);
+      };
+
+      const res = await prepareIsolatedPatch({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EIO');
+      assert.equal(res.stage, 'sync-output-file');
+
+      // Journal remains in phase LOCKED
+      const jInspection = inspectJournal(repo);
+      assert.equal(jInspection.journal?.phase, 'LOCKED');
+    } finally {
+      fs.fsyncSync = origFsync;
+    }
+  });
+
+  test('proves all required synchronizations execute successfully before journal advancement', async () => {
+    const repo = setupDisposableRepo('durability-order-verification-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const syncLog = [];
+    const origFsync = fs.fsyncSync;
+    try {
+      fs.fsyncSync = (fd) => {
+        syncLog.push(fd);
+        return origFsync(fd);
+      };
+
+      const res = await prepareIsolatedPatch({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+      });
+
+      assert.equal(res.ok, true);
+      // At least 6 fsync operations must have executed
+      assert.ok(syncLog.length >= 6);
+      assert.equal(res.journal?.phase, 'ISOLATED_PREPARED');
+    } finally {
+      fs.fsyncSync = origFsync;
+    }
+  });
+});
+
+describe('P3B-2A-F1: Certified Manifest and Patch Authentication (Finding B)', () => {
+  test('rejects caller-supplied conflicting manifest with unauthenticated-manifest-override', async () => {
+    const repo = setupDisposableRepo('manifest-override-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const tamperedManifest = {
+      ...manifest,
+      releaseCommit: '0000000000000000000000000000000000000000',
+    };
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+      manifest: tamperedManifest,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unauthenticated-manifest-override');
+  });
+
+  test('rejects caller-supplied conflicting patchPath with unauthenticated-patch-override', async () => {
+    const repo = setupDisposableRepo('patchpath-override-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const unauthPath = path.join(repo, 'unauth.patch');
+    fs.writeFileSync(unauthPath, 'data');
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+      patchPath: unauthPath,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unauthenticated-patch-override');
+  });
+
+  test('rejects journal fingerprint mismatch against certified manifest', async () => {
+    const repo = setupDisposableRepo('fp-mismatch-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: '0000000000000000000000000000000000000000000000000000000000000000',
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'fingerprint-mismatch');
+  });
+});
+
+describe('P3B-2A-F1: Staging Path Safety & Permissions (Finding C)', () => {
+  test('rejects symlinked .ci-patch/staging directory with unsafe-symlink', async () => {
+    const repo = setupDisposableRepo('symlink-staging-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const externalDir = createTempDir('external-staging-target-');
+    fs.symlinkSync(externalDir, path.join(repo, '.ci-patch/staging'));
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unsafe-symlink');
+  });
+
+  test('rejects dangling symlink at .ci-patch/staging with unsafe-symlink', async () => {
+    const repo = setupDisposableRepo('dangling-symlink-staging-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    fs.symlinkSync('/tmp/nonexistent-path-for-dangling-symlink', path.join(repo, '.ci-patch/staging'));
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unsafe-symlink');
+  });
+
+  test('rejects staging parent when replaced by a regular file with invalid-staging-dir', async () => {
+    const repo = setupDisposableRepo('regfile-staging-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    fs.writeFileSync(path.join(repo, '.ci-patch/staging'), 'not-a-directory');
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'invalid-staging-dir');
+  });
+
+  test('rejects when targetFile parent directory is a symbolic link with unsafe-symlink', async () => {
+    const repo = setupDisposableRepo('symlink-parent-target-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    // Replace src/endpoints directory with a symlink to another directory
+    const realEndpoints = createTempDir('real-endpoints-');
+    fs.rmSync(path.join(repo, 'src/endpoints'), { recursive: true, force: true });
+    fs.symlinkSync(realEndpoints, path.join(repo, 'src/endpoints'));
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'unsafe-symlink');
+  });
+
+  test('rejects when targetFile parent directory is missing with source-parent-missing', async () => {
+    const repo = setupDisposableRepo('missing-parent-target-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    fs.rmSync(path.join(repo, 'src/endpoints'), { recursive: true, force: true });
+
+    const res = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'source-parent-missing');
+  });
+});
+

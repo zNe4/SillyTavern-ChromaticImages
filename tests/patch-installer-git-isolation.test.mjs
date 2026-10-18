@@ -49,11 +49,33 @@ function createTempDir(prefix = 'ci-git-iso-test-') {
   return dir;
 }
 
-function getAuthenticStockContent() {
-  const localRepo = '/home/zzzne4/SillyTavern';
-  if (fs.existsSync(localRepo)) {
+function getVerifiedAuthenticStockContent(targetManifest) {
+  const candidateDirs = [
+    process.env.SILLYTAVERN_TEST_REPO,
+    process.env.SILLYTAVERN_DIR,
+    '/home/zzzne4/SillyTavern',
+  ].filter(Boolean);
+
+  const expectedSha = targetManifest.patches?.runtime?.original?.sha256?.toLowerCase();
+  const expectedBlob = targetManifest.patches?.runtime?.original?.gitBlobSha?.toLowerCase();
+  const releaseCommit = targetManifest.releaseCommit;
+  const targetFile = targetManifest.patches?.runtime?.targetFile;
+
+  for (const candidate of candidateDirs) {
+    if (!fs.existsSync(candidate)) continue;
     try {
-      return child_process.execFileSync('git', ['-C', localRepo, 'show', '06bde939f:src/endpoints/stable-diffusion.js']);
+      const buf = child_process.execFileSync(
+        'git',
+        ['-C', candidate, 'show', `${releaseCommit}:${targetFile}`],
+        { stdio: ['ignore', 'pipe', 'ignore'] }
+      );
+      if (buf && buf.length > 0) {
+        const actualSha = computeSha256(buf).toLowerCase();
+        const actualBlob = computeGitBlobSha(buf).toLowerCase();
+        if (actualSha === expectedSha && actualBlob === expectedBlob) {
+          return buf;
+        }
+      }
     } catch {
       // ignore
     }
@@ -82,7 +104,7 @@ const stockSha = manifest.patches.runtime.original.sha256;
 const stockBlob = manifest.patches.runtime.original.gitBlobSha;
 const patchedSha = manifest.patches.runtime.expected.sha256;
 const patchedBlob = manifest.patches.runtime.expected.gitBlobSha;
-const authenticStock = getAuthenticStockContent();
+const authenticStock = getVerifiedAuthenticStockContent(manifest);
 
 describe('P3B-2A: Native Git Execution Isolation & Strip Invariants', () => {
   if (!authenticStock) {
@@ -263,7 +285,7 @@ describe('P3B-2A: Native Git Execution Isolation & Strip Invariants', () => {
       txId,
       op: 'apply',
       lease,
-      patchPath: corruptPatchPath,
+      _testCorruptPatchPath: corruptPatchPath,
     });
 
     assert.equal(prepRes.ok, false);
@@ -278,5 +300,43 @@ describe('P3B-2A: Native Git Execution Isolation & Strip Invariants', () => {
     // Live target remains authentic stock
     const liveBytes = fs.readFileSync(liveTarget);
     assert.equal(computeSha256(liveBytes), stockSha);
+  });
+
+  test('caller-supplied conflicting patchPath is rejected before patch execution (Finding B)', async () => {
+    const repo = setupDisposableRepo('git-conflicting-override-');
+    const txId = generateTxId();
+
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const foreignPatchPath = path.join(repo, 'foreign.patch');
+    fs.writeFileSync(foreignPatchPath, 'diff --git a/foreign b/foreign\n');
+
+    const prepRes = await prepareIsolatedPatch({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      lease,
+      patchPath: foreignPatchPath,
+    });
+
+    assert.equal(prepRes.ok, false);
+    assert.equal(prepRes.code, 'unauthenticated-patch-override');
+    assert.match(prepRes.error, /does not match certified patch/);
+
+    // Journal remains in phase LOCKED
+    const jInspection = inspectJournal(repo);
+    assert.equal(jInspection.journal?.phase, 'LOCKED');
   });
 });

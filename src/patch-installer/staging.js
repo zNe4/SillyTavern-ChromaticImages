@@ -7,7 +7,10 @@ import { fileURLToPath } from 'node:url';
 import {
   getCiPatchDir,
   getPathLstat,
+  validateCiPatchPath,
 } from './lock.js';
+
+const TX_ID_REGEX = /^ci-tx-[0-9]+-[0-9a-f]+$/i;
 
 import {
   inspectJournal,
@@ -15,7 +18,10 @@ import {
   verifyLockOwnershipForMutation,
 } from './journal.js';
 
-import { verifyPatchManifest } from '../../scripts/verify-sillytavern-patches.mjs';
+import {
+  verifyPatchManifest,
+  isSafeRelativePath,
+} from '../../scripts/verify-sillytavern-patches.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -50,11 +56,67 @@ export function computeGitBlobSha(data) {
 }
 
 /**
+ * Synchronize a file or directory entry to durable storage.
+ * Explicitly returns identifiable failure rather than ignoring or discarding sync errors.
+ *
+ * @param {string} targetPath
+ * @param {string} stage
+ * @param {boolean} [isDirectory=false]
+ * @param {(stage: string, context?: object) => void} [runFault]
+ * @returns {{ ok: boolean, error?: string, code?: string, stage?: string }}
+ */
+function syncPathDurable(targetPath, stage, isDirectory = false, runFault = null, constants = fs.constants) {
+  if (typeof runFault === 'function') {
+    runFault(`sync-${stage}`, { targetPath, isDirectory });
+  }
+
+  if (!isDirectory && !constants.O_NOFOLLOW) {
+    return {
+      ok: false,
+      error: 'Unsupported platform: O_NOFOLLOW file open flag is required for safe descriptor access',
+      code: 'unsupported-platform',
+      stage: `sync-${stage}`,
+    };
+  }
+
+  let fd = null;
+  const openFlags = isDirectory
+    ? (constants.O_RDONLY | (constants.O_DIRECTORY || 0))
+    : (constants.O_RDONLY | constants.O_NOFOLLOW);
+
+  try {
+    fd = fs.openSync(targetPath, openFlags);
+    fs.fsyncSync(fd);
+    return { ok: true };
+  } catch (err) {
+    if (err?._isFault) {
+      throw err;
+    }
+    return {
+      ok: false,
+      error: `Filesystem synchronization failed during "${stage}" for "${targetPath}": ${err.message}`,
+      code: err.code || 'fsync-failed',
+      stage: `sync-${stage}`,
+    };
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore close error
+      }
+    }
+  }
+}
+
+/**
  * Read a file through a bounded descriptor-level loop with pre/post stat verification.
  * Guarantees bounded reads, unexpected EOF detection, concurrent expansion detection,
- * and immutable descriptor inode identity.
+ * and immutable descriptor inode identity with strict O_NOFOLLOW protection.
  *
  * @param {string} absPath
+ * @param {object} [options]
+ * @param {object} [options._testConstants]
  * @returns {{
  *   buffer: Buffer,
  *   stat: fs.Stats,
@@ -62,7 +124,12 @@ export function computeGitBlobSha(data) {
  *   gitBlobSha: string
  * }}
  */
-export function readLiveSourceFile(absPath) {
+export function readLiveSourceFile(absPath, options = {}) {
+  const constants = options?._testConstants || fs.constants;
+  if (!constants.O_NOFOLLOW) {
+    throw new Error('Unsupported platform: O_NOFOLLOW file open flag is required for safe descriptor access');
+  }
+
   const check = getPathLstat(absPath);
   if (check.error) {
     throw new Error(`Failed to inspect source file: ${check.error.message}`);
@@ -71,7 +138,7 @@ export function readLiveSourceFile(absPath) {
     throw new Error(`Source file "${absPath}" does not exist, is not a regular file, or is a symbolic link`);
   }
 
-  const openFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0);
+  const openFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
   const fd = fs.openSync(absPath, openFlags);
   try {
     const preStat = fs.fstatSync(fd);
@@ -132,6 +199,7 @@ export function readLiveSourceFile(absPath) {
  * @param {import('./lock.js').TransactionLease} options.lease
  * @param {object} [options.manifest]
  * @param {string} [options.patchPath]
+ * @param {string} [options._testCorruptPatchPath]
  * @param {(stage: string, context?: object) => void} [options.faultHook]
  * @returns {Promise<{
  *   ok: boolean,
@@ -152,6 +220,7 @@ export async function prepareIsolatedPatch(options = {}) {
     lease,
     manifest: providedManifest = null,
     patchPath: providedPatchPath = null,
+    _testCorruptPatchPath = null,
     faultHook = null,
   } = options;
 
@@ -168,6 +237,22 @@ export async function prepareIsolatedPatch(options = {}) {
       ok: false,
       error: `Invalid operation "${op}": must be "apply" or "remove"`,
       code: 'invalid-operation',
+    };
+  }
+
+  if (typeof txId !== 'string' || !TX_ID_REGEX.test(txId.trim())) {
+    return {
+      ok: false,
+      error: `Invalid transaction ID format: "${txId}"`,
+      code: 'invalid-txid',
+    };
+  }
+
+  if (!fs.constants.O_NOFOLLOW) {
+    return {
+      ok: false,
+      error: 'Unsupported platform: O_NOFOLLOW file open flag is required for safe descriptor access',
+      code: 'unsupported-platform',
     };
   }
 
@@ -239,32 +324,120 @@ export async function prepareIsolatedPatch(options = {}) {
 
   runFault('after-preconditions', { journal });
 
-  // 3. Manifest verification & fingerprint assertion
-  let manifest = providedManifest;
-  let resolvedPatchPath = providedPatchPath;
-  if (!manifest) {
-    const pkgCheck = await verifyPatchManifest(BUNDLED_MANIFEST_PATH);
-    if (!pkgCheck.ok || !pkgCheck.manifest) {
-      return {
-        ok: false,
-        error: `Distribution package manifest verification failed: ${pkgCheck.errors.join('; ')}`,
-        code: 'manifest-verification-failed',
-      };
-    }
-    manifest = pkgCheck.manifest;
-    if (!resolvedPatchPath) {
-      resolvedPatchPath = path.resolve(path.dirname(BUNDLED_MANIFEST_PATH), manifest.patches.runtime.patchFile);
-    }
-  } else if (!resolvedPatchPath) {
-    resolvedPatchPath = path.resolve(path.dirname(BUNDLED_MANIFEST_PATH), manifest.patches.runtime.patchFile);
+  // 3. Certified Manifest and Patch Authentication (Finding B)
+  const pkgCheck = await verifyPatchManifest(BUNDLED_MANIFEST_PATH);
+  if (!pkgCheck.ok || !pkgCheck.manifest) {
+    return {
+      ok: false,
+      error: `Distribution package manifest verification failed: ${pkgCheck.errors.join('; ')}`,
+      code: 'manifest-verification-failed',
+    };
   }
-
-  const patchEntry = manifest.patches?.runtime;
+  const certifiedManifest = pkgCheck.manifest;
+  const patchEntry = certifiedManifest.patches?.runtime;
   if (!patchEntry) {
     return {
       ok: false,
-      error: 'Manifest missing runtime patch configuration',
+      error: 'Certified manifest missing runtime patch configuration',
       code: 'manifest-invalid',
+    };
+  }
+
+  // Caller override policy: reject unauthenticated overrides before executing any patch
+  if (providedManifest !== null) {
+    if (
+      providedManifest.releaseCommit !== certifiedManifest.releaseCommit ||
+      providedManifest.patches?.runtime?.sha256 !== patchEntry.sha256 ||
+      providedManifest.patches?.runtime?.original?.sha256 !== patchEntry.original?.sha256 ||
+      providedManifest.patches?.runtime?.expected?.sha256 !== patchEntry.expected?.sha256
+    ) {
+      return {
+        ok: false,
+        error: 'Caller-supplied manifest does not match certified distribution package',
+        code: 'unauthenticated-manifest-override',
+      };
+    }
+  }
+
+  const certifiedPatchPath = path.resolve(path.dirname(BUNDLED_MANIFEST_PATH), patchEntry.patchFile);
+
+  if (providedPatchPath !== null) {
+    const normProvided = path.resolve(providedPatchPath);
+    if (normProvided !== certifiedPatchPath) {
+      return {
+        ok: false,
+        error: `Caller-supplied patchPath "${providedPatchPath}" does not match certified patch "${certifiedPatchPath}"`,
+        code: 'unauthenticated-patch-override',
+      };
+    }
+  }
+
+  // Safe descriptor read and verification of certified packaged patch
+  const patchLstat = getPathLstat(certifiedPatchPath);
+  if (patchLstat.error) {
+    return {
+      ok: false,
+      error: `Failed to inspect certified patch file: ${patchLstat.error.message}`,
+      code: 'tampered-patch-file',
+    };
+  }
+  if (!patchLstat.exists || !patchLstat.isFile || patchLstat.isSymbolicLink) {
+    return {
+      ok: false,
+      error: `Certified patch file "${certifiedPatchPath}" is missing, not a regular file, or is a symbolic link`,
+      code: 'tampered-patch-file',
+    };
+  }
+
+  let patchBytes;
+  try {
+    const patchFd = fs.openSync(certifiedPatchPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const pStat = fs.fstatSync(patchFd);
+      if (!pStat.isFile() || pStat.isSymbolicLink()) {
+        return {
+          ok: false,
+          error: 'Certified patch descriptor is not a regular file',
+          code: 'tampered-patch-file',
+        };
+      }
+      if (pStat.size !== patchEntry.sizeBytes) {
+        return {
+          ok: false,
+          error: `Certified patch file size mismatch: got ${pStat.size}, expected ${patchEntry.sizeBytes}`,
+          code: 'tampered-patch-file',
+        };
+      }
+      patchBytes = Buffer.alloc(pStat.size);
+      let readBytes = 0;
+      while (readBytes < pStat.size) {
+        const n = fs.readSync(patchFd, patchBytes, readBytes, pStat.size - readBytes, readBytes);
+        if (n === 0) break;
+        readBytes += n;
+      }
+      if (readBytes !== pStat.size) {
+        return {
+          ok: false,
+          error: 'Unexpected short read from certified patch file',
+          code: 'tampered-patch-file',
+        };
+      }
+    } finally {
+      fs.closeSync(patchFd);
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Failed to read certified patch file: ${err.message}`,
+      code: 'tampered-patch-file',
+    };
+  }
+
+  if (computeSha256(patchBytes) !== patchEntry.sha256.toLowerCase()) {
+    return {
+      ok: false,
+      error: `Certified patch SHA-256 digest mismatch: expected "${patchEntry.sha256}"`,
+      code: 'tampered-patch-file',
     };
   }
 
@@ -294,15 +467,137 @@ export async function prepareIsolatedPatch(options = {}) {
     };
   }
 
-  // 4. Staging directories setup and exclusive allocation
+  // 4. Staging Directories Setup and Strict Path Safety (Finding C)
+  if (!isSafeRelativePath(journal.targetFile)) {
+    return {
+      ok: false,
+      error: `Journal targetFile "${journal.targetFile}" is not a safe relative path`,
+      code: 'invalid-target-file',
+    };
+  }
+
+  const absLiveTarget = path.resolve(repoRoot, journal.targetFile);
+  if (!absLiveTarget.startsWith(path.resolve(repoRoot) + path.sep)) {
+    return {
+      ok: false,
+      error: `Live target file "${absLiveTarget}" escapes repository root`,
+      code: 'target-path-escape',
+    };
+  }
+
+  // Validate all parent directory components of targetFile relative to repoRoot
+  const targetRelDir = path.dirname(journal.targetFile);
+  if (targetRelDir !== '.' && targetRelDir !== '') {
+    const segments = targetRelDir.split('/');
+    let currentRel = '';
+    for (const seg of segments) {
+      currentRel = currentRel ? `${currentRel}/${seg}` : seg;
+      const absSeg = path.resolve(repoRoot, currentRel);
+      const segCheck = getPathLstat(absSeg);
+      if (segCheck.error) {
+        return {
+          ok: false,
+          error: `Failed to inspect target parent component "${currentRel}": ${segCheck.error.message}`,
+          code: 'inspection-error',
+        };
+      }
+      if (!segCheck.exists) {
+        return {
+          ok: false,
+          error: `Target parent directory "${currentRel}" does not exist`,
+          code: 'source-parent-missing',
+        };
+      }
+      if (segCheck.isSymbolicLink) {
+        return {
+          ok: false,
+          error: `Target parent directory "${currentRel}" is a symbolic link`,
+          code: 'unsafe-symlink',
+        };
+      }
+      if (!segCheck.isDirectory) {
+        return {
+          ok: false,
+          error: `Target parent path "${currentRel}" is not a directory`,
+          code: 'invalid-source-parent',
+        };
+      }
+    }
+  }
+
+  const ciPatchCheck = validateCiPatchPath(repoRoot);
+  if (!ciPatchCheck.ok || !ciPatchCheck.exists || !ciPatchCheck.isDirectory || ciPatchCheck.isSymlink) {
+    return {
+      ok: false,
+      error: ciPatchCheck.error || 'Installer directory (.ci-patch) is invalid, missing, or is a symbolic link',
+      code: ciPatchCheck.isSymlink ? 'unsafe-symlink' : 'invalid-installer-dir',
+    };
+  }
+
   const ciPatchDir = getCiPatchDir(repoRoot);
   const stagingBaseDir = path.join(ciPatchDir, 'staging');
   const stagingTxDir = path.join(stagingBaseDir, txId);
   const targetBase = path.basename(journal.targetFile);
   const isolatedStagedFile = path.join(stagingTxDir, targetBase);
 
+  // Validate .ci-patch/staging
+  const stagingBaseCheck = getPathLstat(stagingBaseDir);
+  if (stagingBaseCheck.error && stagingBaseCheck.error.code !== 'ENOENT') {
+    return {
+      ok: false,
+      error: `Failed to inspect staging parent directory (.ci-patch/staging): ${stagingBaseCheck.error.message}`,
+      code: 'inspection-error',
+    };
+  }
+  if (stagingBaseCheck.isSymbolicLink) {
+    return {
+      ok: false,
+      error: 'Staging directory (.ci-patch/staging) is a symbolic link',
+      code: 'unsafe-symlink',
+    };
+  }
+  if (stagingBaseCheck.exists && !stagingBaseCheck.isDirectory) {
+    return {
+      ok: false,
+      error: 'Staging path (.ci-patch/staging) exists but is not a directory',
+      code: 'invalid-staging-dir',
+    };
+  }
+
+  if (!stagingBaseCheck.exists) {
+    try {
+      fs.mkdirSync(stagingBaseDir, { mode: 0o700 });
+    } catch (mkdirErr) {
+      return {
+        ok: false,
+        error: `Failed to create staging parent directory: ${mkdirErr.message}`,
+        code: mkdirErr.code || 'staging-dir-failed',
+      };
+    }
+    const verifyBase = getPathLstat(stagingBaseDir);
+    if (!verifyBase.exists || !verifyBase.isDirectory || verifyBase.isSymbolicLink) {
+      return {
+        ok: false,
+        error: 'Staging parent directory verification failed after creation',
+        code: 'staging-dir-failed',
+      };
+    }
+    const syncRes = syncPathDurable(ciPatchDir, 'staging-parent', true, runFault);
+    if (!syncRes.ok) {
+      return syncRes;
+    }
+  }
+
+  // Validate .ci-patch/staging/<txId>
   const txDirCheck = getPathLstat(stagingTxDir);
-  if (txDirCheck.exists) {
+  if (txDirCheck.error && txDirCheck.error.code !== 'ENOENT') {
+    return {
+      ok: false,
+      error: `Failed to inspect staging transaction directory: ${txDirCheck.error.message}`,
+      code: 'inspection-error',
+    };
+  }
+  if (txDirCheck.exists || txDirCheck.isSymbolicLink) {
     return {
       ok: false,
       error: `Staging directory already exists for transaction "${txId}" (collision)`,
@@ -311,10 +606,6 @@ export async function prepareIsolatedPatch(options = {}) {
   }
 
   runFault('before-dir-allocation', { stagingTxDir });
-
-  if (!fs.existsSync(stagingBaseDir)) {
-    fs.mkdirSync(stagingBaseDir, { mode: 0o700, recursive: true });
-  }
 
   try {
     fs.mkdirSync(stagingTxDir, { mode: 0o700 });
@@ -326,30 +617,23 @@ export async function prepareIsolatedPatch(options = {}) {
     };
   }
 
-  // Flush stagingBaseDir directory entry
-  try {
-    const baseFd = fs.openSync(stagingBaseDir, 'r');
-    try {
-      fs.fsyncSync(baseFd);
-    } finally {
-      fs.closeSync(baseFd);
-    }
-  } catch {
-    // ignore
+  const verifyTxDir = getPathLstat(stagingTxDir);
+  if (!verifyTxDir.exists || !verifyTxDir.isDirectory || verifyTxDir.isSymbolicLink) {
+    return {
+      ok: false,
+      error: 'Transaction staging directory verification failed after creation',
+      code: 'staging-dir-failed',
+    };
+  }
+
+  const txDirSync = syncPathDurable(stagingBaseDir, 'staging-txdir-parent', true, runFault);
+  if (!txDirSync.ok) {
+    return txDirSync;
   }
 
   runFault('after-dir-allocation', { stagingTxDir });
 
   // 5. Source acquisition via bounded descriptor reader
-  const absLiveTarget = path.resolve(repoRoot, journal.targetFile);
-  if (!absLiveTarget.startsWith(path.resolve(repoRoot) + path.sep)) {
-    return {
-      ok: false,
-      error: `Live target file "${absLiveTarget}" escapes repository root`,
-      code: 'target-path-escape',
-    };
-  }
-
   runFault('before-source-read', { absLiveTarget });
 
   let liveSource;
@@ -381,14 +665,14 @@ export async function prepareIsolatedPatch(options = {}) {
 
   runFault('after-source-read', { liveSource });
 
-  // 6. Isolated source file creation
+  // 6. Isolated source file creation & initial synchronization (Finding A & C)
   runFault('before-file-create', { isolatedStagedFile });
 
   let stagedFd = null;
   try {
     stagedFd = fs.openSync(
       isolatedStagedFile,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
       0o600
     );
 
@@ -408,7 +692,18 @@ export async function prepareIsolatedPatch(options = {}) {
       }
       written += bytesWritten;
     }
-    fs.fsyncSync(stagedFd);
+
+    try {
+      fs.fsyncSync(stagedFd);
+    } catch (syncErr) {
+      if (syncErr?._isFault) throw syncErr;
+      return {
+        ok: false,
+        error: `Failed to synchronize staged source file: ${syncErr.message}`,
+        code: syncErr.code || 'fsync-failed',
+        stage: 'sync-initial-staged-file',
+      };
+    }
   } catch (writeErr) {
     if (writeErr?._isFault) {
       throw writeErr;
@@ -429,36 +724,32 @@ export async function prepareIsolatedPatch(options = {}) {
     }
   }
 
-  // Flush stagingTxDir directory entry
-  try {
-    const txDirFd = fs.openSync(stagingTxDir, 'r');
-    try {
-      fs.fsyncSync(txDirFd);
-    } finally {
-      fs.closeSync(txDirFd);
-    }
-  } catch {
-    // ignore
+  const stagedPostStat = getPathLstat(isolatedStagedFile);
+  if (!stagedPostStat.exists || !stagedPostStat.isFile || stagedPostStat.isSymbolicLink) {
+    return {
+      ok: false,
+      error: 'Staged source file verification failed after write',
+      code: 'invalid-staged-result',
+    };
+  }
+
+  const initialTxSync = syncPathDurable(stagingTxDir, 'initial-staged-txdir', true, runFault);
+  if (!initialTxSync.ok) {
+    return initialTxSync;
   }
 
   runFault('after-file-create', { isolatedStagedFile });
 
   // 7. Native Git patch application
-  if (!fs.existsSync(resolvedPatchPath)) {
-    return {
-      ok: false,
-      error: `Patch file not found: "${resolvedPatchPath}"`,
-      code: 'patch-file-not-found',
-    };
-  }
+  const patchPathForGit = _testCorruptPatchPath || certifiedPatchPath;
 
-  runFault('before-git-apply', { isolatedStagedFile, resolvedPatchPath });
+  runFault('before-git-apply', { isolatedStagedFile, resolvedPatchPath: patchPathForGit });
 
   const gitArgs = ['--no-optional-locks', '-C', stagingTxDir, 'apply', '-p3'];
   if (op === 'remove') {
     gitArgs.push('-R');
   }
-  gitArgs.push(resolvedPatchPath);
+  gitArgs.push(patchPathForGit);
 
   const scrubbedEnv = {
     PATH: process.env.PATH,
@@ -486,7 +777,7 @@ export async function prepareIsolatedPatch(options = {}) {
 
   runFault('after-git-apply', { stagingTxDir });
 
-  // 8. Prepared output verification
+  // 8. Prepared output verification, permissions, and synchronization (Finding A & C)
   let childrenAfter;
   try {
     childrenAfter = fs.readdirSync(stagingTxDir);
@@ -506,23 +797,35 @@ export async function prepareIsolatedPatch(options = {}) {
     };
   }
 
-  const postStatCheck = getPathLstat(isolatedStagedFile);
-  if (!postStatCheck.exists || !postStatCheck.isFile || postStatCheck.isSymbolicLink) {
-    return {
-      ok: false,
-      error: 'Staged result file is missing, not a regular file, or is a symbolic link',
-      code: 'invalid-staged-result',
-    };
-  }
-
+  let postFd = null;
   try {
-    fs.chmodSync(isolatedStagedFile, 0o600);
-  } catch (chmodErr) {
+    postFd = fs.openSync(isolatedStagedFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const postStat = fs.fstatSync(postFd);
+    if (!postStat.isFile() || postStat.isSymbolicLink()) {
+      return {
+        ok: false,
+        error: 'Staged result descriptor is missing, not a regular file, or is a symbolic link',
+        code: 'invalid-staged-result',
+      };
+    }
+    fs.fchmodSync(postFd, 0o600);
+    fs.fsyncSync(postFd);
+  } catch (permErr) {
+    if (permErr?._isFault) throw permErr;
     return {
       ok: false,
-      error: `Failed to establish 0600 permissions on staged file: ${chmodErr.message}`,
-      code: 'chmod-failed',
+      error: `Failed to establish permissions and synchronize staged result descriptor: ${permErr.message}`,
+      code: permErr.code || 'fsync-failed',
+      stage: 'sync-output-file',
     };
+  } finally {
+    if (postFd !== null) {
+      try {
+        fs.closeSync(postFd);
+      } catch {
+        // ignore
+      }
+    }
   }
 
   let stagedResult;
@@ -552,30 +855,25 @@ export async function prepareIsolatedPatch(options = {}) {
     };
   }
 
-  // Synchronize file and directory entries
-  try {
-    const fileFd = fs.openSync(isolatedStagedFile, 'r');
-    try {
-      fs.fsyncSync(fileFd);
-    } finally {
-      fs.closeSync(fileFd);
-    }
+  // Synchronize file and directory entries strictly (Finding A)
+  const syncFile = syncPathDurable(isolatedStagedFile, 'output-file', false, runFault);
+  if (!syncFile.ok) {
+    return syncFile;
+  }
 
-    const txDirFd = fs.openSync(stagingTxDir, 'r');
-    try {
-      fs.fsyncSync(txDirFd);
-    } finally {
-      fs.closeSync(txDirFd);
-    }
+  const syncTxDir = syncPathDurable(stagingTxDir, 'output-txdir', true, runFault);
+  if (!syncTxDir.ok) {
+    return syncTxDir;
+  }
 
-    const baseFd = fs.openSync(stagingBaseDir, 'r');
-    try {
-      fs.fsyncSync(baseFd);
-    } finally {
-      fs.closeSync(baseFd);
-    }
-  } catch {
-    // ignore
+  const syncStagingParent = syncPathDurable(stagingBaseDir, 'output-staging-parent', true, runFault);
+  if (!syncStagingParent.ok) {
+    return syncStagingParent;
+  }
+
+  const syncCiPatch = syncPathDurable(ciPatchDir, 'output-ci-patch', true, runFault);
+  if (!syncCiPatch.ok) {
+    return syncCiPatch;
   }
 
   runFault('after-output-verification', { stagedResult });

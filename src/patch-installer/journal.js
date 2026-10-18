@@ -258,7 +258,9 @@ export function validateJournalStructure(journal) {
     errors.push(`Invalid updatedAt timestamp: "${journal.updatedAt}"`);
   }
 
-  // Check auxiliary fields
+  // Check auxiliary fields and phase-bound metadata rules
+  const isLegacy = typeof journal.stagedPath === 'string';
+
   for (const [k, v] of Object.entries(journal)) {
     if (IMMUTABLE_JOURNAL_FIELDS.includes(k) || k === 'updatedAt') {
       continue;
@@ -272,7 +274,83 @@ export function validateJournalStructure(journal) {
     }
   }
 
-  return { valid: errors.length === 0, errors };
+  if (isLegacy) {
+    if (journal.stagedPath.trim() === '') {
+      errors.push('Legacy property "stagedPath" must be a non-empty string');
+    }
+    if (journal.isolatedStagedPath || journal.backupPath || journal.targetMode || journal.destinationStagedPath) {
+      errors.push('Cannot mix legacy "stagedPath" with current transaction auxiliary metadata');
+    }
+  } else if (PERMITTED_PHASES.includes(journal.phase)) {
+    // Current-schema phase-bound resource metadata rules
+    const phase = journal.phase;
+    const requiredByPhase = {
+      LOCKED: [],
+      ISOLATED_PREPARED: ['isolatedStagedPath'],
+      BACKUP_CREATED: ['isolatedStagedPath', 'backupPath', 'targetMode'],
+      READY_TO_SWAP: ['isolatedStagedPath', 'backupPath', 'targetMode', 'destinationStagedPath'],
+      SWAPPED: ['isolatedStagedPath', 'backupPath', 'targetMode', 'destinationStagedPath'],
+      COMPLETED: ['isolatedStagedPath', 'backupPath', 'targetMode', 'destinationStagedPath'],
+    };
+
+    const disallowedByPhase = {
+      LOCKED: ['isolatedStagedPath', 'backupPath', 'targetMode', 'destinationStagedPath'],
+      ISOLATED_PREPARED: ['backupPath', 'targetMode', 'destinationStagedPath'],
+      BACKUP_CREATED: ['destinationStagedPath'],
+      READY_TO_SWAP: [],
+      SWAPPED: [],
+      COMPLETED: [],
+    };
+
+    const required = requiredByPhase[phase] || [];
+    for (const reqField of required) {
+      if (typeof journal[reqField] !== 'string' || journal[reqField].trim() === '') {
+        errors.push(`Missing mandatory auxiliary field for phase "${phase}": "${reqField}"`);
+      }
+    }
+
+    const disallowed = disallowedByPhase[phase] || [];
+    for (const disField of disallowed) {
+      if (journal[disField] !== undefined) {
+        errors.push(`Disallowed premature or extraneous auxiliary field in phase "${phase}": "${disField}"`);
+      }
+    }
+
+    // Path containment and exact format validation
+    if (
+      typeof journal.targetFile === 'string' &&
+      journal.targetFile.trim() !== '' &&
+      typeof journal.txId === 'string' &&
+      journal.txId.trim() !== ''
+    ) {
+      const targetBase = path.basename(journal.targetFile.trim());
+      const targetDir = path.dirname(journal.targetFile.trim());
+      const txId = journal.txId.trim();
+
+      if (journal.isolatedStagedPath !== undefined) {
+        const expected = `.ci-patch/staging/${txId}/${targetBase}`;
+        if (journal.isolatedStagedPath !== expected) {
+          errors.push(`Invalid isolatedStagedPath "${journal.isolatedStagedPath}": must strictly equal "${expected}"`);
+        }
+      }
+
+      if (journal.backupPath !== undefined) {
+        const expected = `.ci-patch/backup/${txId}/${targetBase}`;
+        if (journal.backupPath !== expected) {
+          errors.push(`Invalid backupPath "${journal.backupPath}": must strictly equal "${expected}"`);
+        }
+      }
+
+      if (journal.destinationStagedPath !== undefined) {
+        const expected = `${targetDir}/.${targetBase}.ci-staged-${txId}.tmp`;
+        if (journal.destinationStagedPath !== expected) {
+          errors.push(`Invalid destinationStagedPath "${journal.destinationStagedPath}": must strictly equal "${expected}"`);
+        }
+      }
+    }
+  }
+
+  return { valid: errors.length === 0, errors, isLegacy };
 }
 
 /**
@@ -394,6 +472,7 @@ export function inspectJournal(repoRoot) {
         hasJournal: true,
         isValid: false,
         isSymlink: false,
+        isLegacy: Boolean(val.isLegacy),
         journal: parsed,
         journalPath,
         errors: val.errors,
@@ -404,6 +483,7 @@ export function inspectJournal(repoRoot) {
       hasJournal: true,
       isValid: true,
       isSymlink: false,
+      isLegacy: Boolean(val.isLegacy),
       journal: parsed,
       journalPath,
       errors: [],
