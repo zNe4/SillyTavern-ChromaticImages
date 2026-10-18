@@ -3418,5 +3418,104 @@ describe('P3B-2A-F1: Phase-Aware Persisted Journal Validation (validateJournalSt
   });
 });
 
+describe('P3B-2B: Read-Only Incomplete and Corrupted Backup State Classification (transaction-state.js)', () => {
+  const stockSha = '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43';
+  const patchedSha = '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6';
+  test('interrupted backup preparation in ISOLATED_PREPARED is classified as incomplete-transaction', () => {
+    const repo = createTempDir('tx-incomplete-backup-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
 
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
 
+    const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+    fs.mkdirSync(txStagingDir, { recursive: true });
+    fs.writeFileSync(path.join(txStagingDir, 'stable-diffusion.js'), 'code', 'utf8');
+
+    // Case 1: Empty backup parent directory exists
+    fs.mkdirSync(path.join(repo, '.ci-patch/backup'), { recursive: true });
+    let state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+
+    // Case 2: Empty transaction backup directory exists
+    const txBackupDir = path.join(repo, '.ci-patch/backup', txId);
+    fs.mkdirSync(txBackupDir, { recursive: true });
+    state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+
+    // Case 3: Target artifact written in backup before journal advancement
+    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js'), 'backup-bytes', 'utf8');
+    state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+  });
+
+  test('corrupt or missing backup file in BACKUP_CREATED is classified as incomplete-transaction', () => {
+    const repo = createTempDir('tx-corrupt-backup-');
+    const txId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'ISOLATED_PREPARED',
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      lease,
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId,
+      nextPhase: 'BACKUP_CREATED',
+      metadataUpdate: {
+        backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`,
+        targetMode: '0644',
+      },
+      lease,
+    });
+
+    const txStagingDir = path.join(repo, '.ci-patch/staging', txId);
+    fs.mkdirSync(txStagingDir, { recursive: true });
+    fs.writeFileSync(path.join(txStagingDir, 'stable-diffusion.js'), 'code', 'utf8');
+
+    // Case 1: Missing backup file on disk (backup directory exists but is empty)
+    const txBackupDir = path.join(repo, '.ci-patch/backup', txId);
+    fs.mkdirSync(txBackupDir, { recursive: true });
+    let state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Missing backup artifact in phase "BACKUP_CREATED"')));
+
+    // Case 2: Corrupt backup file on disk (wrong SHA-256)
+    fs.writeFileSync(path.join(txBackupDir, 'stable-diffusion.js'), 'corrupted-data', 'utf8');
+    state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Corrupted backup artifact in phase "BACKUP_CREATED"')));
+  });
+});

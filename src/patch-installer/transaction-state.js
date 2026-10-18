@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import {
   getCiPatchDir,
   validateCiPatchPath,
@@ -369,6 +370,14 @@ export function inspectTransactionState(repoRoot) {
     hasInspectionError = true;
     inspectionErrors.push(`Failed to inspect backup path (.ci-patch/backup): ${backupCheck.error.message}`);
     reasons.push(`Failed to inspect backup path (.ci-patch/backup): ${backupCheck.error.message}`);
+  } else if (!backupCheck.exists) {
+    if (hasLock && lockInspection.isValid && hasJournal && journalInspection.isValid && !isMismatched) {
+      const jObj = journalInspection.journal;
+      if (jObj && jObj.phase === 'BACKUP_CREATED') {
+        isIncompleteTransaction = true;
+        reasons.push('Missing backup directory in phase "BACKUP_CREATED": ".ci-patch/backup" does not exist');
+      }
+    }
   } else if (backupCheck.exists) {
     if (backupCheck.isSymbolicLink) {
       hasUnsafeSymlink = true;
@@ -379,80 +388,158 @@ export function inspectTransactionState(repoRoot) {
     } else {
       try {
         const backupEntries = fs.readdirSync(backupPath);
-        if (backupEntries.length > 0) {
-          if (!hasLock || !lockInspection.isValid || !lockInspection.owner) {
-            orphanedArtifacts.push(...backupEntries.map((e) => `backup/${e}`));
-            reasons.push(`Non-empty backup directory detected with no active valid transaction: ${backupEntries.join(', ')}`);
-          } else {
-            const expectedTxId = lockInspection.owner.txId;
-            for (const bEntry of backupEntries) {
-              const bSubPath = path.join(backupPath, bEntry);
-              const bSubCheck = getPathLstat(bSubPath);
+        if (backupEntries.length === 0) {
+          if (hasLock && lockInspection.isValid && hasJournal && journalInspection.isValid && !isMismatched) {
+            const jObj = journalInspection.journal;
+            if (jObj && jObj.phase === 'ISOLATED_PREPARED') {
+              isIncompleteTransaction = true;
+              reasons.push(
+                'Interrupted backup preparation detected: empty backup parent directory exists in phase "ISOLATED_PREPARED" prior to transaction backup directory creation'
+              );
+            } else if (jObj && jObj.phase === 'BACKUP_CREATED') {
+              isIncompleteTransaction = true;
+              reasons.push(
+                'Missing backup transaction directory in phase "BACKUP_CREATED": ".ci-patch/backup" is empty'
+              );
+            }
+          }
+        } else if (!hasLock || !lockInspection.isValid || !lockInspection.owner) {
+          orphanedArtifacts.push(...backupEntries.map((e) => `backup/${e}`));
+          reasons.push(`Non-empty backup directory detected with no active valid transaction: ${backupEntries.join(', ')}`);
+        } else {
+          const expectedTxId = lockInspection.owner.txId;
+          const journalObj = (hasJournal && journalInspection.isValid && !isMismatched) ? journalInspection.journal : null;
 
-              if (bSubCheck.error) {
-                hasInspectionError = true;
-                inspectionErrors.push(`Failed to inspect backup component (backup/${bEntry}): ${bSubCheck.error.message}`);
-                reasons.push(`Failed to inspect backup component (backup/${bEntry}): ${bSubCheck.error.message}`);
-              } else if (bSubCheck.isSymbolicLink) {
-                hasUnsafeSymlink = true;
-                reasons.push(`Backup component (backup/${bEntry}) is a symbolic link`);
-              } else if (bEntry !== expectedTxId) {
-                orphanedArtifacts.push(`backup/${bEntry}`);
-                reasons.push(`Backup entry "${bEntry}" does not match active transaction "${expectedTxId}"`);
-              } else if (!bSubCheck.isDirectory) {
-                orphanedArtifacts.push(`backup/${bEntry}`);
-                reasons.push(`Backup entry "backup/${bEntry}" is not a directory`);
-              } else {
-                // Inspect inside backup/<txId>
-                try {
-                  const txChildren = fs.readdirSync(bSubPath);
+          if (journalObj && journalObj.phase === 'BACKUP_CREATED' && !backupEntries.includes(expectedTxId)) {
+            isIncompleteTransaction = true;
+            reasons.push(`Missing backup directory for active transaction "${expectedTxId}" in phase "BACKUP_CREATED"`);
+          }
 
-                  if (txChildren.length > 0) {
-                    if (!hasJournal || !journalInspection.isValid || !journalInspection.journal || isMismatched) {
-                      orphanedArtifacts.push(...txChildren.map((c) => `backup/${bEntry}/${c}`));
-                      reasons.push(`Backup directory for "${expectedTxId}" contains artifacts but journal is missing, invalid, or mismatched`);
-                    } else {
-                      const journalObj = journalInspection.journal;
+          for (const bEntry of backupEntries) {
+            const bSubPath = path.join(backupPath, bEntry);
+            const bSubCheck = getPathLstat(bSubPath);
 
-                      // Phase consistency: in 'LOCKED' or 'ISOLATED_PREPARED', backup has not been created yet!
-                      if (journalObj.phase === 'LOCKED' || journalObj.phase === 'ISOLATED_PREPARED') {
-                        orphanedArtifacts.push(...txChildren.map((c) => `backup/${bEntry}/${c}`));
-                        reasons.push(`Backup directory contains artifacts in phase "${journalObj.phase}" before backup creation: ${txChildren.join(', ')}`);
+            if (bSubCheck.error) {
+              hasInspectionError = true;
+              inspectionErrors.push(`Failed to inspect backup component (backup/${bEntry}): ${bSubCheck.error.message}`);
+              reasons.push(`Failed to inspect backup component (backup/${bEntry}): ${bSubCheck.error.message}`);
+            } else if (bSubCheck.isSymbolicLink) {
+              hasUnsafeSymlink = true;
+              reasons.push(`Backup component (backup/${bEntry}) is a symbolic link`);
+            } else if (bEntry !== expectedTxId) {
+              orphanedArtifacts.push(`backup/${bEntry}`);
+              reasons.push(`Backup entry "${bEntry}" does not match active transaction "${expectedTxId}"`);
+            } else if (!bSubCheck.isDirectory) {
+              orphanedArtifacts.push(`backup/${bEntry}`);
+              reasons.push(`Backup entry "backup/${bEntry}" is not a directory`);
+            } else {
+              // Inspect inside backup/<txId>
+              try {
+                const txChildren = fs.readdirSync(bSubPath);
+
+                if (txChildren.length === 0) {
+                  if (journalObj) {
+                    if (journalObj.phase === 'ISOLATED_PREPARED') {
+                      isIncompleteTransaction = true;
+                      reasons.push(
+                        `Interrupted backup preparation detected: empty backup directory for active transaction "${expectedTxId}" in phase "ISOLATED_PREPARED" prior to backup file creation`
+                      );
+                    } else if (journalObj.phase === 'BACKUP_CREATED') {
+                      isIncompleteTransaction = true;
+                      reasons.push(
+                        `Missing backup artifact in phase "BACKUP_CREATED": backup directory for transaction "${expectedTxId}" is empty`
+                      );
+                    }
+                  }
+                } else if (!hasJournal || !journalInspection.isValid || !journalInspection.journal || isMismatched) {
+                  orphanedArtifacts.push(...txChildren.map((c) => `backup/${bEntry}/${c}`));
+                  reasons.push(`Backup directory for "${expectedTxId}" contains artifacts but journal is missing, invalid, or mismatched`);
+                } else {
+                  // Phase consistency:
+                  if (journalObj.phase === 'LOCKED') {
+                    orphanedArtifacts.push(...txChildren.map((c) => `backup/${bEntry}/${c}`));
+                    reasons.push(`Backup directory contains artifacts in phase "LOCKED" before backup creation: ${txChildren.join(', ')}`);
+                  } else if (journalObj.phase === 'ISOLATED_PREPARED') {
+                    const expectedTargetBase = path.basename(journalObj.targetFile || '');
+                    for (const cEntry of txChildren) {
+                      const cPath = path.join(bSubPath, cEntry);
+                      const cCheck = getPathLstat(cPath);
+
+                      if (cCheck.error) {
+                        hasInspectionError = true;
+                        inspectionErrors.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
+                        reasons.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
+                      } else if (cCheck.isSymbolicLink) {
+                        hasUnsafeSymlink = true;
+                        reasons.push(`Backup artifact (backup/${bEntry}/${cEntry}) is a symbolic link`);
+                      } else if (cCheck.isDirectory || !cCheck.isFile) {
+                        orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
+                        reasons.push(`Unexpected filesystem object in backup during ISOLATED_PREPARED phase: "backup/${bEntry}/${cEntry}"`);
+                      } else if (cEntry !== expectedTargetBase) {
+                        orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
+                        reasons.push(`Unexpected regular file in backup during ISOLATED_PREPARED phase: "backup/${bEntry}/${cEntry}" (expected: ${expectedTargetBase})`);
                       } else {
-                        const permittedBackupNames = getPermittedArtifactNames(journalObj, 'backup');
-                        for (const cEntry of txChildren) {
-                          const cPath = path.join(bSubPath, cEntry);
-                          const cCheck = getPathLstat(cPath);
+                        // Structurally consistent incomplete backup preparation (partially written or complete backup file before journal advancement)
+                        isIncompleteTransaction = true;
+                        reasons.push(`Interrupted backup preparation detected: backup directory for active transaction "${expectedTxId}" contains target artifact "${cEntry}" in phase "ISOLATED_PREPARED" prior to journal advancement`);
+                      }
+                    }
+                  } else {
+                    const permittedBackupNames = getPermittedArtifactNames(journalObj, 'backup');
+                    const expectedTargetBase = path.basename(journalObj.targetFile || '');
+                    let foundRegisteredBackup = false;
 
-                          if (cCheck.error) {
+                    for (const cEntry of txChildren) {
+                      const cPath = path.join(bSubPath, cEntry);
+                      const cCheck = getPathLstat(cPath);
+
+                      if (cCheck.error) {
+                        hasInspectionError = true;
+                        inspectionErrors.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
+                        reasons.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
+                      } else if (cCheck.isSymbolicLink) {
+                        hasUnsafeSymlink = true;
+                        reasons.push(`Backup artifact (backup/${bEntry}/${cEntry}) is a symbolic link`);
+                      } else if (cCheck.isDirectory) {
+                        orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
+                        reasons.push(`Unexpected subdirectory in backup: "backup/${bEntry}/${cEntry}"`);
+                      } else if (!cCheck.isFile) {
+                        orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
+                        reasons.push(`Unsupported filesystem object type in backup: "backup/${bEntry}/${cEntry}"`);
+                      } else if (!permittedBackupNames.has(cEntry)) {
+                        orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
+                        reasons.push(`Unexpected regular file in backup: "backup/${bEntry}/${cEntry}" (permitted: ${Array.from(permittedBackupNames).join(', ')})`);
+                      } else if (cEntry === expectedTargetBase) {
+                        foundRegisteredBackup = true;
+                        if (typeof journalObj.expectedInitialSha256 === 'string' && journalObj.expectedInitialSha256.trim() !== '') {
+                          try {
+                            const backupBytes = fs.readFileSync(cPath);
+                            const actualSha = crypto.createHash('sha256').update(backupBytes).digest('hex');
+                            if (actualSha.toLowerCase() !== journalObj.expectedInitialSha256.toLowerCase()) {
+                              isIncompleteTransaction = true;
+                              reasons.push(
+                                `Corrupted backup artifact in phase "${journalObj.phase}": "backup/${bEntry}/${cEntry}" SHA-256 (${actualSha}) does not match expected initial SHA-256 (${journalObj.expectedInitialSha256})`
+                              );
+                            }
+                          } catch (readErr) {
                             hasInspectionError = true;
-                            inspectionErrors.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
-                            reasons.push(`Failed to inspect backup artifact (backup/${bEntry}/${cEntry}): ${cCheck.error.message}`);
-                          } else if (cCheck.isSymbolicLink) {
-                            hasUnsafeSymlink = true;
-                            reasons.push(`Backup artifact (backup/${bEntry}/${cEntry}) is a symbolic link`);
-                          } else if (cCheck.isDirectory) {
-                            // Subdirectories are unexpected in P3B-1 flat backup contract
-                            orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
-                            reasons.push(`Unexpected subdirectory in backup: "backup/${bEntry}/${cEntry}"`);
-                          } else if (!cCheck.isFile) {
-                            // Unsupported filesystem object type (FIFO, socket, device)
-                            orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
-                            reasons.push(`Unsupported filesystem object type in backup: "backup/${bEntry}/${cEntry}"`);
-                          } else if (!permittedBackupNames.has(cEntry)) {
-                            // Unexpected regular file
-                            orphanedArtifacts.push(`backup/${bEntry}/${cEntry}`);
-                            reasons.push(`Unexpected regular file in backup: "backup/${bEntry}/${cEntry}" (permitted: ${Array.from(permittedBackupNames).join(', ')})`);
+                            inspectionErrors.push(`Failed to read backup artifact (backup/${bEntry}/${cEntry}): ${readErr.message}`);
+                            reasons.push(`Failed to read backup artifact (backup/${bEntry}/${cEntry}): ${readErr.message}`);
                           }
                         }
                       }
                     }
+
+                    if (journalObj.phase === 'BACKUP_CREATED' && !foundRegisteredBackup) {
+                      isIncompleteTransaction = true;
+                      reasons.push(`Missing backup artifact in phase "BACKUP_CREATED": "${expectedTargetBase}" not found in backup directory`);
+                    }
                   }
-                } catch (readErr) {
-                  hasInspectionError = true;
-                  inspectionErrors.push(`Failed to inspect backup contents for transaction ${bEntry}: ${readErr.message}`);
-                  reasons.push(`Failed to inspect backup contents for transaction ${bEntry}: ${readErr.message}`);
                 }
+              } catch (readErr) {
+                hasInspectionError = true;
+                inspectionErrors.push(`Failed to inspect backup contents for transaction ${bEntry}: ${readErr.message}`);
+                reasons.push(`Failed to inspect backup contents for transaction ${bEntry}: ${readErr.message}`);
               }
             }
           }
