@@ -21,8 +21,8 @@ import {
   computeSha256,
   computeGitBlobSha,
   applyPatchToIsolatedWorktree,
-  _setBundledManifestPathForTest,
 } from '../src/patch-installer/staging.js';
+import * as stagingModule from '../src/patch-installer/staging.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -289,71 +289,32 @@ describe('P3B-2A: Native Git Execution Isolation & Strip Invariants', () => {
     assert.equal(resNull.code, 'invalid-patch-bytes');
   });
 
-  test('replacing original patch pathname on disk after authentication does not affect in-memory Git execution', async () => {
-    const repo = setupDisposableRepo('git-tamper-after-read-');
-    const txId = generateTxId();
+  test('production manifest trust anchor is immutable and does not export test-seam overrides', () => {
+    assert.equal(typeof stagingModule._setBundledManifestPathForTest, 'undefined');
+    assert.equal(typeof stagingModule.setBundledManifestPathForTest, 'undefined');
+  });
 
-    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
-    fs.writeFileSync(liveTarget, authenticStock);
+  test('applyPatchToIsolatedWorktree executes in-memory patch buffer via stdin immune to disk changes', () => {
+    const tmpDir = createTempDir('git-apply-stdin-isolation-');
+    const targetFile = path.join(tmpDir, 'stable-diffusion.js');
+    fs.writeFileSync(targetFile, authenticStock);
 
-    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
-    createJournal({
-      repoRoot: repo,
-      txId,
-      op: 'apply',
-      targetFile: 'src/endpoints/stable-diffusion.js',
-      expectedInitialSha256: stockSha,
-      expectedResultSha256: patchedSha,
-      lease,
-    });
+    const tmpPatchFile = path.join(tmpDir, 'test.patch');
+    const originalPatchBytes = fs.readFileSync(path.join(path.dirname(BUNDLED_MANIFEST_PATH), 'runtime.patch'));
+    fs.writeFileSync(tmpPatchFile, originalPatchBytes);
 
-    // Create a disposable copy of the certified distribution package
-    const disposablePkg = createTempDir('disposable-pkg-');
-    const manifestSrc = BUNDLED_MANIFEST_PATH;
-    const patchSrc = path.join(path.dirname(manifestSrc), 'runtime.patch');
-    const testsPatchSrc = path.join(path.dirname(manifestSrc), 'tests.patch');
-    const disposableManifest = path.join(disposablePkg, 'manifest.json');
-    const disposablePatch = path.join(disposablePkg, 'runtime.patch');
-    const disposableTestsPatch = path.join(disposablePkg, 'tests.patch');
+    // Read bytes into memory
+    const inMemoryPatchBytes = fs.readFileSync(tmpPatchFile);
 
-    fs.copyFileSync(manifestSrc, disposableManifest);
-    fs.copyFileSync(patchSrc, disposablePatch);
-    fs.copyFileSync(testsPatchSrc, disposableTestsPatch);
+    // Corrupt the patch file on disk after in-memory read
+    fs.writeFileSync(tmpPatchFile, 'GARBAGE REPLACED ON DISK AFTER AUTHENTICATION\n');
 
-    _setBundledManifestPathForTest(disposableManifest);
+    // Apply patch using in-memory bytes
+    const res = applyPatchToIsolatedWorktree(tmpDir, inMemoryPatchBytes, 'apply');
+    assert.equal(res.ok, true);
 
-    try {
-      let overwritten = false;
-      const faultHook = (stage) => {
-        if (stage === 'after-patch-read') {
-          // Overwrite the patch file on disk with corrupt data after in-memory read/authentication
-          fs.writeFileSync(disposablePatch, 'GARBAGE REPLACED ON DISK AFTER AUTHENTICATION\n');
-          overwritten = true;
-        }
-      };
-
-      const prepRes = await prepareIsolatedPatch({
-        repoRoot: repo,
-        txId,
-        op: 'apply',
-        lease,
-        faultHook,
-      });
-
-      assert.equal(overwritten, true);
-      assert.equal(prepRes.ok, true);
-      assert.equal(prepRes.sha256, patchedSha);
-      assert.equal(prepRes.journal?.phase, 'ISOLATED_PREPARED');
-
-      // The on-disk patch file was indeed corrupted
-      assert.notEqual(computeSha256(fs.readFileSync(disposablePatch)), manifest.patches.runtime.sha256);
-
-      // But Git executed from in-memory authenticated buffer via stdin, so staged output is correct
-      const stagedFile = path.join(repo, prepRes.isolatedStagedPath);
-      assert.equal(computeSha256(fs.readFileSync(stagedFile)), patchedSha);
-    } finally {
-      _setBundledManifestPathForTest(null);
-    }
+    // Target file is correctly patched despite corrupted on-disk file
+    assert.equal(computeSha256(fs.readFileSync(targetFile)), patchedSha);
   });
 
   test('prepareIsolatedPatch ignores obsolete _testCorruptPatchPath bypass option', async () => {

@@ -35,17 +35,6 @@ const BUNDLED_MANIFEST_PATH = path.join(
 
 const MAX_SOURCE_FILE_BYTES = 50 * 1024 * 1024; // 50 MiB
 
-let bundledManifestPath = BUNDLED_MANIFEST_PATH;
-
-/**
- * Test-only seam to redirect manifest location to a disposable directory.
- * @internal
- * @param {string|null} customPath
- */
-export function _setBundledManifestPathForTest(customPath) {
-  bundledManifestPath = customPath || BUNDLED_MANIFEST_PATH;
-}
-
 /**
  * Compute SHA-256 lowercase hex digest.
  * @param {Buffer|string} data
@@ -416,7 +405,7 @@ export async function prepareIsolatedPatch(options = {}) {
   runFault('after-preconditions', { journal });
 
   // 3. Certified Manifest and Patch Authentication (Finding B)
-  const pkgCheck = await verifyPatchManifest(bundledManifestPath);
+  const pkgCheck = await verifyPatchManifest(BUNDLED_MANIFEST_PATH);
   if (!pkgCheck.ok || !pkgCheck.manifest) {
     return {
       ok: false,
@@ -450,7 +439,7 @@ export async function prepareIsolatedPatch(options = {}) {
     }
   }
 
-  const certifiedPatchPath = path.resolve(path.dirname(bundledManifestPath), patchEntry.patchFile);
+  const certifiedPatchPath = path.resolve(path.dirname(BUNDLED_MANIFEST_PATH), patchEntry.patchFile);
 
   if (providedPatchPath !== null) {
     const normProvided = path.resolve(providedPatchPath);
@@ -867,6 +856,8 @@ export async function prepareIsolatedPatch(options = {}) {
   // Steps 2 - 10: Retain verified open descriptor across content verification, permissions, sync, and identity check
   let stagedFd = null;
   let stagedResult = null;
+  let authenticatedDev = null;
+  let authenticatedIno = null;
   try {
     // Step 2: The staged file is opened with appropriate no-follow protection.
     const openFlags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
@@ -897,6 +888,8 @@ export async function prepareIsolatedPatch(options = {}) {
         code: 'invalid-file-identity',
       };
     }
+    authenticatedDev = preStat.dev;
+    authenticatedIno = preStat.ino;
     if (preStat.size > MAX_SOURCE_FILE_BYTES) {
       return {
         ok: false,
@@ -1078,6 +1071,57 @@ export async function prepareIsolatedPatch(options = {}) {
   const relIsolatedStagedPath = `.ci-patch/staging/${txId}/${targetBase}`;
 
   runFault('before-journal-advancement', { relIsolatedStagedPath });
+
+  // Final staged-path identity check immediately before journal publication (Finding B)
+  let finalPathStat;
+  try {
+    finalPathStat = fs.lstatSync(isolatedStagedFile);
+  } catch (lstatErr) {
+    if (lstatErr?.code === 'ENOENT') {
+      return {
+        ok: false,
+        error: `Staged pathname "${isolatedStagedFile}" missing immediately before journal advancement: ${lstatErr.message}`,
+        code: 'staged-pathname-missing',
+      };
+    }
+    return {
+      ok: false,
+      error: `Filesystem inspection error verifying staged pathname "${isolatedStagedFile}": ${lstatErr.message}`,
+      code: 'inspection-error',
+    };
+  }
+
+  if (finalPathStat.isSymbolicLink()) {
+    return {
+      ok: false,
+      error: `Staged pathname "${isolatedStagedFile}" was replaced by a symbolic link before journal advancement`,
+      code: 'unsafe-symlink',
+    };
+  }
+
+  if (!finalPathStat.isFile()) {
+    return {
+      ok: false,
+      error: `Staged pathname "${isolatedStagedFile}" is not a regular file before journal advancement`,
+      code: 'invalid-staged-result',
+    };
+  }
+
+  if (!isValidDeviceIdentifier(finalPathStat.dev) || !isValidInodeIdentifier(finalPathStat.ino)) {
+    return {
+      ok: false,
+      error: `Staged pathname "${isolatedStagedFile}" has invalid device or inode identity before journal advancement`,
+      code: 'invalid-file-identity',
+    };
+  }
+
+  if (finalPathStat.dev !== authenticatedDev || finalPathStat.ino !== authenticatedIno) {
+    return {
+      ok: false,
+      error: `Staged pathname "${isolatedStagedFile}" inode identity changed before journal advancement (expected dev:${authenticatedDev} ino:${authenticatedIno}, got dev:${finalPathStat.dev} ino:${finalPathStat.ino})`,
+      code: 'staged-identity-replaced',
+    };
+  }
 
   const advanceRes = advanceJournalPhase({
     repoRoot,

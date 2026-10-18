@@ -1215,3 +1215,183 @@ describe('P3B-2A-F2: Authenticated Patch Execution and Final Staged-File Identit
   });
 });
 
+describe('P3B-2A-F3: Final Staged-Path Verification Before Journal Advancement (Finding B)', () => {
+  if (!authenticStock) {
+    test.skip('Skipping authentic staging tests (authentic stock unavailable)', () => {});
+    return;
+  }
+
+  const faultHookPoints = [
+    {
+      name: 'after-output-verification',
+      getFile: (repo, txId, context) =>
+        context.stagedResult?.isolatedStagedPath
+          ? path.join(repo, context.stagedResult.isolatedStagedPath)
+          : path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js'),
+    },
+    {
+      name: 'before-journal-advancement',
+      getFile: (repo, txId, context) =>
+        context.relIsolatedStagedPath
+          ? path.join(repo, context.relIsolatedStagedPath)
+          : path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js'),
+    },
+  ];
+
+  for (const { name: hookPoint, getFile } of faultHookPoints) {
+    test(`removing staged pathname at "${hookPoint}" causes refusal with staged-pathname-missing`, async () => {
+      const repo = setupDisposableRepo(`f3-del-${hookPoint}-`);
+      const txId = generateTxId();
+      const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+      fs.writeFileSync(liveTarget, authenticStock);
+
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+      createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      const faultHook = (stage, context) => {
+        if (stage === hookPoint) {
+          const stagedFile = getFile(repo, txId, context);
+          fs.unlinkSync(stagedFile);
+        }
+      };
+
+      const res = await prepareIsolatedPatch({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+        faultHook,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'staged-pathname-missing');
+      assert.match(res.error, /missing immediately before journal advancement/);
+
+      // Invariant 1: Live target never modified
+      assert.equal(computeSha256(fs.readFileSync(liveTarget)), stockSha);
+
+      // Invariant 2: Journal remains strictly in phase LOCKED
+      const jInspection = inspectJournal(repo);
+      assert.equal(jInspection.journal?.phase, 'LOCKED');
+      assert.equal(jInspection.journal?.isolatedStagedPath, undefined);
+
+      // Invariant 3: Inspection fails closed with isPending true
+      const txState = inspectTransactionState(repo);
+      assert.equal(txState.isPending, true);
+    });
+
+    test(`replacing staged pathname with symbolic link at "${hookPoint}" causes refusal with unsafe-symlink`, async () => {
+      const repo = setupDisposableRepo(`f3-symlink-${hookPoint}-`);
+      const txId = generateTxId();
+      const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+      fs.writeFileSync(liveTarget, authenticStock);
+
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+      createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      const faultHook = (stage, context) => {
+        if (stage === hookPoint) {
+          const stagedFile = getFile(repo, txId, context);
+          fs.unlinkSync(stagedFile);
+          fs.symlinkSync(liveTarget, stagedFile);
+        }
+      };
+
+      const res = await prepareIsolatedPatch({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+        faultHook,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'unsafe-symlink');
+      assert.match(res.error, /replaced by a symbolic link before journal advancement/);
+
+      // Invariant 1: Live target never modified
+      assert.equal(computeSha256(fs.readFileSync(liveTarget)), stockSha);
+
+      // Invariant 2: Journal remains strictly in phase LOCKED
+      const jInspection = inspectJournal(repo);
+      assert.equal(jInspection.journal?.phase, 'LOCKED');
+      assert.equal(jInspection.journal?.isolatedStagedPath, undefined);
+
+      // Invariant 3: Inspection fails closed with isPending true
+      const txState = inspectTransactionState(repo);
+      assert.equal(txState.isPending, true);
+    });
+
+    test(`replacing staged pathname with different regular file at "${hookPoint}" causes refusal with staged-identity-replaced`, async () => {
+      const repo = setupDisposableRepo(`f3-replaced-${hookPoint}-`);
+      const txId = generateTxId();
+      const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+      fs.writeFileSync(liveTarget, authenticStock);
+
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+      createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      let replacedFile = null;
+      const faultHook = (stage, context) => {
+        if (stage === hookPoint) {
+          const stagedFile = getFile(repo, txId, context);
+          replacedFile = stagedFile;
+          fs.unlinkSync(stagedFile);
+          fs.writeFileSync(stagedFile, 'replaced with different file content\n');
+        }
+      };
+
+      const res = await prepareIsolatedPatch({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+        faultHook,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'staged-identity-replaced');
+      assert.match(res.error, /inode identity changed before journal advancement/);
+
+      // Invariant 1: Live target never modified
+      assert.equal(computeSha256(fs.readFileSync(liveTarget)), stockSha);
+
+      // Invariant 2: Journal remains strictly in phase LOCKED
+      const jInspection = inspectJournal(repo);
+      assert.equal(jInspection.journal?.phase, 'LOCKED');
+      assert.equal(jInspection.journal?.isolatedStagedPath, undefined);
+
+      // Invariant 3: Inspection fails closed with isPending true
+      const txState = inspectTransactionState(repo);
+      assert.equal(txState.isPending, true);
+
+      // Replacement file remains preserved on disk
+      assert.ok(fs.existsSync(replacedFile));
+    });
+  }
+});
+
