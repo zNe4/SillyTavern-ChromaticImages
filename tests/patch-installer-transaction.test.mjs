@@ -4449,5 +4449,86 @@ describe('P3B-2C: Destination Candidate Inspection & Lifecycle (transaction-stat
       fs.fstatSync = origFstatSync;
     }
   });
+
+  test('foreign transaction candidate in src/endpoints is classified as orphaned-artifact', () => {
+    const repo = createTempDir('tx-foreign-candidate-');
+    const endpointsDir = path.join(repo, 'src/endpoints');
+    fs.mkdirSync(endpointsDir, { recursive: true });
+
+    const activeTxId = generateTxId();
+    const foreignTxId = generateTxId();
+    const { lease } = acquireLock({ repoRoot: repo, txId: activeTxId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId: activeTxId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId: activeTxId,
+      nextPhase: 'ISOLATED_PREPARED',
+      lease,
+      metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${activeTxId}/stable-diffusion.js` },
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId: activeTxId,
+      nextPhase: 'BACKUP_CREATED',
+      lease,
+      metadataUpdate: { backupPath: `.ci-patch/backup/${activeTxId}/stable-diffusion.js`, targetMode: '0644' },
+    });
+    advanceJournalPhase({
+      repoRoot: repo,
+      txId: activeTxId,
+      nextPhase: 'READY_TO_SWAP',
+      lease,
+      metadataUpdate: { destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${activeTxId}.tmp` },
+    });
+
+    fs.mkdirSync(path.join(repo, `.ci-patch/staging/${activeTxId}`), { recursive: true });
+    fs.writeFileSync(path.join(repo, `.ci-patch/staging/${activeTxId}/stable-diffusion.js`), patchedContent);
+    fs.mkdirSync(path.join(repo, `.ci-patch/backup/${activeTxId}`), { recursive: true });
+    fs.writeFileSync(path.join(repo, `.ci-patch/backup/${activeTxId}/stable-diffusion.js`), stockContent);
+
+    // Active candidate
+    const activeCandidate = path.join(endpointsDir, `.stable-diffusion.js.ci-staged-${activeTxId}.tmp`);
+    fs.writeFileSync(activeCandidate, patchedContent);
+    fs.chmodSync(activeCandidate, 0o644);
+
+    // Foreign candidate for a different transaction
+    const foreignCandidate = path.join(endpointsDir, `.stable-diffusion.js.ci-staged-${foreignTxId}.tmp`);
+    fs.writeFileSync(foreignCandidate, 'foreign candidate content');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.ok(state.orphanedArtifacts.includes(`src/endpoints/.stable-diffusion.js.ci-staged-${foreignTxId}.tmp`));
+  });
+
+  test('orphan destination candidate with corrupted journal is classified as orphaned-artifact with corrupt journal registered', () => {
+    const repo = createTempDir('tx-orphan-corrupt-journal-');
+    const endpointsDir = path.join(repo, 'src/endpoints');
+    fs.mkdirSync(endpointsDir, { recursive: true });
+
+    const ciPatchDir = path.join(repo, '.ci-patch');
+    fs.mkdirSync(ciPatchDir, { recursive: true });
+    fs.writeFileSync(path.join(ciPatchDir, 'journal.json'), '{ invalid json content');
+
+    const orphanCandidate = path.join(endpointsDir, '.stable-diffusion.js.ci-staged-orphanTx777.tmp');
+    fs.writeFileSync(orphanCandidate, 'orphan candidate bytes');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.equal(state.journal?.isValid, false);
+    assert.ok(state.orphanedArtifacts.includes('src/endpoints/.stable-diffusion.js.ci-staged-orphanTx777.tmp'));
+    assert.ok(state.reasons.some((r) => r.includes('corrupted') || r.includes('JSON') || r.includes('SyntaxError') || r.includes('failed to parse')));
+  });
 });
 

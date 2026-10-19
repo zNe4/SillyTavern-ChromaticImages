@@ -50,10 +50,9 @@ const TX_ID_REGEX = /^ci-tx-[0-9]+-[0-9a-f]+$/i;
  * @param {string} stage - Identifier for error reporting and fault injection
  * @param {boolean} [isDirectory=false]
  * @param {(stage: string, context?: object) => void} [runFault]
- * @param {object} [constants=fs.constants]
  * @returns {{ ok: boolean, error?: string, code?: string, stage?: string }}
  */
-function syncDescriptorDurable(target, stage, isDirectory = false, runFault = null, constants = fs.constants) {
+function syncDescriptorDurable(target, stage, isDirectory = false, runFault = null) {
   if (typeof runFault === 'function') {
     runFault(`sync-${stage}`, { target, isDirectory });
   }
@@ -73,7 +72,7 @@ function syncDescriptorDurable(target, stage, isDirectory = false, runFault = nu
     }
   }
 
-  if (!isDirectory && !constants.O_NOFOLLOW) {
+  if (!isDirectory && !fs.constants.O_NOFOLLOW) {
     return {
       ok: false,
       error: 'Unsupported platform: O_NOFOLLOW file open flag is required for safe descriptor access',
@@ -84,8 +83,8 @@ function syncDescriptorDurable(target, stage, isDirectory = false, runFault = nu
 
   let fd = null;
   const openFlags = isDirectory
-    ? (constants.O_RDONLY | (constants.O_DIRECTORY || 0))
-    : (constants.O_RDONLY | constants.O_NOFOLLOW);
+    ? (fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0))
+    : (fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
 
   try {
     fd = fs.openSync(target, openFlags);
@@ -118,7 +117,6 @@ function syncDescriptorDurable(target, stage, isDirectory = false, runFault = nu
  * @param {string} absPath
  * @param {object} [options]
  * @param {number} [options.maxBytes=MAX_DESTINATION_FILE_BYTES]
- * @param {object} [options._testConstants]
  * @returns {{
  *   buffer: Buffer,
  *   stat: fs.Stats,
@@ -127,10 +125,28 @@ function syncDescriptorDurable(target, stage, isDirectory = false, runFault = nu
  * }}
  */
 export function readBoundedFile(absPath, options = {}) {
-  const constants = options?._testConstants || fs.constants;
-  const maxBytes = options?.maxBytes || MAX_DESTINATION_FILE_BYTES;
+  if (options !== undefined && (typeof options !== 'object' || options === null)) {
+    const err = new Error('Options must be an object if provided');
+    err.code = 'invalid-arguments';
+    throw err;
+  }
 
-  if (!constants.O_NOFOLLOW) {
+  let maxBytes = MAX_DESTINATION_FILE_BYTES;
+  if (options && options.maxBytes !== undefined) {
+    if (
+      typeof options.maxBytes !== 'number' ||
+      !Number.isInteger(options.maxBytes) ||
+      options.maxBytes <= 0 ||
+      options.maxBytes > MAX_DESTINATION_FILE_BYTES
+    ) {
+      const err = new Error(`Invalid maxBytes limit: must be a positive integer <= ${MAX_DESTINATION_FILE_BYTES}`);
+      err.code = 'invalid-max-bytes';
+      throw err;
+    }
+    maxBytes = options.maxBytes;
+  }
+
+  if (!fs.constants.O_NOFOLLOW) {
     const err = new Error('Unsupported platform: O_NOFOLLOW file open flag is required for safe descriptor access');
     err.code = 'unsupported-platform';
     throw err;
@@ -148,7 +164,7 @@ export function readBoundedFile(absPath, options = {}) {
     throw err;
   }
 
-  const openFlags = constants.O_RDONLY | constants.O_NOFOLLOW;
+  const openFlags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
   const fd = fs.openSync(absPath, openFlags);
   try {
     const preStat = fs.fstatSync(fd);
@@ -643,8 +659,6 @@ function reauthenticateLiveTarget(
  * @param {import('./lock.js').TransactionLease} options.lease
  * @param {object} [options.manifest]
  * @param {(stage: string, context?: object) => void} [options.faultHook]
- * @param {string} [options._testProcDir]
- * @param {object} [options._testConstants]
  * @returns {Promise<{
  *   ok: boolean,
  *   destinationStagedPath?: string,
@@ -672,11 +686,7 @@ export async function stageDestinationCandidate(options = {}) {
     lease,
     manifest: providedManifest = null,
     faultHook = null,
-    _testProcDir,
-    _testConstants,
   } = options;
-
-  const constants = _testConstants || fs.constants;
 
   // 1. Argument validation
   if (!repoRoot || !txId || !op || !lease) {
@@ -703,7 +713,7 @@ export async function stageDestinationCandidate(options = {}) {
     };
   }
 
-  if (!constants.O_NOFOLLOW) {
+  if (!fs.constants.O_NOFOLLOW) {
     return {
       ok: false,
       error: 'Unsupported platform: O_NOFOLLOW file open flag is required for safe descriptor access',
@@ -995,7 +1005,7 @@ export async function stageDestinationCandidate(options = {}) {
   // Open destination parent directory descriptor
   let parentDirFd = null;
   try {
-    parentDirFd = fs.openSync(absParentDir, constants.O_RDONLY | (constants.O_DIRECTORY || 0));
+    parentDirFd = fs.openSync(absParentDir, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0));
   } catch (openDirErr) {
     return {
       ok: false,
@@ -1004,525 +1014,581 @@ export async function stageDestinationCandidate(options = {}) {
     };
   }
 
-  let authenticatedParentDev;
-  let authenticatedParentIno;
+  let parentCloseErr = null;
   try {
-    const parentStat = fs.fstatSync(parentDirFd);
-    if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    let authenticatedParentDev;
+    let authenticatedParentIno;
+    try {
+      const parentStat = fs.fstatSync(parentDirFd);
+      if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+        return {
+          ok: false,
+          error: 'Destination parent descriptor is not a directory',
+          code: 'invalid-parent-dir',
+        };
+      }
+      if (!isValidDeviceIdentifier(parentStat.dev) || !isValidInodeIdentifier(parentStat.ino)) {
+        return {
+          ok: false,
+          error: 'Destination parent descriptor has invalid device or inode identity',
+          code: 'invalid-file-identity',
+        };
+      }
+
+      // Same-device validation
+      if (parentStat.dev !== authenticatedLiveDev) {
+        return {
+          ok: false,
+          error: `Destination parent directory resides on a different filesystem device (${parentStat.dev}) than live target (${authenticatedLiveDev})`,
+          code: 'cross-device-unsupported',
+        };
+      }
+
+      authenticatedParentDev = parentStat.dev;
+      authenticatedParentIno = parentStat.ino;
+    } catch (err) {
+      if (err?._isFault) throw err;
       return {
         ok: false,
-        error: 'Destination parent descriptor is not a directory',
-        code: 'invalid-parent-dir',
+        error: `Failed to verify parent directory descriptor: ${err.message}`,
+        code: err.code || 'parent-stat-failed',
       };
     }
-    if (!isValidDeviceIdentifier(parentStat.dev) || !isValidInodeIdentifier(parentStat.ino)) {
+
+    // 7. Descriptor-Anchored Candidate Allocation
+    const procDir = '/proc/self/fd';
+
+    // Check procfs availability
+    let procAvailable = false;
+    try {
+      procAvailable = fs.existsSync(procDir);
+    } catch {
+      procAvailable = false;
+    }
+
+    if (!procAvailable) {
       return {
         ok: false,
-        error: 'Destination parent descriptor has invalid device or inode identity',
-        code: 'invalid-file-identity',
+        error: `Unsupported platform: procfs descriptor anchoring ("${procDir}") is required for safe destination candidate creation`,
+        code: 'unsupported-platform',
+        stage: 'procfs-check',
       };
     }
 
-    // Same-device validation
-    if (parentStat.dev !== authenticatedLiveDev) {
+    const procCandidatePath = path.join(procDir, String(parentDirFd), candidateBase);
+
+    // Pre-allocation directory descriptor continuity check
+    try {
+      const preCheckStat = fs.fstatSync(parentDirFd);
+      if (preCheckStat.dev !== authenticatedParentDev || preCheckStat.ino !== authenticatedParentIno) {
+        return {
+          ok: false,
+          error: 'Destination parent directory descriptor identity changed before candidate allocation',
+          code: 'parent-directory-replaced',
+          stage: 'pre-candidate-allocation',
+        };
+      }
+
+      const preCheckLstat = getPathLstat(absParentDir);
+      if (
+        !preCheckLstat.exists ||
+        preCheckLstat.isSymbolicLink ||
+        !preCheckLstat.isDirectory ||
+        preCheckLstat.stat.dev !== authenticatedParentDev ||
+        preCheckLstat.stat.ino !== authenticatedParentIno
+      ) {
+        return {
+          ok: false,
+          error: 'Destination parent directory path was substituted before candidate allocation',
+          code: 'parent-directory-replaced',
+          stage: 'pre-candidate-allocation',
+        };
+      }
+    } catch (preCheckErr) {
+      if (preCheckErr?._isFault) throw preCheckErr;
       return {
         ok: false,
-        error: `Destination parent directory resides on a different filesystem device (${parentStat.dev}) than live target (${authenticatedLiveDev})`,
-        code: 'cross-device-unsupported',
+        error: `Pre-allocation parent check failed: ${preCheckErr.message}`,
+        code: 'parent-directory-replaced',
+        stage: 'pre-candidate-allocation',
       };
     }
 
-    authenticatedParentDev = parentStat.dev;
-    authenticatedParentIno = parentStat.ino;
-  } catch (err) {
-    try { fs.closeSync(parentDirFd); } catch { /* ignore */ }
-    return {
-      ok: false,
-      error: `Failed to verify parent directory descriptor: ${err.message}`,
-      code: err.code || 'parent-stat-failed',
-    };
-  }
+    runFault('before-candidate-create', { procCandidatePath, absCandidatePath });
 
-  // 7. Descriptor-Anchored Candidate Allocation
-  const procDir = _testProcDir !== undefined ? _testProcDir : '/proc/self/fd';
-
-  // Check procfs availability
-  let procAvailable = false;
-  try {
-    procAvailable = fs.existsSync(procDir);
-  } catch {
-    procAvailable = false;
-  }
-
-  if (!procAvailable) {
-    try { fs.closeSync(parentDirFd); } catch { /* ignore */ }
-    return {
-      ok: false,
-      error: `Unsupported platform: procfs descriptor anchoring ("${procDir}") is required for safe destination candidate creation`,
-      code: 'unsupported-platform',
-      stage: 'procfs-check',
-    };
-  }
-
-  const procCandidatePath = path.join(procDir, String(parentDirFd), candidateBase);
-
-  // Pre-allocation directory descriptor continuity check
-  try {
-    const preCheckStat = fs.fstatSync(parentDirFd);
-    if (preCheckStat.dev !== authenticatedParentDev || preCheckStat.ino !== authenticatedParentIno) {
-      fs.closeSync(parentDirFd);
+    const postHookPreStat = fs.fstatSync(parentDirFd);
+    if (postHookPreStat.dev !== authenticatedParentDev || postHookPreStat.ino !== authenticatedParentIno) {
       return {
         ok: false,
         error: 'Destination parent directory descriptor identity changed before candidate allocation',
         code: 'parent-directory-replaced',
+        stage: 'candidate-allocation',
       };
     }
-
-    const preCheckLstat = getPathLstat(absParentDir);
+    const postHookPreLstat = getPathLstat(absParentDir);
     if (
-      !preCheckLstat.exists ||
-      preCheckLstat.isSymbolicLink ||
-      !preCheckLstat.isDirectory ||
-      preCheckLstat.stat.dev !== authenticatedParentDev ||
-      preCheckLstat.stat.ino !== authenticatedParentIno
+      !postHookPreLstat.exists ||
+      postHookPreLstat.isSymbolicLink ||
+      !postHookPreLstat.isDirectory ||
+      postHookPreLstat.stat.dev !== authenticatedParentDev ||
+      postHookPreLstat.stat.ino !== authenticatedParentIno
     ) {
-      fs.closeSync(parentDirFd);
       return {
         ok: false,
         error: 'Destination parent directory path was substituted before candidate allocation',
         code: 'parent-directory-replaced',
-      };
-    }
-  } catch (preCheckErr) {
-    try { fs.closeSync(parentDirFd); } catch { /* ignore */ }
-    return {
-      ok: false,
-      error: `Pre-allocation parent check failed: ${preCheckErr.message}`,
-      code: 'parent-directory-replaced',
-    };
-  }
-
-  runFault('before-candidate-create', { procCandidatePath, absCandidatePath });
-
-  let candidateFd = null;
-  let createdCandidateDev = null;
-  let createdCandidateIno = null;
-
-  try {
-    candidateFd = fs.openSync(
-      procCandidatePath,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      0o600
-    );
-
-    // Immediate post-creation verification BEFORE writing any payload bytes
-    const initialStat = fs.fstatSync(candidateFd);
-    if (!initialStat.isFile() || initialStat.isSymbolicLink()) {
-      throw Object.assign(new Error('Created candidate descriptor is not a regular file'), {
-        code: 'invalid-candidate-descriptor',
-      });
-    }
-    if (!isValidDeviceIdentifier(initialStat.dev) || !isValidInodeIdentifier(initialStat.ino)) {
-      throw Object.assign(new Error('Failed to establish usable file identity on candidate descriptor'), {
-        code: 'invalid-file-identity',
-      });
-    }
-    if (initialStat.dev !== authenticatedParentDev) {
-      throw Object.assign(new Error('Candidate was created on unexpected filesystem device'), {
-        code: 'cross-device-unsupported',
-      });
-    }
-    if ((initialStat.mode & 0o777) !== 0o600) {
-      throw Object.assign(new Error(`Candidate created with unexpected mode: 0o${(initialStat.mode & 0o777).toString(8)}`), {
-        code: 'unexpected-initial-mode',
-      });
-    }
-    if (initialStat.size !== 0) {
-      throw Object.assign(new Error(`Candidate file is not empty upon creation (size: ${initialStat.size})`), {
-        code: 'candidate-not-empty',
-      });
-    }
-    if (initialStat.nlink !== 1) {
-      throw Object.assign(new Error(`Candidate descriptor has unexpected link count: ${initialStat.nlink}`), {
-        code: 'unexpected-link-count',
-      });
-    }
-
-    createdCandidateDev = initialStat.dev;
-    createdCandidateIno = initialStat.ino;
-
-    // Verify parent directory identity remains consistent immediately after creation
-    const postCreateParentStat = fs.fstatSync(parentDirFd);
-    if (postCreateParentStat.dev !== authenticatedParentDev || postCreateParentStat.ino !== authenticatedParentIno) {
-      throw Object.assign(new Error('Destination parent directory identity changed during candidate allocation'), {
-        code: 'parent-directory-replaced',
-      });
-    }
-
-    const postCreateLstat = getPathLstat(absParentDir);
-    if (
-      !postCreateLstat.exists ||
-      postCreateLstat.isSymbolicLink ||
-      !postCreateLstat.isDirectory ||
-      postCreateLstat.stat.dev !== authenticatedParentDev ||
-      postCreateLstat.stat.ino !== authenticatedParentIno
-    ) {
-      throw Object.assign(new Error('Destination parent directory path was substituted during candidate allocation'), {
-        code: 'parent-directory-replaced',
-      });
-    }
-
-    runFault('after-candidate-create', { candidateFd, createdCandidateDev, createdCandidateIno });
-
-    // 8. Payload Writing & Data Durability Flush
-    let written = 0;
-    while (written < authenticatedStagedBuffer.length) {
-      const bytesWritten = fs.writeSync(
-        candidateFd,
-        authenticatedStagedBuffer,
-        written,
-        authenticatedStagedBuffer.length - written,
-        written
-      );
-      if (bytesWritten === 0) {
-        throw Object.assign(new Error('Short write copying prepared staging bytes to candidate file'), {
-          code: 'short-write',
-        });
-      }
-      written += bytesWritten;
-    }
-
-    // Flush payload data
-    const syncDataRes = syncDescriptorDurable(candidateFd, 'candidate-file', false, runFault, constants);
-    if (!syncDataRes.ok) {
-      return Object.assign(syncDataRes, { uncertain: true });
-    }
-
-    // 9. Descriptor Mode Application & Metadata Durability Flush
-    const targetModeInt = parseInt(journal.targetMode, 8);
-    fs.fchmodSync(candidateFd, targetModeInt);
-
-    const syncModeRes = syncDescriptorDurable(candidateFd, 'candidate-mode', false, runFault, constants);
-    if (!syncModeRes.ok) {
-      return Object.assign(syncModeRes, { uncertain: true });
-    }
-  } catch (err) {
-    if (candidateFd !== null) {
-      try { fs.closeSync(candidateFd); } catch { /* ignore */ }
-      candidateFd = null;
-    }
-    if (parentDirFd !== null) {
-      try { fs.closeSync(parentDirFd); } catch { /* ignore */ }
-      parentDirFd = null;
-    }
-    if (err?._isFault) throw err;
-    if (err?.code === 'EEXIST') {
-      return {
-        ok: false,
-        error: `Cannot create destination candidate: candidate artifact already exists (collision)`,
-        code: 'collision-detected',
         stage: 'candidate-allocation',
       };
     }
+
+    let candidateFd = null;
+    let candidateCloseErr = null;
+    let createdCandidateDev = null;
+    let createdCandidateIno = null;
+
+    try {
+      try {
+        candidateFd = fs.openSync(
+          procCandidatePath,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+          0o600
+        );
+      } catch (openCandErr) {
+        if (openCandErr?._isFault) throw openCandErr;
+        if (openCandErr?.code === 'EEXIST') {
+          return {
+            ok: false,
+            error: 'Cannot create destination candidate: candidate artifact already exists (collision)',
+            code: 'collision-detected',
+            stage: 'candidate-allocation',
+          };
+        }
+        if (['ENOENT', 'ENOTDIR', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP', 'EACCES', 'EPERM'].includes(openCandErr?.code)) {
+          return {
+            ok: false,
+            error: `Unsupported platform: descriptor-anchored candidate creation via "${procDir}" failed: ${openCandErr.message}`,
+            code: 'unsupported-platform',
+            stage: 'candidate-allocation',
+          };
+        }
+        return {
+          ok: false,
+          error: `Failed during candidate allocation: ${openCandErr.message}`,
+          code: openCandErr.code || 'candidate-write-failed',
+          stage: 'candidate-allocation',
+          uncertain: false,
+        };
+      }
+
+      // Immediate post-creation verification BEFORE writing any payload bytes
+      const initialStat = fs.fstatSync(candidateFd);
+      if (!initialStat.isFile() || initialStat.isSymbolicLink()) {
+        throw Object.assign(new Error('Created candidate descriptor is not a regular file'), {
+          code: 'invalid-candidate-descriptor',
+        });
+      }
+      if (!isValidDeviceIdentifier(initialStat.dev) || !isValidInodeIdentifier(initialStat.ino)) {
+        throw Object.assign(new Error('Failed to establish usable file identity on candidate descriptor'), {
+          code: 'invalid-file-identity',
+        });
+      }
+      if (initialStat.dev !== authenticatedParentDev) {
+        throw Object.assign(new Error('Candidate was created on unexpected filesystem device'), {
+          code: 'cross-device-unsupported',
+        });
+      }
+      if ((initialStat.mode & 0o777) !== 0o600) {
+        throw Object.assign(new Error(`Candidate created with unexpected mode: 0o${(initialStat.mode & 0o777).toString(8)}`), {
+          code: 'unexpected-initial-mode',
+        });
+      }
+      if (initialStat.size !== 0) {
+        throw Object.assign(new Error(`Candidate file is not empty upon creation (size: ${initialStat.size})`), {
+          code: 'candidate-not-empty',
+        });
+      }
+      if (initialStat.nlink !== 1) {
+        throw Object.assign(new Error(`Candidate descriptor has unexpected link count: ${initialStat.nlink}`), {
+          code: 'unexpected-link-count',
+        });
+      }
+
+      createdCandidateDev = initialStat.dev;
+      createdCandidateIno = initialStat.ino;
+
+      // Verify parent directory identity remains consistent immediately after creation
+      const postCreateParentStat = fs.fstatSync(parentDirFd);
+      if (postCreateParentStat.dev !== authenticatedParentDev || postCreateParentStat.ino !== authenticatedParentIno) {
+        throw Object.assign(new Error('Destination parent directory identity changed during candidate allocation'), {
+          code: 'parent-directory-replaced',
+        });
+      }
+
+      const postCreateLstat = getPathLstat(absParentDir);
+      if (
+        !postCreateLstat.exists ||
+        postCreateLstat.isSymbolicLink ||
+        !postCreateLstat.isDirectory ||
+        postCreateLstat.stat.dev !== authenticatedParentDev ||
+        postCreateLstat.stat.ino !== authenticatedParentIno
+      ) {
+        throw Object.assign(new Error('Destination parent directory path was substituted during candidate allocation'), {
+          code: 'parent-directory-replaced',
+        });
+      }
+
+      runFault('after-candidate-create', { candidateFd, createdCandidateDev, createdCandidateIno });
+
+      // 8. Payload Writing & Data Durability Flush
+      let written = 0;
+      while (written < authenticatedStagedBuffer.length) {
+        const bytesWritten = fs.writeSync(
+          candidateFd,
+          authenticatedStagedBuffer,
+          written,
+          authenticatedStagedBuffer.length - written,
+          written
+        );
+        if (bytesWritten === 0) {
+          throw Object.assign(new Error('Short write copying prepared staging bytes to candidate file'), {
+            code: 'short-write',
+          });
+        }
+        written += bytesWritten;
+      }
+
+      // Flush payload data
+      const syncDataRes = syncDescriptorDurable(candidateFd, 'candidate-file', false, runFault);
+      if (!syncDataRes.ok) {
+        return Object.assign(syncDataRes, { uncertain: true });
+      }
+
+      // 9. Descriptor Mode Application & Metadata Durability Flush
+      const targetModeInt = parseInt(journal.targetMode, 8);
+      fs.fchmodSync(candidateFd, targetModeInt);
+
+      const syncModeRes = syncDescriptorDurable(candidateFd, 'candidate-mode', false, runFault);
+      if (!syncModeRes.ok) {
+        return Object.assign(syncModeRes, { uncertain: true });
+      }
+    } catch (err) {
+      if (err?._isFault) throw err;
+      return {
+        ok: false,
+        error: `Failed during candidate allocation or writing: ${err.message}`,
+        code: err.code || 'candidate-write-failed',
+        stage: 'candidate-allocation',
+        uncertain: true,
+      };
+    } finally {
+      if (candidateFd !== null) {
+        const toClose = candidateFd;
+        candidateFd = null;
+        try {
+          fs.closeSync(toClose);
+        } catch (closeErr) {
+          candidateCloseErr = closeErr;
+        }
+      }
+    }
+
+    if (candidateCloseErr !== null) {
+      return {
+        ok: false,
+        error: `Failed to close destination candidate descriptor: ${candidateCloseErr.message}`,
+        code: candidateCloseErr.code || 'candidate-close-failed',
+        stage: 'candidate-allocation',
+        uncertain: true,
+      };
+    }
+
+    // 10. Bounded Readback & Candidate Verification
+    runFault('before-candidate-readback', { absCandidatePath });
+
+    let readRes;
+    try {
+      readRes = readBoundedFile(absCandidatePath);
+    } catch (err) {
+      if (err?._isFault) throw err;
+      return {
+        ok: false,
+        error: `Candidate readback verification failed: ${err.message}`,
+        code: err.code || 'readback-failed',
+        stage: 'candidate-readback',
+        uncertain: true,
+      };
+    }
+
+    if (readRes.stat.dev !== createdCandidateDev || readRes.stat.ino !== createdCandidateIno) {
+      return {
+        ok: false,
+        error: 'Candidate descriptor identity changed during readback verification',
+        code: 'candidate-identity-replaced',
+        stage: 'candidate-readback',
+        uncertain: true,
+      };
+    }
+
+    const targetModeInt = parseInt(journal.targetMode, 8);
+    if ((readRes.stat.mode & 0o777) !== targetModeInt) {
+      return {
+        ok: false,
+        error: `Candidate mode mismatch on readback: expected 0o${targetModeInt.toString(8)}, observed 0o${(readRes.stat.mode & 0o777).toString(8)}`,
+        code: 'candidate-mode-mismatch',
+        stage: 'candidate-readback',
+        uncertain: true,
+      };
+    }
+
+    if (readRes.sha256 !== expectedResultSha) {
+      return {
+        ok: false,
+        error: `Candidate SHA-256 mismatch on readback: got "${readRes.sha256}", expected "${expectedResultSha}"`,
+        code: 'candidate-sha256-mismatch',
+        stage: 'candidate-readback',
+        uncertain: true,
+      };
+    }
+
+    if (readRes.gitBlobSha !== expectedResultBlob) {
+      return {
+        ok: false,
+        error: `Candidate Git blob SHA mismatch on readback: got "${readRes.gitBlobSha}", expected "${expectedResultBlob}"`,
+        code: 'candidate-blob-mismatch',
+        stage: 'candidate-readback',
+        uncertain: true,
+      };
+    }
+
+    // 11. Destination Parent Directory Durability Flush
+    const parentSyncRes = syncDescriptorDurable(parentDirFd, 'destination-parent', true, runFault);
+    if (!parentSyncRes.ok) {
+      return Object.assign(parentSyncRes, { uncertain: true });
+    }
+
+    const toCloseParent = parentDirFd;
+    parentDirFd = null;
+    try {
+      fs.closeSync(toCloseParent);
+    } catch (closeErr) {
+      parentCloseErr = closeErr;
+    }
+    if (parentCloseErr !== null) {
+      return {
+        ok: false,
+        error: `Failed to close destination parent directory descriptor: ${parentCloseErr.message}`,
+        code: parentCloseErr.code || 'parent-close-failed',
+        stage: 'parent-cleanup',
+        uncertain: true,
+      };
+    }
+
+    runFault('after-candidate-durability', { absCandidatePath });
+
+    // 12. Fault Hook Executed BEFORE Final Pre-Publication Integrity Checks
+    runFault('before-journal-advancement', { destinationStagedPath: relCandidatePath, relCandidatePath });
+
+    // 13. Uninterrupted Pre-Publication Reauthentication
+    // [NO FAULT HOOKS PERMITTED BEYOND THIS POINT]
+
+    // A. Revalidate lock ownership and lease
+    const reLockAuth = verifyLockOwnershipForMutation(repoRoot, txId, op, lease);
+    if (!reLockAuth.ok) {
+      return {
+        ok: false,
+        error: `Pre-publication lock authorization failed: ${reLockAuth.reason || reLockAuth.error}`,
+        code: reLockAuth.error,
+        stage: 'final-lock-auth',
+      };
+    }
+
+    // B. Revalidate journal state and transaction consistency
+    const currentJournalInspect = inspectJournal(repoRoot);
+    if (!currentJournalInspect.isValid || !currentJournalInspect.journal) {
+      return {
+        ok: false,
+        error: 'Journal missing or invalid before journal advancement',
+        code: 'invalid-journal',
+        stage: 'final-journal-auth',
+      };
+    }
+    const currentJournal = currentJournalInspect.journal;
+    if (currentJournal.txId !== txId || currentJournal.op !== op) {
+      return {
+        ok: false,
+        error: `Journal transaction mismatch before advancement: expected txId "${txId}" op "${op}", got txId "${currentJournal.txId}" op "${currentJournal.op}"`,
+        code: 'journal-mismatch',
+        stage: 'final-journal-auth',
+      };
+    }
+    if (currentJournal.phase !== 'BACKUP_CREATED') {
+      return {
+        ok: false,
+        error: `Journal phase mismatch before advancement: expected "BACKUP_CREATED", got "${currentJournal.phase}"`,
+        code: 'invalid-journal-phase',
+        stage: 'final-journal-auth',
+      };
+    }
+
+    // C. Reauthenticate isolated staging
+    const finalStagingAuth = reauthenticateIsolatedStaging(
+      repoRoot,
+      txId,
+      journal,
+      expectedResultSha,
+      expectedResultBlob,
+      authenticatedStagedDev,
+      authenticatedStagedIno
+    );
+    if (!finalStagingAuth.ok) {
+      return Object.assign(finalStagingAuth, { stage: 'final-staging-reauth' });
+    }
+
+    // D. Reauthenticate backup
+    const finalBackupAuth = reauthenticateBackup(
+      repoRoot,
+      txId,
+      journal,
+      expectedInitialSha,
+      expectedInitialBlob,
+      authenticatedBackupDev,
+      authenticatedBackupIno
+    );
+    if (!finalBackupAuth.ok) {
+      return Object.assign(finalBackupAuth, { stage: 'final-backup-reauth' });
+    }
+
+    // E. Reauthenticate live target
+    const finalLiveAuth = reauthenticateLiveTarget(
+      repoRoot,
+      journal,
+      expectedInitialSha,
+      expectedInitialBlob,
+      authenticatedLiveDev,
+      authenticatedLiveIno
+    );
+    if (!finalLiveAuth.ok) {
+      return Object.assign(finalLiveAuth, { stage: 'final-source-reauth' });
+    }
+
+    // F. Reauthenticate destination candidate file
+    let finalCandidateRead;
+    try {
+      finalCandidateRead = readBoundedFile(absCandidatePath);
+    } catch (err) {
+      return {
+        ok: false,
+        error: `Pre-publication candidate reauthentication failed: ${err.message}`,
+        code: err.code || 'candidate-read-failed',
+        stage: 'final-candidate-reauth',
+      };
+    }
+
+    if (
+      finalCandidateRead.stat.dev !== createdCandidateDev ||
+      finalCandidateRead.stat.ino !== createdCandidateIno
+    ) {
+      return {
+        ok: false,
+        error: 'Pre-publication candidate descriptor identity changed',
+        code: 'candidate-identity-replaced',
+        stage: 'final-candidate-reauth',
+      };
+    }
+
+    if ((finalCandidateRead.stat.mode & 0o777) !== targetModeInt) {
+      return {
+        ok: false,
+        error: 'Pre-publication candidate mode mismatch',
+        code: 'candidate-mode-mismatch',
+        stage: 'final-candidate-reauth',
+      };
+    }
+
+    if (finalCandidateRead.sha256 !== expectedResultSha || finalCandidateRead.gitBlobSha !== expectedResultBlob) {
+      return {
+        ok: false,
+        error: 'Pre-publication candidate fingerprint mismatch',
+        code: 'candidate-sha256-mismatch',
+        stage: 'final-candidate-reauth',
+      };
+    }
+
+    // G. Reauthenticate candidate pathname
+    const finalCandidatePathLstat = getPathLstat(absCandidatePath);
+    if (
+      !finalCandidatePathLstat.exists ||
+      finalCandidatePathLstat.isSymbolicLink ||
+      !finalCandidatePathLstat.isFile ||
+      finalCandidatePathLstat.stat.dev !== createdCandidateDev ||
+      finalCandidatePathLstat.stat.ino !== createdCandidateIno
+    ) {
+      return {
+        ok: false,
+        error: 'Pre-publication candidate pathname identity mismatch or symlink',
+        code: 'candidate-identity-replaced',
+        stage: 'final-candidate-reauth',
+      };
+    }
+
+    // H. Reauthenticate destination parent directory
+    const finalParentLstat = getPathLstat(absParentDir);
+    if (
+      !finalParentLstat.exists ||
+      finalParentLstat.isSymbolicLink ||
+      !finalParentLstat.isDirectory ||
+      finalParentLstat.stat.dev !== authenticatedParentDev ||
+      finalParentLstat.stat.ino !== authenticatedParentIno
+    ) {
+      return {
+        ok: false,
+        error: 'Pre-publication destination parent directory identity changed or became a symlink',
+        code: 'parent-directory-replaced',
+        stage: 'final-parent-reauth',
+      };
+    }
+
+    // 14. Atomic Journal Advancement
+    const advanceRes = advanceJournalPhase({
+      repoRoot,
+      txId,
+      nextPhase: 'READY_TO_SWAP',
+      metadataUpdate: {
+        destinationStagedPath: relCandidatePath,
+      },
+      lease,
+    });
+
+    if (!advanceRes.ok) {
+      return {
+        ok: false,
+        error: `Failed to advance journal to READY_TO_SWAP: ${advanceRes.error}`,
+        code: advanceRes.code || 'journal-advancement-failed',
+        stage: advanceRes.stage,
+        uncertain: advanceRes.stage === 'post-rename',
+      };
+    }
+
+    runFault('after-journal-advancement', { journal: advanceRes.journal });
+
     return {
-      ok: false,
-      error: `Failed during candidate allocation or writing: ${err.message}`,
-      code: err.code || 'candidate-write-failed',
-      stage: 'candidate-allocation',
-      uncertain: true,
+      ok: true,
+      candidatePath: relCandidatePath,
+      destinationStagedPath: relCandidatePath,
+      targetMode: journal.targetMode,
+      journal: advanceRes.journal,
+      sha256: expectedResultSha,
+      gitBlobSha: expectedResultBlob,
     };
   } finally {
-    if (candidateFd !== null) {
-      try { fs.closeSync(candidateFd); } catch { /* ignore */ }
-      candidateFd = null;
-    }
-  }
-
-  // 10. Bounded Readback & Candidate Verification
-  runFault('before-candidate-readback', { absCandidatePath });
-
-  let readRes;
-  try {
-    readRes = readBoundedFile(absCandidatePath, { _testConstants: constants });
-  } catch (err) {
     if (parentDirFd !== null) {
-      try { fs.closeSync(parentDirFd); } catch { /* ignore */ }
+      const toCloseParent = parentDirFd;
       parentDirFd = null;
+      try {
+        fs.closeSync(toCloseParent);
+      } catch (closeErr) {
+        if (!parentCloseErr) parentCloseErr = closeErr;
+      }
     }
-    if (err?._isFault) throw err;
-    return {
-      ok: false,
-      error: `Candidate readback verification failed: ${err.message}`,
-      code: err.code || 'readback-failed',
-      stage: 'candidate-readback',
-      uncertain: true,
-    };
   }
-
-  if (readRes.stat.dev !== createdCandidateDev || readRes.stat.ino !== createdCandidateIno) {
-    if (parentDirFd !== null) {
-      try { fs.closeSync(parentDirFd); } catch { /* ignore */ }
-      parentDirFd = null;
-    }
-    return {
-      ok: false,
-      error: 'Candidate descriptor identity changed during readback verification',
-      code: 'candidate-identity-replaced',
-      stage: 'candidate-readback',
-      uncertain: true,
-    };
-  }
-
-  const targetModeInt = parseInt(journal.targetMode, 8);
-  if ((readRes.stat.mode & 0o777) !== targetModeInt) {
-    if (parentDirFd !== null) {
-      try { fs.closeSync(parentDirFd); } catch { /* ignore */ }
-      parentDirFd = null;
-    }
-    return {
-      ok: false,
-      error: `Candidate mode mismatch on readback: expected 0o${targetModeInt.toString(8)}, observed 0o${(readRes.stat.mode & 0o777).toString(8)}`,
-      code: 'candidate-mode-mismatch',
-      stage: 'candidate-readback',
-      uncertain: true,
-    };
-  }
-
-  if (readRes.sha256 !== expectedResultSha) {
-    if (parentDirFd !== null) {
-      try { fs.closeSync(parentDirFd); } catch { /* ignore */ }
-      parentDirFd = null;
-    }
-    return {
-      ok: false,
-      error: `Candidate SHA-256 mismatch on readback: got "${readRes.sha256}", expected "${expectedResultSha}"`,
-      code: 'candidate-sha256-mismatch',
-      stage: 'candidate-readback',
-      uncertain: true,
-    };
-  }
-
-  if (readRes.gitBlobSha !== expectedResultBlob) {
-    if (parentDirFd !== null) {
-      try { fs.closeSync(parentDirFd); } catch { /* ignore */ }
-      parentDirFd = null;
-    }
-    return {
-      ok: false,
-      error: `Candidate Git blob SHA mismatch on readback: got "${readRes.gitBlobSha}", expected "${expectedResultBlob}"`,
-      code: 'candidate-blob-mismatch',
-      stage: 'candidate-readback',
-      uncertain: true,
-    };
-  }
-
-  // 11. Destination Parent Directory Durability Flush
-  const parentSyncRes = syncDescriptorDurable(parentDirFd, 'destination-parent', true, runFault, constants);
-  try {
-    fs.closeSync(parentDirFd);
-    parentDirFd = null;
-  } catch {
-    // ignore
-  }
-  if (!parentSyncRes.ok) {
-    return Object.assign(parentSyncRes, { uncertain: true });
-  }
-
-  runFault('after-candidate-durability', { absCandidatePath });
-
-  // 12. Fault Hook Executed BEFORE Final Pre-Publication Integrity Checks
-  runFault('before-journal-advancement', { destinationStagedPath: relCandidatePath, relCandidatePath });
-
-  // 13. Uninterrupted Pre-Publication Reauthentication
-  // [NO FAULT HOOKS PERMITTED BEYOND THIS POINT]
-
-  // A. Revalidate lock ownership and lease
-  const reLockAuth = verifyLockOwnershipForMutation(repoRoot, txId, op, lease);
-  if (!reLockAuth.ok) {
-    return {
-      ok: false,
-      error: `Pre-publication lock authorization failed: ${reLockAuth.reason || reLockAuth.error}`,
-      code: reLockAuth.error,
-      stage: 'final-lock-auth',
-    };
-  }
-
-  // B. Revalidate journal state and transaction consistency
-  const currentJournalInspect = inspectJournal(repoRoot);
-  if (!currentJournalInspect.isValid || !currentJournalInspect.journal) {
-    return {
-      ok: false,
-      error: 'Journal missing or invalid before journal advancement',
-      code: 'invalid-journal',
-      stage: 'final-journal-auth',
-    };
-  }
-  const currentJournal = currentJournalInspect.journal;
-  if (currentJournal.txId !== txId || currentJournal.op !== op) {
-    return {
-      ok: false,
-      error: `Journal transaction mismatch before advancement: expected txId "${txId}" op "${op}", got txId "${currentJournal.txId}" op "${currentJournal.op}"`,
-      code: 'journal-mismatch',
-      stage: 'final-journal-auth',
-    };
-  }
-  if (currentJournal.phase !== 'BACKUP_CREATED') {
-    return {
-      ok: false,
-      error: `Journal phase mismatch before advancement: expected "BACKUP_CREATED", got "${currentJournal.phase}"`,
-      code: 'invalid-journal-phase',
-      stage: 'final-journal-auth',
-    };
-  }
-
-  // C. Reauthenticate isolated staging
-  const finalStagingAuth = reauthenticateIsolatedStaging(
-    repoRoot,
-    txId,
-    journal,
-    expectedResultSha,
-    expectedResultBlob,
-    authenticatedStagedDev,
-    authenticatedStagedIno
-  );
-  if (!finalStagingAuth.ok) {
-    return Object.assign(finalStagingAuth, { stage: 'final-staging-reauth' });
-  }
-
-  // D. Reauthenticate backup
-  const finalBackupAuth = reauthenticateBackup(
-    repoRoot,
-    txId,
-    journal,
-    expectedInitialSha,
-    expectedInitialBlob,
-    authenticatedBackupDev,
-    authenticatedBackupIno
-  );
-  if (!finalBackupAuth.ok) {
-    return Object.assign(finalBackupAuth, { stage: 'final-backup-reauth' });
-  }
-
-  // E. Reauthenticate live target
-  const finalLiveAuth = reauthenticateLiveTarget(
-    repoRoot,
-    journal,
-    expectedInitialSha,
-    expectedInitialBlob,
-    authenticatedLiveDev,
-    authenticatedLiveIno
-  );
-  if (!finalLiveAuth.ok) {
-    return Object.assign(finalLiveAuth, { stage: 'final-source-reauth' });
-  }
-
-  // F. Reauthenticate destination candidate file
-  let finalCandidateRead;
-  try {
-    finalCandidateRead = readBoundedFile(absCandidatePath, { _testConstants: constants });
-  } catch (err) {
-    return {
-      ok: false,
-      error: `Pre-publication candidate reauthentication failed: ${err.message}`,
-      code: err.code || 'candidate-read-failed',
-      stage: 'final-candidate-reauth',
-    };
-  }
-
-  if (
-    finalCandidateRead.stat.dev !== createdCandidateDev ||
-    finalCandidateRead.stat.ino !== createdCandidateIno
-  ) {
-    return {
-      ok: false,
-      error: 'Pre-publication candidate descriptor identity changed',
-      code: 'candidate-identity-replaced',
-      stage: 'final-candidate-reauth',
-    };
-  }
-
-  if ((finalCandidateRead.stat.mode & 0o777) !== targetModeInt) {
-    return {
-      ok: false,
-      error: 'Pre-publication candidate mode mismatch',
-      code: 'candidate-mode-mismatch',
-      stage: 'final-candidate-reauth',
-    };
-  }
-
-  if (finalCandidateRead.sha256 !== expectedResultSha || finalCandidateRead.gitBlobSha !== expectedResultBlob) {
-    return {
-      ok: false,
-      error: 'Pre-publication candidate fingerprint mismatch',
-      code: 'candidate-sha256-mismatch',
-      stage: 'final-candidate-reauth',
-    };
-  }
-
-  // G. Reauthenticate candidate pathname
-  const finalCandidatePathLstat = getPathLstat(absCandidatePath);
-  if (
-    !finalCandidatePathLstat.exists ||
-    finalCandidatePathLstat.isSymbolicLink ||
-    !finalCandidatePathLstat.isFile ||
-    finalCandidatePathLstat.stat.dev !== createdCandidateDev ||
-    finalCandidatePathLstat.stat.ino !== createdCandidateIno
-  ) {
-    return {
-      ok: false,
-      error: 'Pre-publication candidate pathname identity mismatch or symlink',
-      code: 'candidate-identity-replaced',
-      stage: 'final-candidate-reauth',
-    };
-  }
-
-  // H. Reauthenticate destination parent directory
-  const finalParentLstat = getPathLstat(absParentDir);
-  if (
-    !finalParentLstat.exists ||
-    finalParentLstat.isSymbolicLink ||
-    !finalParentLstat.isDirectory ||
-    finalParentLstat.stat.dev !== authenticatedParentDev ||
-    finalParentLstat.stat.ino !== authenticatedParentIno
-  ) {
-    return {
-      ok: false,
-      error: 'Pre-publication destination parent directory identity changed or became a symlink',
-      code: 'parent-directory-replaced',
-      stage: 'final-parent-reauth',
-    };
-  }
-
-  // 14. Atomic Journal Advancement
-  const advanceRes = advanceJournalPhase({
-    repoRoot,
-    txId,
-    nextPhase: 'READY_TO_SWAP',
-    metadataUpdate: {
-      destinationStagedPath: relCandidatePath,
-    },
-    lease,
-  });
-
-  if (!advanceRes.ok) {
-    return {
-      ok: false,
-      error: `Failed to advance journal to READY_TO_SWAP: ${advanceRes.error}`,
-      code: advanceRes.code || 'journal-advancement-failed',
-      stage: advanceRes.stage,
-      uncertain: advanceRes.stage === 'post-rename',
-    };
-  }
-
-  runFault('after-journal-advancement', { journal: advanceRes.journal });
-
-  return {
-    ok: true,
-    candidatePath: relCandidatePath,
-    destinationStagedPath: relCandidatePath,
-    targetMode: journal.targetMode,
-    journal: advanceRes.journal,
-    sha256: expectedResultSha,
-    gitBlobSha: expectedResultBlob,
-  };
 }
