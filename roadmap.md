@@ -6,13 +6,13 @@
 
 **Phase:** Phase M03 complete (accepted); Distribution track D01 active.
 
-**Current mission:** D01-P3A (Read-only SillyTavern patch installer foundation) implemented and submitted for independent review. D01-P3B (installer application and removal) planned next.
+**Current milestone:** D01-P3B-2C (verified destination-parent staging) formally accepted and closed on 2026-10-19. **Next:** D01-P3B-2D (atomic live-target replacement) requires a separate read-only security architecture review and explicit authorization before coding.
 
-**Completed:** M01 scaffold (accepted), M02 message protocol / inline UI / managed prompt hygiene (accepted), M03-A through M03-H3 (complete and accepted), D01-P1 (release compatibility research, accepted), D01-P2A (proxy hardening, accepted), and D01-P2B (distribution artifacts and verification tooling, accepted).
+**Completed:** M01, M02, and M03-A through M03-H3; D01-P1, D01-P2A, D01-P2B, D01-P3A, D01-P3B transaction/locking foundation, and D01-P3B-2A/2B/2C (all accepted). Public patch application, removal, and recovery remain disabled.
 
 **Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building (normalized and compatibility), response normalization, pure mocked transport core, production dispatch adapters with capability guards (normalized and compatibility), local image I/O primitives, provider settings schema, credential readiness reader, connection diagnostics UI, and explicit settings-only diagnostic image generator with local upload are implemented and verified. Automatic roleplay image generation remains disabled; proposal-card Generate wiring remains deferred to M05, and character identity and trusted reference library management are planned for M04.
 
-**Distribution track (D01):** D01-P1 (release compatibility research), D01-P2A (proxy hardening), and D01-P2B (distribution artifacts and verification tooling) accepted. D01-P3A (read-only patch installer foundation: `--status` and `--check`) implemented and submitted for independent review. D01-P3B (installer application and removal) planned next.
+**Distribution track (D01):** The installer can authenticate the pinned release, prepare an isolated patch, create a verified backup, and stage a durable replacement candidate in the destination directory without changing the live target. The internal journal can advance through `READY_TO_SWAP`; `SWAPPED`/`COMPLETED` and public `--apply`/`--remove` remain deferred. See [D01 installer status and handoff](docs/d01-installer-progress.md).
 
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
@@ -724,6 +724,32 @@ Prepare public stable development release.
 
 ---
 
+## D01 — SillyTavern patch distribution and safe installer
+
+**Status:** D01-P1, P2A, P2B, P3A, and internal P3B transaction stages through P3B-2C are accepted. This does **not** mean an end-user installer is operational.
+
+| Stage | Status | Boundary |
+| --- | --- | --- |
+| D01-P1 | Accepted | Research and pin compatible SillyTavern release. |
+| D01-P2A | Accepted | Privacy-safe NanoGPT proxy hardening. |
+| D01-P2B | Accepted | Certified manifest, patches, offline verification. |
+| D01-P3A | Accepted | Read-only `--status`/`--check` preflight; no mutation. |
+| D01-P3B-1 | Accepted | Transaction lock, lease, journal, state inspection. |
+| D01-P3B-2A | Accepted | Authenticated isolated patch preparation. |
+| D01-P3B-2B | Accepted | Verified original-target backup; no live mutation. |
+| **D01-P3B-2C** | **Accepted 2026-10-19** | Verified destination-parent candidate; journal reaches `READY_TO_SWAP`, live target unchanged. |
+| D01-P3B-2D | **Planning only; not authorized for implementation** | Atomic replacement of live target; first live-file mutation boundary. |
+| D01-P3B-3 and later | Deferred | Completion/recovery/public CLI subject to separately reviewed contracts. |
+
+**Accepted P3B-2C code baseline:** `38043acd5a35e4087c2c7d214ee95f3a5f280323`. Gemini's read-only executable acceptance report recorded **1,043/1,043** full-suite tests, **63/63** focused destination-staging tests, zero failures/skips, `npm run verify:patches` PASS, and `node --check` passing for 64 tracked JavaScript files. The linked SillyTavern checkout was reported unchanged before and after. These are submitted execution results, not claims of independent local execution by the reviewer.
+
+**State-inspection correction:** `orphaned-artifact` has `isPending: true`, including when `.ci-patch` is absent. The acceptance report incorrectly displayed `false` in two table rows; source and regression tests support `true`.
+
+**Stop boundary:** P3B-2C does not rename the candidate onto `src/endpoints/stable-diffusion.js`, implement rollback, or enable public `--apply`/`--remove`/`--recover`. P3B-2D starts with a read-only design/security plan for independent review; no coding stage starts automatically.
+
+**Handoff reference:** [docs/d01-installer-progress.md](docs/d01-installer-progress.md) records source files, journal lifecycle, certified fingerprints, accepted security invariants, testing evidence, and P3B-2D questions.
+
+---
 # Deferred work
 
 - multiple providers;
@@ -744,7 +770,7 @@ Prepare public stable development release.
 
 1. The canonical repository/local checkout is the baseline.
 2. Only one bounded mission is active at a time.
-3. Gemini implements coding work only when explicitly assigned; ChatGPT may directly own research/documentation missions.
+3. Codex (or another explicitly selected implementer) handles bounded coding/testing missions; ChatGPT owns architecture, independent review, and accepted-milestone documentation. No automatic mission advancement.
 4. Review the actual pushed diff/content rather than implementation claims.
 5. Run the full relevant validation in the canonical checkout.
 6. Perform real SillyTavern smoke tests whenever runtime behavior changes.

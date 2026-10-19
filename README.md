@@ -4,7 +4,7 @@
 
 It belongs to the planned **Chromatic** family of SillyTavern extensions alongside Chromatic Dialogue.
 
-> **Project status:** M01 and M02 are complete. M03 implementation and integration verification milestones (M03-A through M03-H2) are accepted; M03-H3 documentation reconciliation is complete and submitted for independent review. Explicit, settings-only diagnostic image generation is verified and functional via SillyTavern's local compatibility proxy. Automatic roleplay image generation remains disabled; proposal-card Generate wiring remains deferred to M05, and character identity and trusted reference library management are planned for M04.
+> **Project status (2026-10-19):** M01–M03 are accepted; explicit settings-only diagnostic image generation is verified. Distribution installer track D01 has completed and accepted its read-only preflight, transaction foundation, isolated preparation, verified backup, and verified destination staging (**P3B-2C**). Public patch application/removal is **not yet implemented**; atomic live-file replacement (**P3B-2D**) awaits a separate security plan. Automatic roleplay generation is still disabled; M04 character identity/reference management and M05 proposal-card Generate wiring remain future work.
 
 ## Product goal
 
@@ -440,6 +440,13 @@ SillyTavern-ChromaticImages/
 This is a responsibility map, not an instruction to create every module immediately.
 
 
+## Distribution installer status (D01)
+
+The packaged SillyTavern NanoGPT proxy patches target **only** the certified release `06bde939fb1e9c4c8d8641d810f0a916b5bce127`. The installer currently supports read-only inspection and internal, lease-authorized transaction primitives through the `READY_TO_SWAP` journal phase. These primitives prepare authenticated resulting bytes, preserve a verified original backup, and create a durable same-directory replacement candidate **without touching the live endpoint**.
+
+**Not yet supported:** publicly callable `--apply`, `--remove`, `--recover`, atomic candidate-to-live-target replacement, or automatic rollback/recovery. P3B-2D is the next planning checkpoint, not an implemented or authorized mutation command.
+
+See [D01 installer status and handoff](docs/d01-installer-progress.md) for accepted evidence, safety invariants, and the next bounded stage.
 ## Development model
 
 Development now uses the canonical repository directly:
@@ -448,7 +455,7 @@ Development now uses the canonical repository directly:
 - Work is performed in the canonical local checkout.
 - One bounded mission is implemented at a time.
 - ChatGPT owns architecture/research/review and inspects the actual pushed diff.
-- Gemini may implement explicitly assigned coding missions.
+- Codex (or another explicitly assigned implementer) handles bounded coding and automated testing; ChatGPT handles architecture, independent review, and acceptance documentation so the coding mission stays focused.
 - Full automated validation and relevant real-SillyTavern smoke tests are required before a mission is accepted.
 - No credentials, generated user images, or temporary personal artifacts may be committed.
 - Future missions do not begin automatically after implementation.

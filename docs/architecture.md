@@ -167,7 +167,7 @@ Pinned donor commit:
 
 - Work directly in the canonical local checkout.
 - Keep one bounded mission active at a time.
-- Gemini implements explicitly assigned coding missions; ChatGPT owns architecture/research/review and may directly complete documentation-only evidence missions.
+- Codex (or another explicitly assigned implementer) performs bounded coding/testing missions; ChatGPT owns architecture, independent review, and accepted-milestone documentation.
 - Review actual pushed content/diffs rather than implementation claims.
 - Run full relevant automated validation and real SillyTavern smoke tests before acceptance.
 - Do not advance missions without explicit user direction.
@@ -985,3 +985,19 @@ MVP is achieved when:
 12. reload/chat switch/double tap never triggers surprise paid requests.
 
 Everything beyond that is refinement.
+
+---
+
+## 28. D01 distribution installer: accepted transaction boundary
+
+The distribution patch installer is separate from the browser extension's roleplay image-generation workflow. Its packaged proxy patch is certified for SillyTavern release `06bde939fb1e9c4c8d8641d810f0a916b5bce127`, not arbitrary future SillyTavern revisions.
+
+Through **D01-P3B-2C (accepted 2026-10-19)**, the internal installer requires a valid transaction lease/lock and journal, authenticates certified stock/patched fingerprints, creates isolated prepared output and a verified backup, then creates a destination-parent candidate and durably records the transition `BACKUP_CREATED → READY_TO_SWAP`. The candidate is distinct from the live source inode; the live target is not renamed, truncated, or replaced in this accepted milestone.
+
+Candidate allocation uses real filesystem flags, exclusive no-follow creation anchored through `/proc/self/fd/<parentFd>/<candidateBase>` on supported Linux environments, a restrictive initial mode (`0600`), authenticated final target mode, file/metadata/parent-directory synchronization, bounded (50 MiB) no-follow reads, and pre-publication reauthentication. If descriptor anchoring is unavailable, creation fails closed; there is no absolute-path fallback. Uncertain candidates are preserved rather than silently reused or removed. No claim is made of complete containment against privileged, actively racing writers.
+
+Read-only inspection recognizes the reserved target-specific candidate family even without `.ci-patch`. A valid candidate is required at `READY_TO_SWAP`; its temporary name is **not** expected to survive a future successful `SWAPPED` rename. An `orphaned-artifact` state always has `isPending: true` under the current source contract (`isPending = state !== 'none'`). Later swap and completion verification/recovery semantics are **not yet implemented**.
+
+Public `--apply` and `--remove` remain deferred; `--recover` is unavailable. **P3B-2D, the first live-file mutation stage, requires a separate read-only architecture and security review followed by explicit authorization before implementation.**
+
+For the stage ledger, module ownership, certified fingerprints, test evidence, accepted commit, and future research questions, read [D01 installer status and handoff](d01-installer-progress.md).

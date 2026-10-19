@@ -21,13 +21,14 @@ At the start of an **implementation mission**, explicitly read the following rep
 1. `README.md` — product behavior and constraints.
 2. `roadmap.md` — currently authorized milestone and stop boundary.
 3. `docs/architecture.md` — architecture and persistence decisions.
-4. The mission-specific contract(s), e.g. `docs/m03-contract.md` for M03 provider work.
+4. The mission-specific contract(s), e.g. `docs/m03-contract.md` for M03 provider work or `docs/d01-installer-progress.md` for D01 installer coding.
 
 If the user/task references additional documents, read those too. Do not resolve contradictory requirements by guessing: document the conflict and request a decision.
 
 ## Mission discipline
 
 - Implement **only** the explicitly authorized mission. Never opportunistically advance to the next one.
+- For the current D01 workflow, Codex/implementation agents focus on explicitly scoped code and test changes. ChatGPT/user owns acceptance documentation and roadmap updates after independent review, unless a mission expressly assigns documentation.
 - Before changing files, inspect `git status --short`, current branch, relevant code, and existing tests. Preserve pre-existing user changes.
 - For complex or security-sensitive work, create a concise implementation plan for review **before making edits**. Include target files, tests, risks, and open decisions.
 - Prefer small, dependency-free, pure modules with `node:test` tests. Match existing patterns; minimize broad refactors, new dependencies, and unnecessary copying from donor projects.
