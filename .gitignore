@@ -5,6 +5,7 @@ build/
 coverage/
 .cache/
 tmp/
+SillyTavern
 
 # Project archives
 *.zip
