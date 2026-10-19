@@ -1239,6 +1239,34 @@ export async function stageDestinationCandidate(options = {}) {
 
       runFault('after-candidate-create', { candidateFd, createdCandidateDev, createdCandidateIno });
 
+      // Revalidate parent directory continuity after after-candidate-create fault hook
+      const postHookParentStat = fs.fstatSync(parentDirFd);
+      if (
+        !postHookParentStat.isDirectory() ||
+        postHookParentStat.isSymbolicLink() ||
+        postHookParentStat.dev !== authenticatedParentDev ||
+        postHookParentStat.ino !== authenticatedParentIno
+      ) {
+        throw Object.assign(new Error('Destination parent directory descriptor identity changed after candidate creation'), {
+          code: 'parent-directory-replaced',
+          stage: 'after-candidate-create',
+        });
+      }
+
+      const postHookLstat = getPathLstat(absParentDir);
+      if (
+        !postHookLstat.exists ||
+        postHookLstat.isSymbolicLink ||
+        !postHookLstat.isDirectory ||
+        postHookLstat.stat.dev !== authenticatedParentDev ||
+        postHookLstat.stat.ino !== authenticatedParentIno
+      ) {
+        throw Object.assign(new Error('Destination parent directory path was substituted after candidate creation'), {
+          code: 'parent-directory-replaced',
+          stage: 'after-candidate-create',
+        });
+      }
+
       // 8. Payload Writing & Data Durability Flush
       let written = 0;
       while (written < authenticatedStagedBuffer.length) {
@@ -1277,7 +1305,7 @@ export async function stageDestinationCandidate(options = {}) {
         ok: false,
         error: `Failed during candidate allocation or writing: ${err.message}`,
         code: err.code || 'candidate-write-failed',
-        stage: 'candidate-allocation',
+        stage: err.stage || 'candidate-allocation',
         uncertain: true,
       };
     } finally {
@@ -1430,7 +1458,24 @@ export async function stageDestinationCandidate(options = {}) {
       };
     }
 
-    // C. Reauthenticate isolated staging
+    // C. Reauthenticate destination parent directory
+    const finalParentLstat = getPathLstat(absParentDir);
+    if (
+      !finalParentLstat.exists ||
+      finalParentLstat.isSymbolicLink ||
+      !finalParentLstat.isDirectory ||
+      finalParentLstat.stat.dev !== authenticatedParentDev ||
+      finalParentLstat.stat.ino !== authenticatedParentIno
+    ) {
+      return {
+        ok: false,
+        error: 'Pre-publication destination parent directory identity changed or became a symlink',
+        code: 'parent-directory-replaced',
+        stage: 'final-parent-reauth',
+      };
+    }
+
+    // D. Reauthenticate isolated staging
     const finalStagingAuth = reauthenticateIsolatedStaging(
       repoRoot,
       txId,
@@ -1528,23 +1573,6 @@ export async function stageDestinationCandidate(options = {}) {
         error: 'Pre-publication candidate pathname identity mismatch or symlink',
         code: 'candidate-identity-replaced',
         stage: 'final-candidate-reauth',
-      };
-    }
-
-    // H. Reauthenticate destination parent directory
-    const finalParentLstat = getPathLstat(absParentDir);
-    if (
-      !finalParentLstat.exists ||
-      finalParentLstat.isSymbolicLink ||
-      !finalParentLstat.isDirectory ||
-      finalParentLstat.stat.dev !== authenticatedParentDev ||
-      finalParentLstat.stat.ino !== authenticatedParentIno
-    ) {
-      return {
-        ok: false,
-        error: 'Pre-publication destination parent directory identity changed or became a symlink',
-        code: 'parent-directory-replaced',
-        stage: 'final-parent-reauth',
       };
     }
 

@@ -647,7 +647,7 @@ describe('P3B-2C: Cold-Start Cross-Mission Resource Authentication', () => {
 
     const res = await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
     assert.equal(res.ok, false);
-    assert.equal(res.code, 'staging-file-missing');
+    assert.equal(res.code, 'unexpected-staging-artifacts');
   });
 
   test('rejects staging artifact when content SHA does not match expected result SHA', async () => {
@@ -669,7 +669,7 @@ describe('P3B-2C: Cold-Start Cross-Mission Resource Authentication', () => {
 
     const res = await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
     assert.equal(res.ok, false);
-    assert.equal(res.code, 'backup-file-missing');
+    assert.equal(res.code, 'unexpected-backup-artifacts');
   });
 
   test('rejects backup artifact when content SHA does not match expected initial SHA', async () => {
@@ -691,7 +691,7 @@ describe('P3B-2C: Cold-Start Cross-Mission Resource Authentication', () => {
 
     const res = await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
     assert.equal(res.ok, false);
-    assert.equal(res.code, 'target-file-missing');
+    assert.equal(res.code, 'file-missing');
   });
 
   test('rejects live target when content SHA does not match expected initial SHA', async () => {
@@ -716,7 +716,7 @@ describe('P3B-2C: Cold-Start Cross-Mission Resource Authentication', () => {
 
       const res = await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
       assert.equal(res.ok, false);
-      assert.equal(res.code, 'staging-unsafe-symlink');
+      assert.equal(res.code, 'unsafe-symlink');
     }
 
     // 2. Backup symlink
@@ -729,7 +729,7 @@ describe('P3B-2C: Cold-Start Cross-Mission Resource Authentication', () => {
 
       const res = await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
       assert.equal(res.ok, false);
-      assert.equal(res.code, 'backup-unsafe-symlink');
+      assert.equal(res.code, 'unsafe-symlink');
     }
 
     // 3. Live target symlink
@@ -741,7 +741,7 @@ describe('P3B-2C: Cold-Start Cross-Mission Resource Authentication', () => {
 
       const res = await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
       assert.equal(res.ok, false);
-      assert.equal(res.code, 'target-unsafe-symlink');
+      assert.equal(res.code, 'unsafe-symlink');
     }
   });
 
@@ -755,7 +755,7 @@ describe('P3B-2C: Cold-Start Cross-Mission Resource Authentication', () => {
 
     const res = await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
     assert.equal(res.ok, false);
-    assert.equal(res.code, 'parent-unsafe-symlink');
+    assert.equal(res.code, 'unsafe-symlink');
   });
 });
 
@@ -813,7 +813,7 @@ describe('P3B-2C: Descriptor Anchoring, procfs Fallback Refusal, and Collisions'
     const origOpenSync = fs.openSync;
     try {
       fs.openSync = (targetPath, flags, mode) => {
-        if (typeof targetPath === 'string' && targetPath.includes(`.ci-staged-${txId}.tmp`)) {
+        if (capturedPath === null && typeof targetPath === 'string' && targetPath.includes(`.ci-staged-${txId}.tmp`)) {
           capturedPath = targetPath;
           capturedFlags = flags;
         }
@@ -861,7 +861,7 @@ describe('P3B-2C: Descriptor Anchoring, procfs Fallback Refusal, and Collisions'
     });
 
     assert.equal(res.ok, false);
-    assert.equal(res.code, 'collision-detected');
+    assert.equal(res.code, 'candidate-collision');
 
     // Candidate preserved exactly
     assert.equal(fs.readFileSync(candidatePath, 'utf8'), 'pre-existing conflicting candidate');
@@ -887,7 +887,7 @@ describe('P3B-2C: Descriptor Anchoring, procfs Fallback Refusal, and Collisions'
     });
 
     assert.equal(res.ok, false);
-    assert.equal(res.code, 'collision-detected');
+    assert.equal(res.code, 'candidate-collision');
 
     assert.equal(fs.lstatSync(candidatePath).isSymbolicLink(), true);
   });
@@ -907,7 +907,7 @@ describe('P3B-2C: Descriptor Anchoring, procfs Fallback Refusal, and Collisions'
     });
 
     assert.equal(res.ok, false);
-    assert.equal(res.code, 'collision-detected');
+    assert.equal(res.code, 'candidate-collision');
 
     assert.equal(fs.lstatSync(candidatePath).isSymbolicLink(), true);
   });
@@ -1111,7 +1111,7 @@ describe('P3B-2C: Late Substitution at before-journal-advancement Hook', () => {
     });
 
     assert.equal(res.ok, false);
-    assert.equal(res.code, 'ENOENT');
+    assert.equal(res.code, 'file-missing');
 
     assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
   });
@@ -1160,7 +1160,7 @@ describe('P3B-2C: Late Substitution at before-journal-advancement Hook', () => {
     });
 
     assert.equal(res.ok, false);
-    assert.equal(res.code, 'lease-revoked');
+    assert.equal(res.code, 'lease-not-active');
 
     assert.equal(fs.existsSync(candidatePath), true);
     assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
@@ -1382,29 +1382,46 @@ describe('D01-P3B-2C-F1: Separate Synchronization Failure Isolation', () => {
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
     const candidatePath = path.join(repo, `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`);
 
-    const res = await stageDestinationCandidate({
-      repoRoot: repo,
-      txId,
-      op: 'apply',
-      lease,
-      faultHook: (stage) => {
-        if (stage === 'sync-candidate-file') {
+    let armed = false;
+    let injected = false;
+    const origFsyncSync = fs.fsyncSync;
+    try {
+      fs.fsyncSync = (fd, ...args) => {
+        if (armed) {
+          armed = false;
+          injected = true;
           const err = new Error('Simulated EIO during candidate data sync');
           err.code = 'EIO';
           throw err;
         }
-      },
-    });
+        return origFsyncSync(fd, ...args);
+      };
 
-    assert.equal(res.ok, false);
-    assert.equal(res.code, 'EIO');
-    assert.equal(res.stage, 'sync-candidate-file');
-    assert.equal(res.uncertain, true);
+      const res = await stageDestinationCandidate({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+        faultHook: (stage) => {
+          if (stage === 'sync-candidate-file') {
+            armed = true;
+          }
+        },
+      });
 
-    // Journal remains in BACKUP_CREATED
-    assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
-    // Candidate file preserved on disk
-    assert.equal(fs.existsSync(candidatePath), true);
+      assert.equal(injected, true, 'fsyncSync injection should have been reached');
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EIO');
+      assert.equal(res.stage, 'sync-candidate-file');
+      assert.equal(res.uncertain, true);
+
+      // Journal remains in BACKUP_CREATED
+      assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
+      // Candidate file preserved on disk
+      assert.equal(fs.existsSync(candidatePath), true);
+    } finally {
+      fs.fsyncSync = origFsyncSync;
+    }
   });
 
   // 7.4B Candidate mode metadata synchronization failure
@@ -1413,27 +1430,44 @@ describe('D01-P3B-2C-F1: Separate Synchronization Failure Isolation', () => {
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
     const candidatePath = path.join(repo, `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`);
 
-    const res = await stageDestinationCandidate({
-      repoRoot: repo,
-      txId,
-      op: 'apply',
-      lease,
-      faultHook: (stage) => {
-        if (stage === 'sync-candidate-mode') {
+    let armed = false;
+    let injected = false;
+    const origFsyncSync = fs.fsyncSync;
+    try {
+      fs.fsyncSync = (fd, ...args) => {
+        if (armed) {
+          armed = false;
+          injected = true;
           const err = new Error('Simulated EIO during candidate mode sync');
           err.code = 'EIO';
           throw err;
         }
-      },
-    });
+        return origFsyncSync(fd, ...args);
+      };
 
-    assert.equal(res.ok, false);
-    assert.equal(res.code, 'EIO');
-    assert.equal(res.stage, 'sync-candidate-mode');
-    assert.equal(res.uncertain, true);
+      const res = await stageDestinationCandidate({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+        faultHook: (stage) => {
+          if (stage === 'sync-candidate-mode') {
+            armed = true;
+          }
+        },
+      });
 
-    assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
-    assert.equal(fs.existsSync(candidatePath), true);
+      assert.equal(injected, true, 'fsyncSync injection should have been reached');
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EIO');
+      assert.equal(res.stage, 'sync-candidate-mode');
+      assert.equal(res.uncertain, true);
+
+      assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
+      assert.equal(fs.existsSync(candidatePath), true);
+    } finally {
+      fs.fsyncSync = origFsyncSync;
+    }
   });
 
   // 7.4C Destination parent directory synchronization failure
@@ -1442,27 +1476,72 @@ describe('D01-P3B-2C-F1: Separate Synchronization Failure Isolation', () => {
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
     const candidatePath = path.join(repo, `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`);
 
-    const res = await stageDestinationCandidate({
-      repoRoot: repo,
-      txId,
-      op: 'apply',
-      lease,
-      faultHook: (stage) => {
-        if (stage === 'sync-destination-parent') {
+    let armed = false;
+    let injected = false;
+    const origFsyncSync = fs.fsyncSync;
+    try {
+      fs.fsyncSync = (fd, ...args) => {
+        if (armed) {
+          armed = false;
+          injected = true;
           const err = new Error('Simulated EIO during parent directory sync');
           err.code = 'EIO';
           throw err;
         }
-      },
-    });
+        return origFsyncSync(fd, ...args);
+      };
 
-    assert.equal(res.ok, false);
-    assert.equal(res.code, 'EIO');
-    assert.equal(res.stage, 'sync-destination-parent');
-    assert.equal(res.uncertain, true);
+      const res = await stageDestinationCandidate({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+        faultHook: (stage) => {
+          if (stage === 'sync-destination-parent') {
+            armed = true;
+          }
+        },
+      });
 
+      assert.equal(injected, true, 'fsyncSync injection should have been reached');
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EIO');
+      assert.equal(res.stage, 'sync-destination-parent');
+      assert.equal(res.uncertain, true);
+
+      assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
+      assert.equal(fs.existsSync(candidatePath), true);
+    } finally {
+      fs.fsyncSync = origFsyncSync;
+    }
+  });
+
+  test('deliberate faultHook exception during sync propagates as crash simulation', async () => {
+    const repo = setupDisposableRepo('f1-sync-fault-propagate-');
+    const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
+
+    let caught = null;
+    try {
+      await stageDestinationCandidate({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+        faultHook: (stage) => {
+          if (stage === 'sync-candidate-file') {
+            const err = new Error('Intentional crash at candidate sync');
+            throw err;
+          }
+        },
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    assert.ok(caught, 'Expected faultHook exception to propagate');
+    assert.equal(caught._isFault, true);
+    assert.match(caught.message, /Intentional crash at candidate sync/);
     assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
-    assert.equal(fs.existsSync(candidatePath), true);
   });
 });
 
@@ -1478,11 +1557,13 @@ describe('D01-P3B-2C-F1: Journal Publication Failure Boundary & Uncertainty', ()
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
     const candidatePath = path.join(repo, `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`);
 
+    let injected = false;
     const origWriteSync = fs.writeSync;
     try {
       fs.writeSync = (fd, ...args) => {
-        const buf = args[0];
-        if (Buffer.isBuffer(buf) && buf.toString().includes('READY_TO_SWAP')) {
+        const data = args[0];
+        if (typeof data === 'string' && data.includes('READY_TO_SWAP')) {
+          injected = true;
           const err = new Error('Simulated ENOSPC writing temp journal');
           err.code = 'ENOSPC';
           throw err;
@@ -1497,7 +1578,9 @@ describe('D01-P3B-2C-F1: Journal Publication Failure Boundary & Uncertainty', ()
         lease,
       });
 
+      assert.equal(injected, true, 'Pre-publication journal write injection must fire');
       assert.equal(res.ok, false);
+      assert.equal(res.stage, 'pre-rename');
       assert.equal(res.uncertain, false);
 
       // Journal remains in BACKUP_CREATED
@@ -1627,176 +1710,296 @@ describe('D01-P3B-2C-F1: Descriptor Safety and Closure Verification (Section 6)'
     return;
   }
 
-  function trackDescriptors(fn) {
-    const openedFds = new Set();
-    const closedFds = new Set();
+  function trackDescriptors(fn, hooks = {}) {
+    let allocCounter = 0;
+    const openedList = [];
+    const closedList = [];
+    const activeAllocations = new Map();
     const origOpenSync = fs.openSync;
     const origCloseSync = fs.closeSync;
+    const origFstatSync = fs.fstatSync;
+    const origFsyncSync = fs.fsyncSync;
+    const origWriteSync = fs.writeSync;
 
     fs.openSync = function (...args) {
+      if (typeof hooks.onOpen === 'function') {
+        hooks.onOpen(...args);
+      }
       const fd = origOpenSync.apply(fs, args);
-      openedFds.add(fd);
+      const alloc = { id: ++allocCounter, fd, path: args[0], flags: args[1], mode: args[2] };
+      openedList.push(alloc);
+      if (!activeAllocations.has(fd)) {
+        activeAllocations.set(fd, []);
+      }
+      activeAllocations.get(fd).push(alloc);
+      if (typeof hooks.onOpenSuccess === 'function') {
+        hooks.onOpenSuccess(alloc, ...args);
+      }
       return fd;
     };
+
     fs.closeSync = function (fd) {
-      closedFds.add(fd);
+      const active = activeAllocations.get(fd);
+      if (active && active.length > 0) {
+        const closed = active.pop();
+        closedList.push(closed);
+      }
+      if (typeof hooks.onClose === 'function') {
+        hooks.onClose(fd);
+      }
       return origCloseSync.apply(fs, arguments);
     };
+
+    if (typeof hooks.onFstat === 'function') {
+      fs.fstatSync = function (fd, ...args) {
+        return hooks.onFstat(fd, origFstatSync, ...args);
+      };
+    }
+
+    if (typeof hooks.onFsync === 'function') {
+      fs.fsyncSync = function (fd, ...args) {
+        return hooks.onFsync(fd, origFsyncSync, ...args);
+      };
+    }
+
+    if (typeof hooks.onWrite === 'function') {
+      fs.writeSync = function (fd, ...args) {
+        return hooks.onWrite(fd, origWriteSync, ...args);
+      };
+    }
 
     return Promise.resolve()
       .then(fn)
       .finally(() => {
         fs.openSync = origOpenSync;
         fs.closeSync = origCloseSync;
+        if (typeof hooks.onFstat === 'function') fs.fstatSync = origFstatSync;
+        if (typeof hooks.onFsync === 'function') fs.fsyncSync = origFsyncSync;
+        if (typeof hooks.onWrite === 'function') fs.writeSync = origWriteSync;
       })
-      .then((res) => ({
-        res,
-        unclosed: Array.from(openedFds).filter((fd) => !closedFds.has(fd)),
-      }));
+      .then((res) => {
+        const unclosed = Array.from(activeAllocations.values()).flat();
+        return {
+          res,
+          unclosed,
+          openedList,
+          closedList,
+        };
+      });
   }
 
   test('descriptor safety: invalid parent descriptor closes descriptor', async () => {
     const repo = setupDisposableRepo('f1-desc-invalid-parent-');
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
+    const endpointsDir = path.join(repo, 'src/endpoints');
+    let parentFd = null;
 
-    const origFstatSync = fs.fstatSync;
-    const { res, unclosed } = await trackDescriptors(async () => {
-      try {
-        fs.fstatSync = (fd, ...args) => {
-          const s = origFstatSync(fd, ...args);
-          s.isDirectory = () => false;
-          return s;
-        };
+    const { res, unclosed, openedList } = await trackDescriptors(
+      async () => {
         return await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
-      } finally {
-        fs.fstatSync = origFstatSync;
+      },
+      {
+        onOpenSuccess: (alloc) => {
+          if (typeof alloc.path === 'string' && path.resolve(alloc.path) === path.resolve(endpointsDir)) {
+            parentFd = alloc.fd;
+          }
+        },
+        onFstat: (fd, origFstatSync, ...args) => {
+          const s = origFstatSync(fd, ...args);
+          if (parentFd !== null && fd === parentFd) {
+            return Object.create(s, {
+              isDirectory: { value: () => false, enumerable: true },
+            });
+          }
+          return s;
+        },
       }
-    });
+    );
 
     assert.equal(res.ok, false);
     assert.equal(res.code, 'invalid-parent-dir');
+    assert.ok(openedList.length > 0);
     assert.equal(unclosed.length, 0);
   });
 
   test('descriptor safety: cross-device mismatch closes descriptor', async () => {
     const repo = setupDisposableRepo('f1-desc-cross-device-');
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
+    const endpointsDir = path.join(repo, 'src/endpoints');
+    let parentFd = null;
+    let injected = false;
 
-    const origFstatSync = fs.fstatSync;
-    const { res, unclosed } = await trackDescriptors(async () => {
-      try {
-        fs.fstatSync = (fd, ...args) => {
-          const s = origFstatSync(fd, ...args);
-          s.dev = 99999999;
-          return s;
-        };
+    const { res, unclosed, openedList } = await trackDescriptors(
+      async () => {
         return await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
-      } finally {
-        fs.fstatSync = origFstatSync;
+      },
+      {
+        onOpenSuccess: (alloc) => {
+          if (typeof alloc.path === 'string' && path.resolve(alloc.path) === path.resolve(endpointsDir)) {
+            parentFd = alloc.fd;
+          }
+        },
+        onFstat: (fd, origFstatSync, ...args) => {
+          const s = origFstatSync(fd, ...args);
+          if (parentFd !== null && fd === parentFd) {
+            injected = true;
+            return Object.create(s, {
+              dev: { value: s.dev + 9999, enumerable: true },
+            });
+          }
+          return s;
+        },
       }
-    });
+    );
 
+    assert.equal(injected, true, 'Cross-device mismatch injection must fire');
     assert.equal(res.ok, false);
     assert.equal(res.code, 'cross-device-unsupported');
+    assert.ok(openedList.length > 0);
     assert.equal(unclosed.length, 0);
+    assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
   });
 
   test('descriptor safety: candidate allocation failure closes parent descriptor', async () => {
     const repo = setupDisposableRepo('f1-desc-cand-alloc-fail-');
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
+    const endpointsDir = path.join(repo, 'src/endpoints');
+    let injected = false;
 
-    const origOpenSync = fs.openSync;
-    const { res, unclosed } = await trackDescriptors(async () => {
-      try {
-        fs.openSync = (p, flags, mode) => {
+    const { res, unclosed, openedList } = await trackDescriptors(
+      async () => {
+        return await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
+      },
+      {
+        onOpen: (p) => {
           if (typeof p === 'string' && p.startsWith('/proc/self/fd/')) {
+            injected = true;
             const err = new Error('Simulated candidate open failure');
             err.code = 'EACCES';
             throw err;
           }
-          return origOpenSync(p, flags, mode);
-        };
-        return await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
-      } finally {
-        fs.openSync = origOpenSync;
+        },
       }
-    });
+    );
 
+    assert.equal(injected, true, 'Candidate allocation injection must fire');
     assert.equal(res.ok, false);
     assert.equal(res.code, 'unsupported-platform');
-    assert.equal(unclosed.length, 0);
+    const parentOpened = openedList.filter(
+      (a) => typeof a.path === 'string' && path.resolve(a.path) === path.resolve(endpointsDir)
+    );
+    assert.equal(parentOpened.length, 1, 'Parent directory descriptor must have been opened');
+    assert.equal(unclosed.length, 0, 'All opened descriptors must be closed');
+    assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
+    const candidatePath = path.join(repo, `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`);
+    assert.equal(fs.existsSync(candidatePath), false);
   });
 
   test('descriptor safety: candidate write failure closes all descriptors', async () => {
     const repo = setupDisposableRepo('f1-desc-write-fail-');
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
+    let injected = false;
 
-    const origWriteSync = fs.writeSync;
-    const { res, unclosed } = await trackDescriptors(async () => {
-      try {
-        fs.writeSync = (fd, ...args) => {
+    const { res, unclosed, openedList } = await trackDescriptors(
+      async () => {
+        return await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
+      },
+      {
+        onWrite: (fd, origWriteSync, ...args) => {
+          injected = true;
           const err = new Error('Simulated write failure');
           err.code = 'EIO';
           throw err;
-        };
-        return await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
-      } finally {
-        fs.writeSync = origWriteSync;
+        },
       }
-    });
+    );
 
+    assert.equal(injected, true, 'Candidate write injection must fire');
     assert.equal(res.ok, false);
     assert.equal(res.code, 'EIO');
+    assert.ok(openedList.length > 0);
     assert.equal(unclosed.length, 0);
   });
 
   test('descriptor safety: candidate synchronization failure closes all descriptors', async () => {
     const repo = setupDisposableRepo('f1-desc-cand-sync-fail-');
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
+    let armed = false;
+    let injected = false;
 
-    const { res, unclosed } = await trackDescriptors(async () => {
-      return await stageDestinationCandidate({
-        repoRoot: repo,
-        txId,
-        op: 'apply',
-        lease,
-        faultHook: (stage) => {
-          if (stage === 'sync-candidate-file') {
+    const { res, unclosed, openedList } = await trackDescriptors(
+      async () => {
+        return await stageDestinationCandidate({
+          repoRoot: repo,
+          txId,
+          op: 'apply',
+          lease,
+          faultHook: (stage) => {
+            if (stage === 'sync-candidate-file') {
+              armed = true;
+            }
+          },
+        });
+      },
+      {
+        onFsync: (fd, origFsyncSync, ...args) => {
+          if (armed) {
+            armed = false;
+            injected = true;
             const err = new Error('Simulated candidate fsync failure');
             err.code = 'EIO';
             throw err;
           }
+          return origFsyncSync(fd, ...args);
         },
-      });
-    });
+      }
+    );
 
+    assert.equal(injected, true, 'Candidate fsync injection must fire');
     assert.equal(res.ok, false);
     assert.equal(res.code, 'EIO');
+    assert.ok(openedList.length > 0);
     assert.equal(unclosed.length, 0);
   });
 
   test('descriptor safety: parent directory synchronization failure closes all descriptors', async () => {
     const repo = setupDisposableRepo('f1-desc-parent-sync-fail-');
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
+    let armed = false;
+    let injected = false;
 
-    const { res, unclosed } = await trackDescriptors(async () => {
-      return await stageDestinationCandidate({
-        repoRoot: repo,
-        txId,
-        op: 'apply',
-        lease,
-        faultHook: (stage) => {
-          if (stage === 'sync-destination-parent') {
-            const err = new Error('Simulated parent fsync failure');
+    const { res, unclosed, openedList } = await trackDescriptors(
+      async () => {
+        return await stageDestinationCandidate({
+          repoRoot: repo,
+          txId,
+          op: 'apply',
+          lease,
+          faultHook: (stage) => {
+            if (stage === 'sync-destination-parent') {
+              armed = true;
+            }
+          },
+        });
+      },
+      {
+        onFsync: (fd, origFsyncSync, ...args) => {
+          if (armed) {
+            armed = false;
+            injected = true;
+            const err = new Error('Simulated parent directory fsync failure');
             err.code = 'EIO';
             throw err;
           }
+          return origFsyncSync(fd, ...args);
         },
-      });
-    });
+      }
+    );
 
+    assert.equal(injected, true, 'Parent fsync injection must fire');
     assert.equal(res.ok, false);
     assert.equal(res.code, 'EIO');
+    assert.ok(openedList.length > 0);
     assert.equal(unclosed.length, 0);
   });
 
@@ -1804,11 +2007,12 @@ describe('D01-P3B-2C-F1: Descriptor Safety and Closure Verification (Section 6)'
     const repo = setupDisposableRepo('f1-desc-success-');
     const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
 
-    const { res, unclosed } = await trackDescriptors(async () => {
+    const { res, unclosed, openedList } = await trackDescriptors(async () => {
       return await stageDestinationCandidate({ repoRoot: repo, txId, op: 'apply', lease });
     });
 
     assert.equal(res.ok, true);
+    assert.ok(openedList.length > 0);
     assert.equal(unclosed.length, 0);
   });
 });
