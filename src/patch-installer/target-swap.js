@@ -41,6 +41,7 @@ const BUNDLED_MANIFEST_PATH = path.join(
 
 export const MAX_SWAP_FILE_BYTES = 50 * 1024 * 1024; // 50 MiB bounded read
 export const CERTIFIED_TARGET_FILE = 'src/endpoints/stable-diffusion.js';
+export const SPECIAL_MODE_MASK = 0o7000;
 const TX_ID_REGEX = /^ci-tx-[0-9]+-[0-9a-f]+$/i;
 
 /**
@@ -63,7 +64,10 @@ export function isValidOpenConstant(val) {
 /**
  * Safely read and verify a bounded file through an open O_NOFOLLOW | O_NONBLOCK descriptor.
  * Strictly verifies size bounds prior to buffer allocation, detects short-reads / unexpected EOF,
- * verifies concurrent expansion, and verifies pre/post descriptor identity and single-link invariants.
+ * verifies concurrent expansion, rejects unsupported special permission bits (setuid/setgid/sticky),
+ * and verifies pre/post descriptor identity and single-link invariants.
+ *
+ * Guaranteed fail-closed descriptor closure: failed or uncertain close cannot return success.
  *
  * @param {string} absPath - Absolute path to file to read
  * @param {object} [options]
@@ -151,6 +155,13 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
     throw err;
   }
 
+  // F1-C: Reject unsupported setuid, setgid, and sticky permission bits
+  if ((preCheck.stat.mode & SPECIAL_MODE_MASK) !== 0) {
+    const err = new Error(`File "${absPath}" has unsupported special permission bits (setuid/setgid/sticky): 0o${(preCheck.stat.mode & 0o7777).toString(8)}`);
+    err.code = 'unsupported-special-mode';
+    throw err;
+  }
+
   // Hook right before opening descriptor (allows testing TOCTOU races such as FIFO substitution)
   if (beforeOpenHook) {
     beforeOpenHook(absPath);
@@ -159,6 +170,7 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
   // 3. Open file descriptor with O_RDONLY | O_NOFOLLOW | O_NONBLOCK
   const openFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
   let fd = null;
+  let primaryError = null;
   try {
     fd = fs.openSync(absPath, openFlags);
   } catch (err) {
@@ -188,6 +200,13 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
     if (!preStat.isFile() || preStat.isSymbolicLink()) {
       const err = new Error(`File descriptor for "${absPath}" is not a regular file`);
       err.code = 'unsupported-type';
+      throw err;
+    }
+
+    // F1-C: Reject unsupported setuid, setgid, and sticky permission bits on descriptor
+    if ((preStat.mode & SPECIAL_MODE_MASK) !== 0) {
+      const err = new Error(`File descriptor for "${absPath}" has unsupported special permission bits (setuid/setgid/sticky): 0o${(preStat.mode & 0o7777).toString(8)}`);
+      err.code = 'unsupported-special-mode';
       throw err;
     }
 
@@ -228,7 +247,8 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
       throw err;
     }
 
-    if ((preCheck.stat.mode & 0o777) !== (preStat.mode & 0o777)) {
+    // F1-C: Compare full permission bits without masking special bits
+    if ((preCheck.stat.mode & 0o7777) !== (preStat.mode & 0o7777)) {
       const err = new Error(`Pathname permissions do not match opened descriptor for "${absPath}"`);
       err.code = 'descriptor-mode-mismatch';
       throw err;
@@ -274,7 +294,14 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
       throw err;
     }
 
-    if ((postStat.mode & 0o777) !== (preStat.mode & 0o777)) {
+    // F1-C: Reject special bits on postStat
+    if ((postStat.mode & SPECIAL_MODE_MASK) !== 0) {
+      const err = new Error(`File "${absPath}" has unsupported special permission bits after reading: 0o${(postStat.mode & 0o7777).toString(8)}`);
+      err.code = 'unsupported-special-mode';
+      throw err;
+    }
+
+    if ((postStat.mode & 0o7777) !== (preStat.mode & 0o7777)) {
       const err = new Error(`File "${absPath}" permissions modified concurrently during reading`);
       err.code = 'concurrent-modification';
       throw err;
@@ -295,9 +322,21 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
       !postCheck.isFile() ||
       postCheck.dev !== preStat.dev ||
       postCheck.ino !== preStat.ino ||
-      postCheck.size !== preStat.size ||
-      (postCheck.mode & 0o777) !== (preStat.mode & 0o777)
+      postCheck.size !== preStat.size
     ) {
+      const err = new Error(`Pathname "${absPath}" identity, mode, or type modified concurrently after reading`);
+      err.code = 'pathname-continuity-error';
+      throw err;
+    }
+
+    // F1-C: Reject special bits on postCheck
+    if ((postCheck.mode & SPECIAL_MODE_MASK) !== 0) {
+      const err = new Error(`Pathname "${absPath}" has unsupported special permission bits after reading: 0o${(postCheck.mode & 0o7777).toString(8)}`);
+      err.code = 'unsupported-special-mode';
+      throw err;
+    }
+
+    if ((postCheck.mode & 0o7777) !== (preStat.mode & 0o7777)) {
       const err = new Error(`Pathname "${absPath}" identity, mode, or type modified concurrently after reading`);
       err.code = 'pathname-continuity-error';
       throw err;
@@ -317,13 +356,26 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
       sha256,
       gitBlobSha,
     };
+  } catch (err) {
+    primaryError = err;
+    throw err;
   } finally {
-    // Guaranteed descriptor closure
+    // F1-D: Fail closed on descriptor-close errors
     if (fd !== null) {
+      const fdToClose = fd;
+      fd = null; // Do not retry or close again: ownership relinquished immediately
       try {
-        fs.closeSync(fd);
-      } catch {
-        // ignore close errors in finally
+        fs.closeSync(fdToClose);
+      } catch (closeErr) {
+        if (!primaryError) {
+          const err = new Error(`Failed to close descriptor for "${absPath}": ${closeErr.message}`);
+          err.code = closeErr.code || 'descriptor-close-error';
+          err.cause = closeErr;
+          throw err;
+        } else if (typeof primaryError === 'object' && primaryError !== null && !primaryError.closeError) {
+          // Preserve primary verification error when cleanup also fails
+          primaryError.closeError = closeErr;
+        }
       }
     }
   }
@@ -499,6 +551,18 @@ export async function authenticateSwapPrerequisites(options = {}) {
     };
   }
 
+  // Reject symlinked .ci-patch immediately before accessing lock or journal through it
+  const ciPatchCheck = getPathLstat(path.resolve(normRepo, '.ci-patch'));
+  if (ciPatchCheck.exists && ciPatchCheck.isSymbolicLink) {
+    return {
+      ok: false,
+      verified: false,
+      error: 'Directory component ".ci-patch" is a symbolic link',
+      code: 'unsafe-symlink',
+      stage: 'staging-hierarchy',
+    };
+  }
+
   // 4. Authenticate transaction lock ownership and in-process lease
   const lockAuth = verifyLockOwnershipForMutation(normRepo, txId.trim(), op, lease);
   if (!lockAuth.ok) {
@@ -669,14 +733,10 @@ export async function authenticateSwapPrerequisites(options = {}) {
     };
   }
 
-  // 6. Bundled patch manifest verification
-  const manifestPath = typeof providedManifest === 'string'
-    ? path.resolve(normRepo, providedManifest)
-    : BUNDLED_MANIFEST_PATH;
-
+  // 6. Bundled patch manifest verification (F1-E: Bind manifest authority to package)
   let pkgCheck;
   try {
-    pkgCheck = await verifyPatchManifest(manifestPath);
+    pkgCheck = await verifyPatchManifest(BUNDLED_MANIFEST_PATH);
   } catch (err) {
     return {
       ok: false,
@@ -699,7 +759,16 @@ export async function authenticateSwapPrerequisites(options = {}) {
 
   const certifiedManifest = pkgCheck.manifest;
   const patchEntry = certifiedManifest.patches?.runtime;
-  if (!patchEntry) {
+  if (
+    !patchEntry ||
+    !patchEntry.targetFile ||
+    !patchEntry.relativePath ||
+    !patchEntry.sha256 ||
+    !patchEntry.original?.sha256 ||
+    !patchEntry.original?.gitBlobSha ||
+    !patchEntry.expected?.sha256 ||
+    !patchEntry.expected?.gitBlobSha
+  ) {
     return {
       ok: false,
       verified: false,
@@ -709,63 +778,106 @@ export async function authenticateSwapPrerequisites(options = {}) {
     };
   }
 
-  if (providedManifest !== null && typeof providedManifest === 'object') {
-    if (providedManifest.patches?.runtime?.targetFile && providedManifest.patches?.runtime?.targetFile !== patchEntry.targetFile) {
+  // F1-E: If caller supplies an optional manifest, require strict consistency with certified package
+  if (providedManifest !== null && providedManifest !== undefined) {
+    if (typeof providedManifest === 'string') {
+      const resolvedNorm = path.resolve(normRepo, providedManifest);
+      const resolvedRoot = path.resolve(REPO_ROOT, providedManifest);
+      if (resolvedNorm !== BUNDLED_MANIFEST_PATH && resolvedRoot !== BUNDLED_MANIFEST_PATH) {
+        return {
+          ok: false,
+          verified: false,
+          error: `Arbitrary manifest path "${providedManifest}" is not permitted to redefine certified package`,
+          code: 'untrusted-manifest-path',
+          stage: 'manifest-verification',
+        };
+      }
+    } else if (typeof providedManifest === 'object') {
+      if (Array.isArray(providedManifest)) {
+        return {
+          ok: false,
+          verified: false,
+          error: 'Provided manifest must be a plain object',
+          code: 'manifest-invalid',
+          stage: 'manifest-verification',
+        };
+      }
+      const provRuntime = providedManifest.patches?.runtime;
+      if (
+        !providedManifest.releaseCommit ||
+        !provRuntime ||
+        !provRuntime.targetFile ||
+        !provRuntime.relativePath ||
+        !provRuntime.sha256 ||
+        !provRuntime.original?.sha256 ||
+        !provRuntime.original?.gitBlobSha ||
+        !provRuntime.expected?.sha256 ||
+        !provRuntime.expected?.gitBlobSha
+      ) {
+        return {
+          ok: false,
+          verified: false,
+          error: 'Provided manifest is malformed or incomplete',
+          code: 'manifest-invalid',
+          stage: 'manifest-verification',
+        };
+      }
+      if (
+        providedManifest.releaseCommit !== certifiedManifest.releaseCommit ||
+        provRuntime.targetFile !== patchEntry.targetFile ||
+        provRuntime.relativePath !== patchEntry.relativePath ||
+        provRuntime.sha256 !== patchEntry.sha256 ||
+        provRuntime.original.sha256 !== patchEntry.original.sha256 ||
+        provRuntime.original.gitBlobSha !== patchEntry.original.gitBlobSha ||
+        provRuntime.expected.sha256 !== patchEntry.expected.sha256 ||
+        provRuntime.expected.gitBlobSha !== patchEntry.expected.gitBlobSha
+      ) {
+        return {
+          ok: false,
+          verified: false,
+          error: 'Provided manifest contradicts certified bundled package manifest',
+          code: 'manifest-mismatch',
+          stage: 'manifest-verification',
+        };
+      }
+    } else {
       return {
         ok: false,
         verified: false,
-        error: `Provided manifest targetFile "${providedManifest.patches.runtime.targetFile}" contradicts certified runtime targetFile "${patchEntry.targetFile}"`,
-        code: 'manifest-target-mismatch',
-        stage: 'manifest-verification',
-      };
-    }
-    if (
-      providedManifest.releaseCommit !== certifiedManifest.releaseCommit ||
-      providedManifest.patches?.runtime?.sha256 !== patchEntry.sha256 ||
-      providedManifest.patches?.runtime?.original?.sha256 !== patchEntry.original?.sha256 ||
-      providedManifest.patches?.runtime?.expected?.sha256 !== patchEntry.expected?.sha256
-    ) {
-      return {
-        ok: false,
-        verified: false,
-        error: 'Provided manifest contradicts certified bundled package manifest',
-        code: 'manifest-mismatch',
+        error: 'Provided manifest must be a non-null object or string path',
+        code: 'manifest-invalid',
         stage: 'manifest-verification',
       };
     }
   }
 
-  const effectiveManifest = (providedManifest && typeof providedManifest === 'object')
-    ? providedManifest
-    : certifiedManifest;
-
-  if (effectiveManifest.patches?.runtime?.targetFile !== journal.targetFile) {
+  if (patchEntry.targetFile !== journal.targetFile) {
     return {
       ok: false,
       verified: false,
-      error: `Manifest targetFile "${effectiveManifest.patches?.runtime?.targetFile}" does not match journal targetFile "${journal.targetFile}"`,
+      error: `Manifest targetFile "${patchEntry.targetFile}" does not match journal targetFile "${journal.targetFile}"`,
       code: 'manifest-target-mismatch',
       stage: 'manifest-verification',
     };
   }
 
-  // Compute operation-dependent expected digests
+  // F1-E: Derive all authoritative SHA-256 and Git blob fingerprints strictly from verified bundled manifest
   let expectedInitialSha;
   let expectedInitialGitBlob;
   let expectedResultSha;
   let expectedResultGitBlob;
 
   if (op === 'apply') {
-    expectedInitialSha = effectiveManifest.patches.runtime.original.sha256.toLowerCase();
-    expectedInitialGitBlob = effectiveManifest.patches.runtime.original.gitBlobSha.toLowerCase();
-    expectedResultSha = effectiveManifest.patches.runtime.expected.sha256.toLowerCase();
-    expectedResultGitBlob = effectiveManifest.patches.runtime.expected.gitBlobSha.toLowerCase();
+    expectedInitialSha = patchEntry.original.sha256.toLowerCase();
+    expectedInitialGitBlob = patchEntry.original.gitBlobSha.toLowerCase();
+    expectedResultSha = patchEntry.expected.sha256.toLowerCase();
+    expectedResultGitBlob = patchEntry.expected.gitBlobSha.toLowerCase();
   } else {
     // op === 'remove'
-    expectedInitialSha = effectiveManifest.patches.runtime.expected.sha256.toLowerCase();
-    expectedInitialGitBlob = effectiveManifest.patches.runtime.expected.gitBlobSha.toLowerCase();
-    expectedResultSha = effectiveManifest.patches.runtime.original.sha256.toLowerCase();
-    expectedResultGitBlob = effectiveManifest.patches.runtime.original.gitBlobSha.toLowerCase();
+    expectedInitialSha = patchEntry.expected.sha256.toLowerCase();
+    expectedInitialGitBlob = patchEntry.expected.gitBlobSha.toLowerCase();
+    expectedResultSha = patchEntry.original.sha256.toLowerCase();
+    expectedResultGitBlob = patchEntry.original.gitBlobSha.toLowerCase();
   }
 
   // Verify journal expected hashes against certified manifest
@@ -789,25 +901,163 @@ export async function authenticateSwapPrerequisites(options = {}) {
     };
   }
 
-  // 7. Destination parent directory descriptor and procfs anchoring
-  const absParentDir = path.resolve(normRepo, targetDir);
-  if (!isPathContained(normRepo, absParentDir)) {
+  // 7. Authenticate every parent-directory component (F1-A)
+  const requiredDirComponents = [
+    {
+      rel: 'src',
+      name: 'intermediate target directory component (src)',
+      stage: 'destination-parent',
+      codeMissing: 'parent-dir-invalid',
+      codeSymlink: 'unsafe-symlink',
+      codeNotDir: 'parent-dir-invalid',
+    },
+    {
+      rel: targetDir, // 'src/endpoints'
+      name: 'destination parent directory (src/endpoints)',
+      stage: 'destination-parent',
+      codeMissing: 'parent-dir-invalid',
+      codeSymlink: 'unsafe-symlink',
+      codeNotDir: 'parent-dir-invalid',
+    },
+    {
+      rel: '.ci-patch',
+      name: 'transaction root directory (.ci-patch)',
+      stage: 'staging-hierarchy',
+      codeMissing: 'staged-resource-missing',
+      codeSymlink: 'unsafe-symlink',
+      codeNotDir: 'invalid-staging-dir',
+    },
+    {
+      rel: '.ci-patch/staging',
+      name: 'staging parent directory (.ci-patch/staging)',
+      stage: 'staging-hierarchy',
+      codeMissing: 'staged-resource-missing',
+      codeSymlink: 'unsafe-symlink',
+      codeNotDir: 'invalid-staging-dir',
+    },
+    {
+      rel: `.ci-patch/staging/${txId.trim()}`,
+      name: `staging transaction directory (.ci-patch/staging/${txId.trim()})`,
+      stage: 'staging-hierarchy',
+      codeMissing: 'staged-resource-missing',
+      codeSymlink: 'unsafe-symlink',
+      codeNotDir: 'invalid-staging-dir',
+    },
+    {
+      rel: '.ci-patch/backup',
+      name: 'backup parent directory (.ci-patch/backup)',
+      stage: 'backup-hierarchy',
+      codeMissing: 'backup-resource-missing',
+      codeSymlink: 'unsafe-symlink',
+      codeNotDir: 'invalid-backup-dir',
+    },
+    {
+      rel: `.ci-patch/backup/${txId.trim()}`,
+      name: `backup transaction directory (.ci-patch/backup/${txId.trim()})`,
+      stage: 'backup-hierarchy',
+      codeMissing: 'backup-resource-missing',
+      codeSymlink: 'unsafe-symlink',
+      codeNotDir: 'invalid-backup-dir',
+    },
+  ];
+
+  for (const comp of requiredDirComponents) {
+    const absComp = path.resolve(normRepo, comp.rel);
+    if (!isPathContained(normRepo, absComp)) {
+      return {
+        ok: false,
+        verified: false,
+        error: `Directory "${absComp}" escapes repository root`,
+        code: 'path-escape',
+        stage: comp.stage,
+      };
+    }
+    const st = getPathLstat(absComp);
+    if (st.error || !st.exists) {
+      return {
+        ok: false,
+        verified: false,
+        error: `Directory component "${comp.rel}" does not exist`,
+        code: comp.codeMissing,
+        stage: comp.stage,
+      };
+    }
+    if (st.isSymbolicLink) {
+      return {
+        ok: false,
+        verified: false,
+        error: `Directory component "${comp.rel}" is a symbolic link`,
+        code: comp.codeSymlink,
+        stage: comp.stage,
+      };
+    }
+    if (!st.isDirectory) {
+      return {
+        ok: false,
+        verified: false,
+        error: `Directory component "${comp.rel}" is not a genuine directory`,
+        code: comp.codeNotDir,
+        stage: comp.stage,
+      };
+    }
+  }
+
+  // 8. Validate transaction directory contents (F1-A & F1-B)
+  const stagingTxDir = path.resolve(normRepo, `.ci-patch/staging/${txId.trim()}`);
+  let stagingChildren;
+  try {
+    stagingChildren = fs.readdirSync(stagingTxDir);
+  } catch (err) {
     return {
       ok: false,
       verified: false,
-      error: `Destination parent directory "${absParentDir}" escapes repository root`,
-      code: 'path-escape',
-      stage: 'destination-parent',
+      error: `Failed to inspect staging directory contents: ${err.message}`,
+      code: 'inspection-error',
+      stage: 'isolated-staging-verification',
+    };
+  }
+  if (stagingChildren.length !== 1 || stagingChildren[0] !== targetBase) {
+    return {
+      ok: false,
+      verified: false,
+      error: `Staging directory contains unexpected artifacts: ${stagingChildren.join(', ')}`,
+      code: 'unexpected-staging-artifacts',
+      stage: 'isolated-staging-verification',
     };
   }
 
+  const backupTxDir = path.resolve(normRepo, `.ci-patch/backup/${txId.trim()}`);
+  let backupChildren;
+  try {
+    backupChildren = fs.readdirSync(backupTxDir);
+  } catch (err) {
+    return {
+      ok: false,
+      verified: false,
+      error: `Failed to inspect backup directory contents: ${err.message}`,
+      code: 'inspection-error',
+      stage: 'backup-verification',
+    };
+  }
+  if (backupChildren.length !== 1 || backupChildren[0] !== targetBase) {
+    return {
+      ok: false,
+      verified: false,
+      error: `Backup directory contains unexpected artifacts: ${backupChildren.join(', ')}`,
+      code: 'unexpected-backup-artifacts',
+      stage: 'backup-verification',
+    };
+  }
+
+  // 9. Destination parent directory descriptor and procfs anchoring
+  const absParentDir = path.resolve(normRepo, targetDir);
   const parentLstat = getPathLstat(absParentDir);
   if (parentLstat.error || !parentLstat.exists || !parentLstat.isDirectory || parentLstat.isSymbolicLink) {
     return {
       ok: false,
       verified: false,
       error: `Destination parent directory "${absParentDir}" does not exist, is not a directory, or is a symbolic link`,
-      code: 'parent-dir-invalid',
+      code: parentLstat.isSymbolicLink ? 'unsafe-symlink' : 'parent-dir-invalid',
       stage: 'destination-parent',
     };
   }
@@ -836,26 +1086,34 @@ export async function authenticateSwapPrerequisites(options = {}) {
     };
   }
 
+  let verificationResult = null;
+  let verificationException = null;
+
+  const fail = (res) => {
+    verificationResult = res;
+    return res;
+  };
+
   try {
     const parentStat = fs.fstatSync(parentFd);
     if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: 'Destination parent descriptor is not a directory or is a symbolic link',
         code: 'parent-dir-invalid',
         stage: 'destination-parent',
-      };
+      });
     }
 
     if (parentStat.dev !== parentLstat.stat.dev || parentStat.ino !== parentLstat.stat.ino) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: 'Destination parent descriptor identity does not match preliminary directory inspection',
         code: 'parent-dir-identity-mismatch',
         stage: 'destination-parent',
-      };
+      });
     }
 
     // Procfs descriptor anchoring verification
@@ -866,13 +1124,13 @@ export async function authenticateSwapPrerequisites(options = {}) {
       procAvailable = false;
     }
     if (!procAvailable) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Procfs descriptor directory "${procDir}" is unavailable`,
         code: 'procfs-unavailable',
         stage: 'procfs-anchoring',
-      };
+      });
     }
 
     const parentProcDir = path.join(procDir, String(parentFd));
@@ -880,34 +1138,37 @@ export async function authenticateSwapPrerequisites(options = {}) {
     try {
       parentProcStat = fs.statSync(parentProcDir);
     } catch (err) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Procfs descriptor path "${parentProcDir}" cannot be accessed: ${err.message}`,
         code: 'procfs-descriptor-unavailable',
         stage: 'procfs-anchoring',
-      };
+      });
     }
 
     if (!parentProcStat.isDirectory()) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Procfs descriptor path "${parentProcDir}" is not a directory`,
         code: 'procfs-descriptor-not-directory',
         stage: 'procfs-anchoring',
-      };
+      });
     }
 
     if (parentProcStat.dev !== parentStat.dev || parentProcStat.ino !== parentStat.ino) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: 'Procfs descriptor path resolves to unexpected directory identity',
         code: 'procfs-descriptor-identity-mismatch',
         stage: 'procfs-anchoring',
-      };
+      });
     }
+
+    // Intentional fault hook after destination parent is authenticated
+    runFault('after-parent-authenticated', { absParentDir, parentFd, parentStat });
 
     const readerOpts = {
       maxBytes,
@@ -917,16 +1178,16 @@ export async function authenticateSwapPrerequisites(options = {}) {
       beforeOpenHook,
     };
 
-    // 8. Authenticate isolated staging output
+    // 10. Authenticate isolated staging output
     const absStaging = path.resolve(normRepo, journal.isolatedStagedPath);
     if (!isPathContained(normRepo, absStaging)) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Isolated staged path "${absStaging}" escapes repository root`,
         code: 'staging-path-escape',
         stage: 'isolated-staging-verification',
-      };
+      });
     }
 
     let stagingRes;
@@ -934,46 +1195,57 @@ export async function authenticateSwapPrerequisites(options = {}) {
       stagingRes = readBoundedNonblockingFile(absStaging, readerOpts);
     } catch (err) {
       if (err?._isFault) throw err;
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Isolated staging verification failed: ${err.message}`,
         code: err.code || 'staging-verification-failed',
         stage: 'isolated-staging-verification',
         reason: err.message,
-      };
+      });
+    }
+
+    // F1-B: Staging file must strictly have mode 0600
+    if (stagingRes.mode !== '0600') {
+      return fail({
+        ok: false,
+        verified: false,
+        error: `Isolated staging file mode mismatch: expected "0600", observed "${stagingRes.mode}"`,
+        code: 'staging-mode-mismatch',
+        stage: 'isolated-staging-verification',
+      });
     }
 
     if (stagingRes.sha256 !== expectedResultSha) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Isolated staging SHA-256 mismatch: expected "${expectedResultSha}", observed "${stagingRes.sha256}"`,
         code: 'staging-digest-mismatch',
         stage: 'isolated-staging-verification',
-      };
+      });
     }
 
     if (stagingRes.gitBlobSha !== expectedResultGitBlob) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Isolated staging Git blob mismatch: expected "${expectedResultGitBlob}", observed "${stagingRes.gitBlobSha}"`,
         code: 'staging-digest-mismatch',
         stage: 'isolated-staging-verification',
-      };
+      });
     }
 
-    // 9. Authenticate verified backup
+    // 11. Authenticate verified backup
     const absBackup = path.resolve(normRepo, journal.backupPath);
     if (!isPathContained(normRepo, absBackup)) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Backup path "${absBackup}" escapes repository root`,
         code: 'backup-path-escape',
         stage: 'backup-verification',
-      };
+      });
     }
 
     let backupRes;
@@ -981,46 +1253,57 @@ export async function authenticateSwapPrerequisites(options = {}) {
       backupRes = readBoundedNonblockingFile(absBackup, readerOpts);
     } catch (err) {
       if (err?._isFault) throw err;
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Backup verification failed: ${err.message}`,
         code: err.code || 'backup-verification-failed',
         stage: 'backup-verification',
         reason: err.message,
-      };
+      });
+    }
+
+    // F1-B: Backup file must strictly have mode 0600
+    if (backupRes.mode !== '0600') {
+      return fail({
+        ok: false,
+        verified: false,
+        error: `Backup file mode mismatch: expected "0600", observed "${backupRes.mode}"`,
+        code: 'backup-mode-mismatch',
+        stage: 'backup-verification',
+      });
     }
 
     if (backupRes.sha256 !== expectedInitialSha) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Backup SHA-256 mismatch: expected "${expectedInitialSha}", observed "${backupRes.sha256}"`,
         code: 'backup-digest-mismatch',
         stage: 'backup-verification',
-      };
+      });
     }
 
     if (backupRes.gitBlobSha !== expectedInitialGitBlob) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Backup Git blob mismatch: expected "${expectedInitialGitBlob}", observed "${backupRes.gitBlobSha}"`,
         code: 'backup-digest-mismatch',
         stage: 'backup-verification',
-      };
+      });
     }
 
-    // 10. Authenticate live target
+    // 12. Authenticate live target
     const absLiveTarget = path.resolve(normRepo, journal.targetFile);
     if (!isPathContained(normRepo, absLiveTarget)) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Live target path "${absLiveTarget}" escapes repository root`,
         code: 'target-path-escape',
         stage: 'live-target-verification',
-      };
+      });
     }
 
     let liveTargetRes;
@@ -1028,69 +1311,69 @@ export async function authenticateSwapPrerequisites(options = {}) {
       liveTargetRes = readBoundedNonblockingFile(absLiveTarget, readerOpts);
     } catch (err) {
       if (err?._isFault) throw err;
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Live target verification failed: ${err.message}`,
         code: err.code || 'live-target-verification-failed',
         stage: 'live-target-verification',
         reason: err.message,
-      };
+      });
     }
 
     // Live target must reside on the same filesystem device as destination parent directory
     if (liveTargetRes.dev !== parentStat.dev) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: 'Live target resides on a different filesystem device than destination parent directory',
         code: 'target-cross-device',
         stage: 'live-target-verification',
-      };
+      });
     }
 
     // Live target mode must match journal recorded targetMode
     if (liveTargetRes.mode !== journal.targetMode) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Live target mode mismatch: expected "${journal.targetMode}", observed "${liveTargetRes.mode}"`,
         code: 'target-mode-mismatch',
         stage: 'live-target-verification',
-      };
+      });
     }
 
     // Live target must still contain initial bytes and Git blob
     if (liveTargetRes.sha256 !== expectedInitialSha) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Live target SHA-256 mismatch: expected initial "${expectedInitialSha}", observed "${liveTargetRes.sha256}"`,
         code: 'target-digest-mismatch',
         stage: 'live-target-verification',
-      };
+      });
     }
 
     if (liveTargetRes.gitBlobSha !== expectedInitialGitBlob) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Live target Git blob mismatch: expected initial "${expectedInitialGitBlob}", observed "${liveTargetRes.gitBlobSha}"`,
         code: 'target-digest-mismatch',
         stage: 'live-target-verification',
-      };
+      });
     }
 
-    // 11. Authenticate destination candidate
+    // 13. Authenticate destination candidate
     const absCandidate = path.resolve(normRepo, journal.destinationStagedPath);
     if (!isPathContained(normRepo, absCandidate)) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Destination candidate path "${absCandidate}" escapes repository root`,
         code: 'candidate-path-escape',
         stage: 'candidate-verification',
-      };
+      });
     }
 
     let candidateRes;
@@ -1098,74 +1381,103 @@ export async function authenticateSwapPrerequisites(options = {}) {
       candidateRes = readBoundedNonblockingFile(absCandidate, readerOpts);
     } catch (err) {
       if (err?._isFault) throw err;
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Destination candidate verification failed: ${err.message}`,
         code: err.code || 'candidate-verification-failed',
         stage: 'candidate-verification',
         reason: err.message,
-      };
+      });
     }
 
     // Destination candidate must reside on same device as destination parent directory and live target
     if (candidateRes.dev !== parentStat.dev || candidateRes.dev !== liveTargetRes.dev) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: 'Destination candidate resides on a different filesystem device than live target or parent directory',
         code: 'candidate-cross-device',
         stage: 'candidate-verification',
-      };
+      });
     }
 
     // Destination candidate inode must be distinct from live target inode
     if (candidateRes.ino === liveTargetRes.ino) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: 'Destination candidate unexpectedly shares inode identity with live target',
         code: 'candidate-inode-collision',
         stage: 'candidate-verification',
-      };
+      });
     }
 
     // Destination candidate mode must match recorded targetMode
     if (candidateRes.mode !== journal.targetMode) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Destination candidate mode mismatch: expected "${journal.targetMode}", observed "${candidateRes.mode}"`,
         code: 'candidate-mode-mismatch',
         stage: 'candidate-verification',
-      };
+      });
     }
 
     // Destination candidate must contain expected result bytes and Git blob
     if (candidateRes.sha256 !== expectedResultSha) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Destination candidate SHA-256 mismatch: expected result "${expectedResultSha}", observed "${candidateRes.sha256}"`,
         code: 'candidate-digest-mismatch',
         stage: 'candidate-verification',
-      };
+      });
     }
 
     if (candidateRes.gitBlobSha !== expectedResultGitBlob) {
-      return {
+      return fail({
         ok: false,
         verified: false,
         error: `Destination candidate Git blob mismatch: expected result "${expectedResultGitBlob}", observed "${candidateRes.gitBlobSha}"`,
         code: 'candidate-digest-mismatch',
         stage: 'candidate-verification',
-      };
+      });
+    }
+
+    // 14. Check pathname continuity against the authenticated descriptor after resource verification (F1-A)
+    let postParentCheck;
+    try {
+      postParentCheck = fs.lstatSync(absParentDir);
+    } catch (err) {
+      return fail({
+        ok: false,
+        verified: false,
+        error: `Destination parent directory "${absParentDir}" disappeared or became inaccessible after resource verification: ${err.message}`,
+        code: 'parent-dir-continuity-error',
+        stage: 'destination-parent',
+      });
+    }
+
+    if (
+      postParentCheck.isSymbolicLink() ||
+      !postParentCheck.isDirectory() ||
+      postParentCheck.dev !== parentStat.dev ||
+      postParentCheck.ino !== parentStat.ino
+    ) {
+      return fail({
+        ok: false,
+        verified: false,
+        error: `Destination parent directory "${absParentDir}" identity or type modified concurrently after resource verification`,
+        code: 'parent-dir-continuity-error',
+        stage: 'destination-parent',
+      });
     }
 
     // Inode continuity was verified within the invocation for candidate, target, backup, staging, parent.
     // Return read-only informational verification result.
     // DOES NOT advance journal phase or produce a reusable authorization capability token.
-    return {
+    verificationResult = {
       ok: true,
       verified: true,
       txId: txId.trim(),
@@ -1189,12 +1501,39 @@ export async function authenticateSwapPrerequisites(options = {}) {
       parentDev: parentStat.dev,
       parentIno: parentStat.ino,
     };
+    return verificationResult;
+  } catch (err) {
+    verificationException = err;
+    throw err;
   } finally {
+    // F1-D: Fail closed on destination parent descriptor closure errors
     if (parentFd !== null) {
+      const fdToClose = parentFd;
+      parentFd = null; // Relinquish ownership immediately; do not retry close
+      let closeErr = null;
       try {
-        fs.closeSync(parentFd);
-      } catch {
-        // ignore close errors in finally
+        fs.closeSync(fdToClose);
+      } catch (err) {
+        closeErr = err;
+      }
+
+      if (closeErr) {
+        if (verificationException) {
+          // Preserve primary verification exception when cleanup also fails
+          if (typeof verificationException === 'object' && verificationException !== null && !verificationException.closeError) {
+            verificationException.closeError = closeErr;
+          }
+        } else if (verificationResult && verificationResult.ok === true) {
+          // A failed descriptor close cannot return verified: true
+          return {
+            ok: false,
+            verified: false,
+            error: `Failed to close destination parent directory descriptor: ${closeErr.message}`,
+            code: closeErr.code || 'parent-dir-close-error',
+            stage: 'destination-parent',
+            reason: closeErr.message,
+          };
+        }
       }
     }
   }
@@ -1204,7 +1543,6 @@ export async function authenticateSwapPrerequisites(options = {}) {
  * Aliases for authenticateSwapPrerequisites.
  */
 export const authenticatePreSwap = authenticateSwapPrerequisites;
-export const authenticateSwapPrerequisitesSync = authenticateSwapPrerequisites;
 
 /**
  * Reserved placeholder for future Stage C live-target swap.
