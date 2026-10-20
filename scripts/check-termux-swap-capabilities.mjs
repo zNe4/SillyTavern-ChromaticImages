@@ -8,6 +8,23 @@ import { fileURLToPath } from 'node:url';
 export const PROBE_PREFIX = '.ci-termux-probe-';
 
 /**
+ * Validate open constants: must be finite, non-zero integer.
+ * Rejects missing, zero, NaN, Infinity, fractional, and non-numeric values.
+ *
+ * @param {unknown} val
+ * @returns {boolean}
+ */
+export function isValidOpenConstant(val) {
+  return (
+    typeof val === 'number' &&
+    Number.isFinite(val) &&
+    !Number.isNaN(val) &&
+    Number.isInteger(val) &&
+    val !== 0
+  );
+}
+
+/**
  * Validate device identifier.
  * @param {unknown} val
  * @returns {boolean}
@@ -125,12 +142,31 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
   let probeDir = null;
   let initialDev = null;
   let initialIno = null;
-  let parentFd = null;
-  let candidateFd = null;
-  let targetFd = null;
-  let readFd = null;
+  let createdCandidateIno = null;
+  let createdTargetIno = null;
   let cleanupSucceeded = false;
   let cleanupError = null;
+
+  // Track owned descriptors with explicit closure state
+  const ownedDescriptors = {
+    parent: { fd: null, name: 'destination-parent' },
+    candidate: { fd: null, name: 'candidate' },
+    target: { fd: null, name: 'initial-target' },
+    read: { fd: null, name: 'readback-target' },
+  };
+  const closeErrors = [];
+
+  function safelyCloseDescriptor(ref) {
+    if (ref.fd === null) return;
+    const toClose = ref.fd;
+    ref.fd = null; // Unbind immediately to prevent double-closing or closing a reused descriptor
+    try {
+      runFault(`close-${ref.name}`, { fd: toClose });
+      fs.closeSync(toClose);
+    } catch (err) {
+      closeErrors.push({ name: ref.name, fd: toClose, error: err });
+    }
+  }
 
   const result = {
     ok: false,
@@ -172,27 +208,27 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
       );
     }
 
-    // 2. Real platform constants check
-    if (!constants || typeof constants.O_NOFOLLOW !== 'number' || constants.O_NOFOLLOW === 0) {
+    // 2. Real platform constants check (strict finite non-zero integers)
+    if (!constants || !isValidOpenConstant(constants.O_NOFOLLOW)) {
       return fail(
         'missing-onofollow',
-        'fs.constants.O_NOFOLLOW is missing, non-numeric, or zero'
+        'fs.constants.O_NOFOLLOW is missing, non-integer, zero, or non-finite'
       );
     }
     capabilities.oNoFollow = true;
 
-    if (typeof constants.O_NONBLOCK !== 'number' || constants.O_NONBLOCK === 0) {
+    if (!isValidOpenConstant(constants.O_NONBLOCK)) {
       return fail(
         'missing-ononblock',
-        'fs.constants.O_NONBLOCK is missing, non-numeric, or zero'
+        'fs.constants.O_NONBLOCK is missing, non-integer, zero, or non-finite'
       );
     }
     capabilities.oNonBlock = true;
 
-    if (typeof constants.O_DIRECTORY !== 'number' || constants.O_DIRECTORY === 0) {
+    if (!isValidOpenConstant(constants.O_DIRECTORY)) {
       return fail(
         'missing-odirectory',
-        'fs.constants.O_DIRECTORY is missing, non-numeric, or zero'
+        'fs.constants.O_DIRECTORY is missing, non-integer, zero, or non-finite'
       );
     }
     capabilities.oDirectory = true;
@@ -236,13 +272,14 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
 
     // 4. Open directory descriptor with O_RDONLY | O_DIRECTORY | O_NOFOLLOW
     try {
-      parentFd = fs.openSync(
+      ownedDescriptors.parent.fd = fs.openSync(
         probeDir,
         constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
       );
     } catch (err) {
       return fail('open-directory-descriptor', `Failed to open probe directory descriptor: ${err.message}`);
     }
+    const parentFd = ownedDescriptors.parent.fd;
 
     // 5. Directory descriptor identity verification
     const parentStat = fs.fstatSync(parentFd);
@@ -287,7 +324,7 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
     // 7. Descriptor-anchored file creation using O_CREAT | O_EXCL | O_NOFOLLOW (0600)
     const procCandidatePath = path.join(parentProcDir, 'candidate.tmp');
     try {
-      candidateFd = fs.openSync(
+      ownedDescriptors.candidate.fd = fs.openSync(
         procCandidatePath,
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
         0o600
@@ -295,6 +332,7 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
     } catch (err) {
       return fail('create-candidate-file', `Descriptor-anchored candidate creation failed: ${err.message}`);
     }
+    const candidateFd = ownedDescriptors.candidate.fd;
 
     const candInitialStat = fs.fstatSync(candidateFd);
     if (!candInitialStat.isFile() || candInitialStat.isSymbolicLink()) {
@@ -315,15 +353,29 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
     if (candInitialStat.dev !== parentStat.dev) {
       return fail('candidate-cross-device', 'Candidate created on different filesystem device than directory');
     }
-    const candidateIno = candInitialStat.ino;
+    createdCandidateIno = candInitialStat.ino;
     capabilities.descriptorFileCreation = true;
 
-    runFault('after-candidate-create', { candidateFd, candidateIno });
+    runFault('after-candidate-create', { candidateFd, candidateIno: createdCandidateIno });
 
-    // 8. Candidate data writing and fsyncSync(candidateFd)
+    // 8. Candidate data writing with short-write handling and fsyncSync(candidateFd)
     const candidateContent = Buffer.from('ci-termux-probe-candidate-payload\n', 'utf8');
+    let candWritten = 0;
     try {
-      fs.writeSync(candidateFd, candidateContent, 0, candidateContent.length, 0);
+      while (candWritten < candidateContent.length) {
+        runFault('write-candidate-chunk', { written: candWritten, total: candidateContent.length });
+        const chunk = fs.writeSync(
+          candidateFd,
+          candidateContent,
+          candWritten,
+          candidateContent.length - candWritten,
+          candWritten
+        );
+        if (chunk <= 0) {
+          return fail('candidate-short-write', `Short write copying candidate data: wrote ${candWritten} of ${candidateContent.length} bytes`);
+        }
+        candWritten += chunk;
+      }
       fs.fsyncSync(candidateFd);
     } catch (err) {
       return fail('candidate-data-fsync', `Writing candidate data or fsyncSync failed: ${err.message}`);
@@ -349,16 +401,15 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
     }
     capabilities.fileMetadataFsync = true;
 
-    // Close candidate descriptor
-    fs.closeSync(candidateFd);
-    candidateFd = null;
+    // Safely close candidate descriptor
+    safelyCloseDescriptor(ownedDescriptors.candidate);
 
     runFault('after-candidate-closed');
 
-    // 10. Creating an independent disposable initial target
+    // 10. Creating an independent disposable initial target with short-write handling
     const procTargetPath = path.join(parentProcDir, 'target.txt');
     try {
-      targetFd = fs.openSync(
+      ownedDescriptors.target.fd = fs.openSync(
         procTargetPath,
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
         0o644
@@ -366,35 +417,49 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
     } catch (err) {
       return fail('create-initial-target', `Descriptor-anchored initial target creation failed: ${err.message}`);
     }
+    const targetFd = ownedDescriptors.target.fd;
 
     const initialTargetContent = Buffer.from('ci-termux-probe-initial-target-payload\n', 'utf8');
+    let targetWritten = 0;
     try {
-      fs.writeSync(targetFd, initialTargetContent, 0, initialTargetContent.length, 0);
+      while (targetWritten < initialTargetContent.length) {
+        runFault('write-target-chunk', { written: targetWritten, total: initialTargetContent.length });
+        const chunk = fs.writeSync(
+          targetFd,
+          initialTargetContent,
+          targetWritten,
+          initialTargetContent.length - targetWritten,
+          targetWritten
+        );
+        if (chunk <= 0) {
+          return fail('target-short-write', `Short write copying target data: wrote ${targetWritten} of ${initialTargetContent.length} bytes`);
+        }
+        targetWritten += chunk;
+      }
       fs.fsyncSync(targetFd);
     } catch (err) {
       return fail('initial-target-fsync', `Writing initial target or fsyncSync failed: ${err.message}`);
     }
 
     const targetInitialStat = fs.fstatSync(targetFd);
-    const initialTargetIno = targetInitialStat.ino;
-    fs.closeSync(targetFd);
-    targetFd = null;
+    createdTargetIno = targetInitialStat.ino;
+    safelyCloseDescriptor(ownedDescriptors.target);
 
-    runFault('after-initial-target-closed', { initialTargetIno });
+    runFault('after-initial-target-closed', { initialTargetIno: createdTargetIno });
 
     // 11. Recording candidate and target inode identities
-    if (candidateIno === initialTargetIno) {
+    if (createdCandidateIno === createdTargetIno) {
       return fail('inode-identity-collision', 'Candidate and initial target unexpectedly share the same inode number');
     }
 
     // Verify candidate and target stats before rename
     const preRenameCandStat = fs.statSync(procCandidatePath);
     const preRenameTargetStat = fs.statSync(procTargetPath);
-    if (preRenameCandStat.ino !== candidateIno || preRenameTargetStat.ino !== initialTargetIno) {
+    if (preRenameCandStat.ino !== createdCandidateIno || preRenameTargetStat.ino !== createdTargetIno) {
       return fail('pre-rename-inode-mismatch', 'File inodes before rename do not match creation identities');
     }
 
-    runFault('before-rename', { procCandidatePath, procTargetPath, candidateIno, initialTargetIno });
+    runFault('before-rename', { procCandidatePath, procTargetPath, candidateIno: createdCandidateIno, initialTargetIno: createdTargetIno });
 
     // 12. Descriptor-anchored replacement using fs.renameSync
     try {
@@ -418,24 +483,25 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
 
     // 14. Post-rename verification through retained parent descriptor
     try {
-      readFd = fs.openSync(
+      ownedDescriptors.read.fd = fs.openSync(
         procTargetPath,
         constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
       );
     } catch (err) {
       return fail('open-target-post-rename', `Failed to open target post-rename through parent descriptor: ${err.message}`);
     }
+    const readFd = ownedDescriptors.read.fd;
 
     const postRenameTargetStat = fs.fstatSync(readFd);
     if (!postRenameTargetStat.isFile() || postRenameTargetStat.isSymbolicLink()) {
       return fail('target-not-regular-post-rename', 'Post-rename target is not a regular file');
     }
 
-    // 15. Inode continuity and content verification
-    if (postRenameTargetStat.ino !== candidateIno) {
+    // 15. Inode continuity, mode, and content verification with short-read handling
+    if (postRenameTargetStat.ino !== createdCandidateIno) {
       return fail(
         'inode-continuity-broken',
-        `Target inode after rename (${postRenameTargetStat.ino}) does not match pre-rename candidate inode (${candidateIno})`
+        `Target inode after rename (${postRenameTargetStat.ino}) does not match pre-rename candidate inode (${createdCandidateIno})`
       );
     }
     capabilities.inodeContinuityPreserved = true;
@@ -449,13 +515,34 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
     capabilities.modePreserved = true;
 
     const readBuf = Buffer.alloc(postRenameTargetStat.size);
-    fs.readSync(readFd, readBuf, 0, postRenameTargetStat.size, 0);
+    let targetRead = 0;
+    while (targetRead < postRenameTargetStat.size) {
+      runFault('read-target-chunk', { totalRead: targetRead, expected: postRenameTargetStat.size });
+      const chunk = fs.readSync(
+        readFd,
+        readBuf,
+        targetRead,
+        postRenameTargetStat.size - targetRead,
+        targetRead
+      );
+      if (chunk <= 0) {
+        return fail('target-short-read', `Unexpected EOF reading target: read ${targetRead} of ${postRenameTargetStat.size} bytes`);
+      }
+      targetRead += chunk;
+    }
+
+    // Concurrent expansion check
+    const extraBuf = Buffer.alloc(1);
+    const extraRead = fs.readSync(readFd, extraBuf, 0, 1, postRenameTargetStat.size);
+    if (extraRead !== 0) {
+      return fail('target-concurrent-expansion', 'Target file expanded concurrently during readback verification');
+    }
+
     if (!readBuf.equals(candidateContent)) {
       return fail('target-content-mismatch-post-rename', 'Target content after rename does not match candidate content');
     }
 
-    fs.closeSync(readFd);
-    readFd = null;
+    safelyCloseDescriptor(ownedDescriptors.read);
 
     runFault('after-post-rename-read-verification');
 
@@ -488,6 +575,9 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
     }
     capabilities.candidateConsumed = true;
 
+    // Safely close directory descriptor before artifact cleanup
+    safelyCloseDescriptor(ownedDescriptors.parent);
+
     runFault('before-cleanup');
 
     // All capabilities succeeded!
@@ -497,41 +587,21 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
   } catch (err) {
     return fail('unexpected-exception', `Unexpected exception during capability probe: ${err.message}`);
   } finally {
-    // 17. Closure of all open descriptors
-    if (readFd !== null) {
-      try {
-        fs.closeSync(readFd);
-      } catch {
-        // ignore
-      }
-      readFd = null;
-    }
-    if (candidateFd !== null) {
-      try {
-        fs.closeSync(candidateFd);
-      } catch {
-        // ignore
-      }
-      candidateFd = null;
-    }
-    if (targetFd !== null) {
-      try {
-        fs.closeSync(targetFd);
-      } catch {
-        // ignore
-      }
-      targetFd = null;
-    }
-    if (parentFd !== null) {
-      try {
-        fs.closeSync(parentFd);
-      } catch {
-        // ignore
-      }
-      parentFd = null;
-    }
+    // 17. Closure of all owned descriptors in finally
+    safelyCloseDescriptor(ownedDescriptors.read);
+    safelyCloseDescriptor(ownedDescriptors.target);
+    safelyCloseDescriptor(ownedDescriptors.candidate);
+    safelyCloseDescriptor(ownedDescriptors.parent);
 
-    // 18. Safe cleanup of the newly created probe directory
+    // 18. Safe cleanup of recognized probe-owned artifacts only
+    //
+    // POSIX RESIDUAL RACE DOCUMENTATION:
+    // POSIX filesystems do not provide an atomic conditional directory-deletion syscall.
+    // An uncoordinated concurrent writer possessing write access to probeDir could in theory
+    // create an entry in the microsecond between our readdir inspection and rmdir.
+    // To minimize risk, we verify directory identity, inspect every entry, unlink exclusively
+    // verified probe-owned files matching our recorded inode identities, and refuse deletion
+    // if any foreign, substituted, or unverified artifact is detected.
     if (probeDir && initialDev !== null && initialIno !== null) {
       let cleanupStat = null;
       try {
@@ -550,17 +620,128 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
         } else if (cleanupStat.dev !== initialDev || cleanupStat.ino !== initialIno) {
           cleanupError = `Refusing cleanup: probe directory identity changed (expected dev=${initialDev}, ino=${initialIno}; observed dev=${cleanupStat.dev}, ino=${cleanupStat.ino})`;
         } else {
+          // Inspect directory contents to ensure only recognized probe-owned artifacts exist
+          let entries = [];
           try {
-            fs.rmSync(probeDir, { recursive: true, force: true });
-            cleanupSucceeded = true;
-          } catch (rmErr) {
-            cleanupError = `Failed to remove probe directory: ${rmErr.message}`;
+            entries = fs.readdirSync(probeDir);
+          } catch (readDirErr) {
+            cleanupError = `Failed to read probe directory entries for cleanup: ${readDirErr.message}`;
+          }
+
+          runFault('before-artifact-cleanup', { probeDir, entries });
+
+          if (!cleanupError) {
+            const recognizedNames = new Set(['candidate.tmp', 'target.txt']);
+            let hasForeignArtifact = false;
+            let artifactValidationErr = null;
+
+            for (const entry of entries) {
+              if (!recognizedNames.has(entry)) {
+                hasForeignArtifact = true;
+                artifactValidationErr = `Refusing cleanup: unrecognized foreign artifact detected in probe directory ("${entry}")`;
+                break;
+              }
+
+              const entryPath = path.join(probeDir, entry);
+              let entryStat;
+              try {
+                entryStat = fs.lstatSync(entryPath);
+              } catch (statErr) {
+                hasForeignArtifact = true;
+                artifactValidationErr = `Failed to inspect artifact "${entry}" before cleanup: ${statErr.message}`;
+                break;
+              }
+
+              if (!entryStat.isFile() || entryStat.isSymbolicLink()) {
+                hasForeignArtifact = true;
+                artifactValidationErr = `Refusing cleanup: artifact "${entry}" is not a regular file or is a symbolic link`;
+                break;
+              }
+              if (entryStat.dev !== initialDev) {
+                hasForeignArtifact = true;
+                artifactValidationErr = `Refusing cleanup: artifact "${entry}" resides on different device (${entryStat.dev}) than probe directory (${initialDev})`;
+                break;
+              }
+
+              // Verify ownership against tracked inodes
+              if (entry === 'candidate.tmp') {
+                if (createdCandidateIno !== null && entryStat.ino !== createdCandidateIno) {
+                  hasForeignArtifact = true;
+                  artifactValidationErr = `Refusing cleanup: candidate.tmp inode (${entryStat.ino}) does not match probe creation inode (${createdCandidateIno})`;
+                  break;
+                }
+              } else if (entry === 'target.txt') {
+                const matchesInitial = createdTargetIno !== null && entryStat.ino === createdTargetIno;
+                const matchesCandidate = createdCandidateIno !== null && entryStat.ino === createdCandidateIno;
+                if (!matchesInitial && !matchesCandidate) {
+                  hasForeignArtifact = true;
+                  artifactValidationErr = `Refusing cleanup: target.txt inode (${entryStat.ino}) matches neither initial target (${createdTargetIno}) nor swapped candidate (${createdCandidateIno})`;
+                  break;
+                }
+              }
+            }
+
+            if (hasForeignArtifact) {
+              cleanupError = artifactValidationErr;
+            } else {
+              // All entries are verified probe-owned artifacts. Safe to unlink.
+              let unlinkFailed = false;
+              for (const entry of entries) {
+                const entryPath = path.join(probeDir, entry);
+                try {
+                  fs.unlinkSync(entryPath);
+                } catch (unErr) {
+                  cleanupError = `Failed to unlink probe artifact "${entry}": ${unErr.message}`;
+                  unlinkFailed = true;
+                  break;
+                }
+              }
+
+              if (!unlinkFailed) {
+                try {
+                  fs.rmdirSync(probeDir);
+                  // Verify absence
+                  let postCheck = null;
+                  try {
+                    postCheck = fs.lstatSync(probeDir);
+                  } catch (postErr) {
+                    if (postErr?.code === 'ENOENT') {
+                      cleanupSucceeded = true;
+                    } else {
+                      cleanupError = `Failed to verify probe directory absence after removal: ${postErr.message}`;
+                    }
+                  }
+                  if (postCheck !== null) {
+                    cleanupError = 'Probe directory still present after removal';
+                  }
+                } catch (rmDirErr) {
+                  cleanupError = `Failed to remove probe directory: ${rmDirErr.message}`;
+                }
+              }
+            }
           }
         }
       }
     }
 
     result.cleanupSucceeded = cleanupSucceeded;
+
+    // Check for descriptor closure errors
+    if (closeErrors.length > 0) {
+      const closeErrMsg = closeErrors
+        .map((e) => `${e.name} (fd ${e.fd}): ${e.error.message}`)
+        .join('; ');
+      if (result.ok) {
+        result.ok = false;
+        result.failedStage = 'descriptor-cleanup-failed';
+        result.error = `Descriptor closure failed: ${closeErrMsg}`;
+        result.summary = `Capability probe operations passed but descriptor cleanup failed: ${result.error}`;
+      } else {
+        result.error = `${result.error || ''}; Descriptor cleanup error: ${closeErrMsg}`.trim();
+      }
+    }
+
+    // Check for directory cleanup errors
     if (cleanupError) {
       if (result.ok) {
         result.ok = false;
