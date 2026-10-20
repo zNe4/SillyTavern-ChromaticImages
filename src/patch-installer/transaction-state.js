@@ -88,6 +88,22 @@ export function hasRequiredNoFollow(constants) {
 }
 
 /**
+ * Pure capability predicate that checks whether a constants object satisfies
+ * the required platform O_NOFOLLOW and O_NONBLOCK capabilities for safe live-target inspection.
+ *
+ * @param {object|null|undefined} constants
+ * @returns {boolean}
+ */
+export function hasRequiredLiveTargetFlags(constants) {
+  return Boolean(
+    hasRequiredNoFollow(constants) &&
+    typeof constants?.O_NONBLOCK === 'number' &&
+    Number.isInteger(constants.O_NONBLOCK) &&
+    constants.O_NONBLOCK !== 0
+  );
+}
+
+/**
  * Bounded, descriptor-based readback and SHA-256 verification of a backup artifact.
  * Strictly read-only; imposes size bounds before allocating buffer.
  *
@@ -435,11 +451,11 @@ export const MAX_LIVE_TARGET_INSPECT_BYTES = 50 * 1024 * 1024; // 50 MiB
  * }}
  */
 export function inspectLiveTargetFile(cPath, expectedInitialSha, expectedResultSha, expectedMode, phase, relTarget) {
-  if (!hasRequiredNoFollow(fs.constants)) {
+  if (!hasRequiredLiveTargetFlags(fs.constants)) {
     return {
       ok: false,
       isError: true,
-      reason: `Unsupported platform: O_NOFOLLOW file open flag is required for safe live target inspection of "${relTarget}"`,
+      reason: `Unsupported platform: O_NOFOLLOW and O_NONBLOCK file open flags are required for safe live target inspection of "${relTarget}"`,
     };
   }
 
@@ -462,7 +478,7 @@ export function inspectLiveTargetFile(cPath, expectedInitialSha, expectedResultS
   }
 
   let fd = null;
-  const openFlags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (fs.constants.O_NONBLOCK || 0);
+  const openFlags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
   try {
     fd = fs.openSync(cPath, openFlags);
   } catch (err) {

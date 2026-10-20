@@ -40,6 +40,7 @@ import {
   MAX_DESTINATION_INSPECT_BYTES,
   MAX_LIVE_TARGET_INSPECT_BYTES,
   hasRequiredNoFollow,
+  hasRequiredLiveTargetFlags,
   getPermittedArtifactNames,
 } from '../src/patch-installer/transaction-state.js';
 
@@ -3827,6 +3828,35 @@ describe('P3B-2B-F3: Finding A — Production Inspector Isolation & Pure No-Foll
     assert.equal(hasRequiredNoFollow({ O_NOFOLLOW: true }), false);
   });
 
+  test('pure predicate hasRequiredLiveTargetFlags strictly validates platform capabilities (O_NOFOLLOW and O_NONBLOCK)', () => {
+    // 1. Valid on real platform constants
+    assert.equal(hasRequiredLiveTargetFlags(fs.constants), true);
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 131072, O_NONBLOCK: 2048 }), true);
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 1, O_NONBLOCK: 1 }), true);
+
+    // 2. Missing or zero-valued O_NONBLOCK rejected
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 131072 }), false);
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 131072, O_NONBLOCK: 0 }), false);
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 131072, O_NONBLOCK: null }), false);
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 131072, O_NONBLOCK: undefined }), false);
+
+    // 3. Missing or zero-valued O_NOFOLLOW rejected
+    assert.equal(hasRequiredLiveTargetFlags({ O_NONBLOCK: 2048 }), false);
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 0, O_NONBLOCK: 2048 }), false);
+
+    // 4. Missing or invalid constants object rejected
+    assert.equal(hasRequiredLiveTargetFlags({}), false);
+    assert.equal(hasRequiredLiveTargetFlags(null), false);
+    assert.equal(hasRequiredLiveTargetFlags(undefined), false);
+
+    // 5. Non-integer or non-number O_NONBLOCK rejected
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 131072, O_NONBLOCK: '2048' }), false);
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 131072, O_NONBLOCK: NaN }), false);
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 131072, O_NONBLOCK: Infinity }), false);
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 131072, O_NONBLOCK: 2048.5 }), false);
+    assert.equal(hasRequiredLiveTargetFlags({ O_NOFOLLOW: 131072, O_NONBLOCK: true }), false);
+  });
+
   test('production inspectTransactionState always uses real platform constants and ignores caller _fsConstants', () => {
     const { repo } = setupValidBackupState('insp-f3-prod-flags-');
     const origOpenSync = fs.openSync;
@@ -4778,30 +4808,63 @@ describe('P3B-2D-1: Read-Only Post-Swap State Inspection (transaction-state.js)'
     const { endpointsDir } = setupTxAtPhase(repo, 'SWAPPED');
 
     const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
-    fs.writeFileSync(liveTarget, patchedContent);
+    // Create a real sparse file exceeding 50 MiB specifically for the live target
+    const fd = fs.openSync(liveTarget, 'w');
+    fs.ftruncateSync(fd, MAX_LIVE_TARGET_INSPECT_BYTES + 1);
+    fs.closeSync(fd);
     fs.chmodSync(liveTarget, 0o644);
 
-    // Part A: Simulated oversized target (> 50 MiB)
-    const origFstatSync = fs.fstatSync;
-    try {
-      fs.fstatSync = (fd, ...args) => {
-        const s = origFstatSync(fd, ...args);
-        s.size = MAX_LIVE_TARGET_INSPECT_BYTES + 1;
-        return s;
-      };
-      const state = inspectTransactionState(repo);
-      assert.equal(state.state, 'inspection-error');
-      assert.equal(state.isPending, true);
-      assert.ok(state.reasons.some((r) => r.includes('exceeds safety limit')));
-    } finally {
-      fs.fstatSync = origFstatSync;
-    }
+    // Part A: Precise oversized live target (> 50 MiB) without monkey-patching fstatSync
+    // Preserves ordinary staging and backup inspection (backup remains small and valid)
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'inspection-error');
+    assert.equal(state.isPending, true);
+    // Asserts a diagnostic explicitly identifying the live target and its size limit
+    assert.ok(
+      state.reasons.some(
+        (r) =>
+          r.includes('Live target size') &&
+          r.includes('exceeds safety limit') &&
+          r.includes('52428800 bytes') &&
+          r.includes('src/endpoints/stable-diffusion.js')
+      ),
+      'Expected explicit diagnostic identifying oversized live target'
+    );
+    // Verifies backup inspection was NOT the source of error
+    assert.ok(
+      !state.reasons.some((r) => r.includes('Backup artifact size')),
+      'Backup inspection must not be triggered as oversized'
+    );
+    // Verifies no file modification and no descriptor leaks
+    const st = fs.statSync(liveTarget);
+    assert.equal(st.size, MAX_LIVE_TARGET_INSPECT_BYTES + 1);
+
+    // Also verify unit inspectLiveTargetFile directly reports isOversized and isError
+    const unitOversized = inspectLiveTargetFile(
+      liveTarget,
+      stockSha,
+      patchedSha,
+      '0644',
+      'SWAPPED',
+      'src/endpoints/stable-diffusion.js'
+    );
+    assert.equal(unitOversized.ok, false);
+    assert.equal(unitOversized.isOversized, true);
+    assert.equal(unitOversized.isError, true);
+    assert.match(unitOversized.reason, /Live target size .* exceeds safety limit/);
 
     // Part B: Simulated concurrent permission change during descriptor readback
+    const repoB = createTempDir('tx-p3b2d1-perm-change-');
+    const { endpointsDir: edB } = setupTxAtPhase(repoB, 'SWAPPED');
+    const liveTargetB = path.join(edB, 'stable-diffusion.js');
+    fs.writeFileSync(liveTargetB, patchedContent);
+    fs.chmodSync(liveTargetB, 0o644);
+
+    const origFstatSync = fs.fstatSync;
     let callCount = 0;
     try {
-      fs.fstatSync = (fd, ...args) => {
-        const s = origFstatSync(fd, ...args);
+      fs.fstatSync = (fdesc, ...args) => {
+        const s = origFstatSync(fdesc, ...args);
         callCount++;
         if (callCount > 1) {
           s.mode = (s.mode & ~0o777) | 0o700;
@@ -4809,7 +4872,7 @@ describe('P3B-2D-1: Read-Only Post-Swap State Inspection (transaction-state.js)'
         return s;
       };
       const unitRes = inspectLiveTargetFile(
-        liveTarget,
+        liveTargetB,
         stockSha,
         patchedSha,
         '0644',
@@ -4918,7 +4981,7 @@ describe('P3B-2D-1: Read-Only Post-Swap State Inspection (transaction-state.js)'
     assert.deepEqual(after, before);
   });
 
-  test('17. Amendments B & C: Live target is directory or FIFO fails closed without orphaned-artifact and without blocking', () => {
+  test('17. Amendments B & C: Live target is directory or FIFO fails closed without orphaned-artifact and without blocking', (t) => {
     // Directory live target
     const repoDir = createTempDir('tx-p3b2d1-target-dir-');
     const { endpointsDir: edDir } = setupTxAtPhase(repoDir, 'SWAPPED');
@@ -4930,31 +4993,212 @@ describe('P3B-2D-1: Read-Only Post-Swap State Inspection (transaction-state.js)'
     assert.equal(stateDir.orphanedArtifacts.length, 0);
     assert.ok(stateDir.reasons.some((r) => r.includes('not a regular file')));
 
+    // Check whether mkfifo is available before running the FIFO test
+    let hasMkfifo = false;
+    try {
+      child_process.execFileSync('mkfifo', ['--version'], { stdio: 'ignore' });
+      hasMkfifo = true;
+    } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        hasMkfifo = true;
+      }
+    }
+
+    if (!hasMkfifo) {
+      if (typeof t?.diagnostic === 'function') {
+        t.diagnostic('Skipping FIFO live target check: mkfifo utility is not available on this platform');
+      }
+      return;
+    }
+
     // FIFO live target with mkfifo
     const repoFifo = createTempDir('tx-p3b2d1-target-fifo-');
     const { endpointsDir: edFifo } = setupTxAtPhase(repoFifo, 'SWAPPED');
     const fifoTarget = path.join(edFifo, 'stable-diffusion.js');
-    try {
-      child_process.execFileSync('mkfifo', [fifoTarget]);
-      const stateFifo = inspectTransactionState(repoFifo);
-      assert.equal(stateFifo.state, 'incomplete-transaction');
-      assert.equal(stateFifo.isPending, true);
-      assert.equal(stateFifo.orphanedArtifacts.length, 0);
-      assert.ok(stateFifo.reasons.some((r) => r.includes('not a regular file')));
+    child_process.execFileSync('mkfifo', [fifoTarget]);
 
-      const fifoUnit = inspectLiveTargetFile(
-        fifoTarget,
+    const stateFifo = inspectTransactionState(repoFifo);
+    assert.equal(stateFifo.state, 'incomplete-transaction');
+    assert.equal(stateFifo.isPending, true);
+    assert.equal(stateFifo.orphanedArtifacts.length, 0);
+    assert.ok(stateFifo.reasons.some((r) => r.includes('not a regular file')));
+
+    const fifoUnit = inspectLiveTargetFile(
+      fifoTarget,
+      stockSha,
+      patchedSha,
+      '0644',
+      'SWAPPED',
+      'src/endpoints/stable-diffusion.js'
+    );
+    assert.equal(fifoUnit.ok, false);
+    assert.equal(fifoUnit.isUnsupportedType, true);
+    assert.equal(fifoUnit.isIncomplete, true);
+  });
+
+  test('production inspectLiveTargetFile strictly uses real platform constants (O_RDONLY | O_NOFOLLOW | O_NONBLOCK)', () => {
+    const repo = createTempDir('tx-p3b2d1-flags-check-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'SWAPPED');
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, patchedContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    const origOpenSync = fs.openSync;
+    let observedFlags = null;
+    let openCount = 0;
+    try {
+      fs.openSync = (p, flags, ...args) => {
+        if (typeof p === 'string' && p.endsWith('stable-diffusion.js')) {
+          openCount++;
+          observedFlags = flags;
+        }
+        return origOpenSync(p, flags, ...args);
+      };
+
+      const res = inspectLiveTargetFile(
+        liveTarget,
         stockSha,
         patchedSha,
         '0644',
         'SWAPPED',
         'src/endpoints/stable-diffusion.js'
       );
-      assert.equal(fifoUnit.ok, false);
-      assert.equal(fifoUnit.isUnsupportedType, true);
-      assert.equal(fifoUnit.isIncomplete, true);
+      assert.equal(res.ok, true);
+      assert.equal(openCount, 1);
+      const expectedFlags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
+      assert.equal(observedFlags, expectedFlags);
+    } finally {
+      fs.openSync = origOpenSync;
+    }
+  });
+
+  test('TOCTOU race: regular file becoming FIFO between precheck and open fails closed safely and non-blockingly', (t) => {
+    let hasMkfifo = false;
+    try {
+      child_process.execFileSync('mkfifo', ['--version'], { stdio: 'ignore' });
+      hasMkfifo = true;
     } catch (err) {
-      if (err?.code !== 'ENOENT') throw err;
+      if (err?.code !== 'ENOENT') {
+        hasMkfifo = true;
+      }
+    }
+
+    if (!hasMkfifo) {
+      if (typeof t?.diagnostic === 'function') {
+        t.diagnostic('Skipping TOCTOU FIFO test: mkfifo utility is not available on this platform');
+      }
+      return;
+    }
+
+    const repo = createTempDir('tx-p3b2d1-toctou-fifo-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'SWAPPED');
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, patchedContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    const origOpenSync = fs.openSync;
+    let intercepted = false;
+    try {
+      fs.openSync = (p, flags, ...args) => {
+        if (!intercepted && typeof p === 'string' && p.endsWith('stable-diffusion.js')) {
+          intercepted = true;
+          // Simulate race: regular file replaced by a FIFO between precheck and open
+          fs.unlinkSync(p);
+          child_process.execFileSync('mkfifo', [p]);
+        }
+        return origOpenSync(p, flags, ...args);
+      };
+
+      const res = inspectLiveTargetFile(
+        liveTarget,
+        stockSha,
+        patchedSha,
+        '0644',
+        'SWAPPED',
+        'src/endpoints/stable-diffusion.js'
+      );
+
+      assert.equal(res.ok, false);
+      assert.equal(res.isUnsupportedType, true);
+      assert.equal(res.isIncomplete, true);
+      assert.match(res.reason, /not a regular file/);
+    } finally {
+      fs.openSync = origOpenSync;
+    }
+  });
+
+  test('non-ENOENT pathname inspection errors (EACCES and EIO) trigger inspection-error and do not treat target as missing', () => {
+    // Case 1: EACCES error on live-target path in SWAPPED
+    const repoAccess = createTempDir('tx-p3b2d1-eacces-');
+    const { endpointsDir: edAccess } = setupTxAtPhase(repoAccess, 'SWAPPED');
+    const liveTargetAccess = path.join(edAccess, 'stable-diffusion.js');
+    fs.writeFileSync(liveTargetAccess, patchedContent);
+    fs.chmodSync(liveTargetAccess, 0o644);
+
+    const origLstatSync = fs.lstatSync;
+    try {
+      fs.lstatSync = (p, ...args) => {
+        if (typeof p === 'string' && p.endsWith(path.join('src/endpoints', 'stable-diffusion.js'))) {
+          const err = new Error('Permission denied');
+          err.code = 'EACCES';
+          throw err;
+        }
+        return origLstatSync(p, ...args);
+      };
+
+      const stateAccess = inspectTransactionState(repoAccess);
+      assert.equal(stateAccess.state, 'inspection-error');
+      assert.equal(stateAccess.isPending, true);
+      assert.ok(
+        stateAccess.reasons.some(
+          (r) =>
+            r.includes('Failed to inspect live target path') &&
+            (r.includes('Permission denied') || r.includes('EACCES'))
+        ),
+        'Expected explicit inspection-error reason for EACCES'
+      );
+      assert.ok(
+        !stateAccess.reasons.some((r) => r.includes('Missing live target') || r.includes('Possible unrecorded swap')),
+        'EACCES must not be treated as missing file or unrecorded swap'
+      );
+    } finally {
+      fs.lstatSync = origLstatSync;
+    }
+
+    // Case 2: EIO error on live-target path in READY_TO_SWAP without candidate
+    const repoIo = createTempDir('tx-p3b2d1-eio-');
+    const { endpointsDir: edIo } = setupTxAtPhase(repoIo, 'READY_TO_SWAP');
+    const liveTargetIo = path.join(edIo, 'stable-diffusion.js');
+    fs.writeFileSync(liveTargetIo, patchedContent);
+    fs.chmodSync(liveTargetIo, 0o644);
+
+    try {
+      fs.lstatSync = (p, ...args) => {
+        if (typeof p === 'string' && p.endsWith(path.join('src/endpoints', 'stable-diffusion.js'))) {
+          const err = new Error('Input/output error');
+          err.code = 'EIO';
+          throw err;
+        }
+        return origLstatSync(p, ...args);
+      };
+
+      const stateIo = inspectTransactionState(repoIo);
+      assert.equal(stateIo.state, 'inspection-error');
+      assert.equal(stateIo.isPending, true);
+      assert.ok(
+        stateIo.reasons.some(
+          (r) =>
+            r.includes('Failed to inspect live target path') &&
+            (r.includes('Input/output error') || r.includes('EIO'))
+        ),
+        'Expected explicit inspection-error reason for EIO'
+      );
+      assert.ok(
+        !stateIo.reasons.some((r) => r.includes('Possible unrecorded swap')),
+        'EIO must not trigger unrecorded-swap logic'
+      );
+    } finally {
+      fs.lstatSync = origLstatSync;
     }
   });
 });
