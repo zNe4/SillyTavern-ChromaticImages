@@ -1947,3 +1947,501 @@ describe('D01-P3B-2D-2-B: Transaction Pre-Swap Authentication (authenticateSwapP
     });
   });
 });
+
+describe('D01-P3B-2D-2-C1: Private Authentication Core and Descriptor Retention', () => {
+  const AUTH_CORE_KEY = Symbol.for('ci.patch-installer.target-swap.authenticatePrerequisitesCore');
+  const authenticatePrerequisitesCore = authenticateSwapPrerequisites[AUTH_CORE_KEY];
+
+  test('C1-01: authenticatePrerequisitesCore is accessible via internal symbol and is an async function', () => {
+    assert.equal(typeof authenticatePrerequisitesCore, 'function');
+  });
+
+  test('C1-02: Stage B public authenticateSwapPrerequisites API signature and result shape are strictly preserved without parentFd', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-02')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-api-preserve-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    const res = await authenticateSwapPrerequisites({ repoRoot: repo, txId, op, lease, manifest });
+    assert.equal(res.ok, true);
+    assert.equal(res.verified, true);
+    assert.equal(res.parentFd, undefined, 'Public API must never expose parentFd');
+    assert.equal(res.parentStat, undefined, 'Public API must never expose parentStat');
+
+    // Confirm all expected Stage B informational fields are intact
+    assert.equal(res.txId, txId);
+    assert.equal(res.op, op);
+    assert.equal(res.targetFile, 'src/endpoints/stable-diffusion.js');
+    assert.equal(res.targetMode, '0644');
+    assert.equal(typeof res.targetDev === 'number' || typeof res.targetDev === 'bigint', true);
+    assert.equal(typeof res.targetIno === 'number' || typeof res.targetIno === 'bigint', true);
+    assert.equal(typeof res.candidateDev === 'number' || typeof res.candidateDev === 'bigint', true);
+    assert.equal(typeof res.candidateIno === 'number' || typeof res.candidateIno === 'bigint', true);
+    assert.equal(typeof res.parentDev === 'number' || typeof res.parentDev === 'bigint', true);
+    assert.equal(typeof res.parentIno === 'number' || typeof res.parentIno === 'bigint', true);
+  });
+
+  test('C1-03: Public authenticateSwapPrerequisites strictly ignores retainParentDescriptor option and closes all descriptors', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-03')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-pub-ignore-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    const openedFds = new Set();
+    const closedFds = new Set();
+    const origOpen = fs.openSync;
+    const origClose = fs.closeSync;
+
+    try {
+      fs.openSync = (...args) => {
+        const fd = origOpen.apply(fs, args);
+        openedFds.add(fd);
+        return fd;
+      };
+      fs.closeSync = (fd) => {
+        closedFds.add(fd);
+        return origClose(fd);
+      };
+
+      // Even when caller passes retainParentDescriptor: true into public API, it must be ignored
+      const res = await authenticateSwapPrerequisites({
+        repoRoot: repo,
+        txId,
+        op,
+        lease,
+        manifest,
+        retainParentDescriptor: true,
+      });
+
+      assert.equal(res.ok, true);
+      assert.equal(res.parentFd, undefined, 'Public API must never return parentFd');
+
+      // Every opened descriptor must be closed
+      const unclosed = Array.from(openedFds).filter((fd) => !closedFds.has(fd));
+      assert.equal(unclosed.length, 0, `All descriptors must be closed; leaked fds: ${unclosed.join(', ')}`);
+    } finally {
+      fs.openSync = origOpen;
+      fs.closeSync = origClose;
+    }
+  });
+
+  test('C1-04: authenticatePrerequisitesCore with retainParentDescriptor: false closes all descriptors and omits parentFd', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-04')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-core-false-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    const openedFds = new Set();
+    const closedFds = new Set();
+    const origOpen = fs.openSync;
+    const origClose = fs.closeSync;
+
+    try {
+      fs.openSync = (...args) => {
+        const fd = origOpen.apply(fs, args);
+        openedFds.add(fd);
+        return fd;
+      };
+      fs.closeSync = (fd) => {
+        closedFds.add(fd);
+        return origClose(fd);
+      };
+
+      const res = await authenticatePrerequisitesCore(
+        { repoRoot: repo, txId, op, lease, manifest },
+        { retainParentDescriptor: false }
+      );
+
+      assert.equal(res.ok, true);
+      assert.equal(res.parentFd, undefined);
+
+      const unclosed = Array.from(openedFds).filter((fd) => !closedFds.has(fd));
+      assert.equal(unclosed.length, 0, `All descriptors must be closed; leaked fds: ${unclosed.join(', ')}`);
+    } finally {
+      fs.openSync = origOpen;
+      fs.closeSync = origClose;
+    }
+  });
+
+  test('C1-05: authenticatePrerequisitesCore with retainParentDescriptor: true transfers ownership of parentFd exactly once', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-05')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-core-true-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    const activeFds = new Set();
+    const origOpen = fs.openSync;
+    const origClose = fs.closeSync;
+
+    let retainedFd = null;
+
+    try {
+      fs.openSync = (...args) => {
+        const fd = origOpen.apply(fs, args);
+        activeFds.add(fd);
+        return fd;
+      };
+      fs.closeSync = (fd) => {
+        activeFds.delete(fd);
+        return origClose(fd);
+      };
+
+      const res = await authenticatePrerequisitesCore(
+        { repoRoot: repo, txId, op, lease, manifest },
+        { retainParentDescriptor: true }
+      );
+
+      assert.equal(res.ok, true);
+      assert.equal(typeof res.parentFd, 'number');
+      assert.ok(res.parentFd > 0);
+      retainedFd = res.parentFd;
+
+      // Retained descriptor must remain active/open (core transferred without closing)
+      assert.ok(activeFds.has(retainedFd), 'Transferred descriptor must remain active and open');
+
+      // All OTHER descriptors (manifest, staging, backup, live target, candidate) must be closed
+      assert.deepEqual(
+        Array.from(activeFds),
+        [retainedFd],
+        'Only the transferred parentFd must remain active after successful retention'
+      );
+
+      // The descriptor is valid and open in the current process
+      const stat = fs.fstatSync(retainedFd);
+      assert.equal(stat.isDirectory(), true);
+      assert.equal(stat.dev, res.parentDev);
+      assert.equal(stat.ino, res.parentIno);
+    } finally {
+      fs.openSync = origOpen;
+      fs.closeSync = origClose;
+
+      // Caller exclusively owns the retained descriptor and closes it in finally
+      if (retainedFd !== null) {
+        fs.closeSync(retainedFd);
+      }
+    }
+
+    // Verify that after caller closed it, the descriptor is no longer open
+    assert.throws(() => fs.fstatSync(retainedFd), { code: 'EBADF' });
+  });
+
+  test('C1-06: Retained descriptor continues identifying destination parent directory until authorized owner closes it', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-06')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-ident-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    let retainedFd = null;
+    try {
+      const res = await authenticatePrerequisitesCore(
+        { repoRoot: repo, txId, op, lease, manifest },
+        { retainParentDescriptor: true }
+      );
+      assert.equal(res.ok, true);
+      retainedFd = res.parentFd;
+
+      // Verify directory descriptor anchoring via procfs
+      const procDir = path.join('/proc/self/fd', String(retainedFd));
+      const entries = fs.readdirSync(procDir);
+      assert.ok(entries.includes('stable-diffusion.js'), 'Retained parentFd must resolve to destination directory');
+      assert.ok(entries.includes(`.stable-diffusion.js.ci-staged-${txId}.tmp`));
+
+      const stat = fs.fstatSync(retainedFd);
+      assert.equal(stat.dev, res.parentDev);
+      assert.equal(stat.ino, res.parentIno);
+    } finally {
+      if (retainedFd !== null) {
+        fs.closeSync(retainedFd);
+      }
+    }
+  });
+
+  test('C1-07: Failed authentication never transfers a descriptor when retainParentDescriptor: true', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-07')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-fail-no-transfer-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    // Tamper destination candidate content so authentication fails at step 13
+    const candidatePath = path.join(repo, `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`);
+    fs.writeFileSync(candidatePath, 'tampered-candidate-bytes\n');
+
+    const openedFds = new Set();
+    const closedFds = new Set();
+    const origOpen = fs.openSync;
+    const origClose = fs.closeSync;
+
+    try {
+      fs.openSync = (...args) => {
+        const fd = origOpen.apply(fs, args);
+        openedFds.add(fd);
+        return fd;
+      };
+      fs.closeSync = (fd) => {
+        closedFds.add(fd);
+        return origClose(fd);
+      };
+
+      const res = await authenticatePrerequisitesCore(
+        { repoRoot: repo, txId, op, lease, manifest },
+        { retainParentDescriptor: true }
+      );
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'candidate-digest-mismatch');
+      assert.equal(res.parentFd, undefined, 'Failed authentication must never transfer parentFd');
+
+      // Every descriptor opened during the failed authentication must have been closed
+      const unclosed = Array.from(openedFds).filter((fd) => !closedFds.has(fd));
+      assert.equal(unclosed.length, 0, `All descriptors must be closed on failure; leaked: ${unclosed.join(', ')}`);
+    } finally {
+      fs.openSync = origOpen;
+      fs.closeSync = origClose;
+    }
+  });
+
+  test('C1-08: Pre-parent-open failure never opens or transfers a descriptor', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-08')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-pre-parent-fail-');
+    const { txId, op } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    // Pass invalid lease (null)
+    const res = await authenticatePrerequisitesCore(
+      { repoRoot: repo, txId, op, lease: null, manifest },
+      { retainParentDescriptor: true }
+    );
+
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'lease-required');
+    assert.equal(res.parentFd, undefined);
+  });
+
+  test('C1-09: Exceptions during authentication with retainParentDescriptor: true do not leak descriptors', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-09')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-exc-no-leak-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    const openedFds = new Set();
+    const closedFds = new Set();
+    const origOpen = fs.openSync;
+    const origClose = fs.closeSync;
+
+    try {
+      fs.openSync = (...args) => {
+        const fd = origOpen.apply(fs, args);
+        openedFds.add(fd);
+        return fd;
+      };
+      fs.closeSync = (fd) => {
+        closedFds.add(fd);
+        return origClose(fd);
+      };
+
+      let caughtErr = null;
+      try {
+        await authenticatePrerequisitesCore(
+          {
+            repoRoot: repo,
+            txId,
+            op,
+            lease,
+            manifest,
+            faultHook: (stage) => {
+              if (stage === 'after-parent-authenticated') {
+                const err = new Error('simulated exception during authentication');
+                err._isFault = true;
+                throw err;
+              }
+            },
+          },
+          { retainParentDescriptor: true }
+        );
+      } catch (err) {
+        caughtErr = err;
+      }
+
+      assert.ok(caughtErr, 'Expected fault exception to propagate');
+      assert.equal(caughtErr._isFault, true);
+      assert.match(caughtErr.message, /simulated exception/);
+
+      // All descriptors opened prior to exception must have been closed in finally
+      const unclosed = Array.from(openedFds).filter((fd) => !closedFds.has(fd));
+      assert.equal(unclosed.length, 0, `All descriptors must be closed on exception; leaked: ${unclosed.join(', ')}`);
+    } finally {
+      fs.openSync = origOpen;
+      fs.closeSync = origClose;
+    }
+  });
+
+  test('C1-10: Close failure prevents successful authentication when retainParentDescriptor: false', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-10')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-close-fail-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    const origClose = fs.closeSync;
+    const absParentDir = path.resolve(repo, 'src/endpoints');
+    const parentLstat = fs.lstatSync(absParentDir);
+
+    try {
+      fs.closeSync = (fd) => {
+        try {
+          const st = fs.fstatSync(fd);
+          if (st.isDirectory() && st.dev === parentLstat.dev && st.ino === parentLstat.ino) {
+            origClose(fd);
+            const err = new Error('simulated EIO on destination parent closeSync');
+            err.code = 'EIO';
+            throw err;
+          }
+        } catch (checkErr) {
+          if (checkErr.code === 'EIO') throw checkErr;
+        }
+        return origClose(fd);
+      };
+
+      const res = await authenticatePrerequisitesCore(
+        { repoRoot: repo, txId, op, lease, manifest },
+        { retainParentDescriptor: false }
+      );
+
+      assert.equal(res.ok, false);
+      assert.equal(res.verified, false);
+      assert.equal(res.code, 'EIO');
+      assert.equal(res.descriptorCloseUncertain, true);
+      assert.equal(res.parentFd, undefined);
+    } finally {
+      fs.closeSync = origClose;
+    }
+  });
+
+  test('C1-11: Secondary close failure preserves primary error and does not transfer descriptor when retainParentDescriptor: true', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-11')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-sec-close-fail-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    // Primary error: corrupt candidate SHA
+    const candidatePath = path.join(repo, `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`);
+    fs.writeFileSync(candidatePath, 'tampered-candidate-data\n');
+
+    const origClose = fs.closeSync;
+    const absParentDir = path.resolve(repo, 'src/endpoints');
+    const parentLstat = fs.lstatSync(absParentDir);
+
+    try {
+      fs.closeSync = (fd) => {
+        try {
+          const st = fs.fstatSync(fd);
+          if (st.isDirectory() && st.dev === parentLstat.dev && st.ino === parentLstat.ino) {
+            origClose(fd);
+            const err = new Error('simulated secondary EIO on parent closeSync');
+            err.code = 'EIO';
+            throw err;
+          }
+        } catch (checkErr) {
+          if (checkErr.code === 'EIO') throw checkErr;
+        }
+        return origClose(fd);
+      };
+
+      const res = await authenticatePrerequisitesCore(
+        { repoRoot: repo, txId, op, lease, manifest },
+        { retainParentDescriptor: true }
+      );
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'candidate-digest-mismatch', 'Primary authentication error must be preserved');
+      assert.ok(res.closeError, 'Secondary close error must be recorded');
+      assert.equal(res.closeError.code, 'EIO');
+      assert.equal(res.descriptorCloseUncertain, true);
+      assert.equal(res.parentFd, undefined, 'Failed authentication must not transfer descriptor');
+    } finally {
+      fs.closeSync = origClose;
+    }
+  });
+
+  test('C1-12: Strict No-Mutation: filesystem snapshot is 100% identical after authentication with retainParentDescriptor: true', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'C1-12')) return;
+    const repo = setupDisposableRepo('tx-swap-c1-no-mutation-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    const beforeSnapshot = snapshotDirectory(repo);
+
+    let renameCalled = false;
+    let unlinkCalled = false;
+    let writeCalled = false;
+    let chmodCalled = false;
+
+    const origRename = fs.renameSync;
+    const origUnlink = fs.unlinkSync;
+    const origWrite = fs.writeSync;
+    const origChmod = fs.chmodSync;
+
+    let retainedFd = null;
+    try {
+      fs.renameSync = (...args) => {
+        renameCalled = true;
+        return origRename.apply(fs, args);
+      };
+      fs.unlinkSync = (...args) => {
+        unlinkCalled = true;
+        return origUnlink.apply(fs, args);
+      };
+      fs.writeSync = (...args) => {
+        writeCalled = true;
+        return origWrite.apply(fs, args);
+      };
+      fs.chmodSync = (...args) => {
+        chmodCalled = true;
+        return origChmod.apply(fs, args);
+      };
+
+      const res = await authenticatePrerequisitesCore(
+        { repoRoot: repo, txId, op, lease, manifest },
+        { retainParentDescriptor: true }
+      );
+
+      assert.equal(res.ok, true);
+      assert.equal(res.verified, true);
+      retainedFd = res.parentFd;
+
+      assert.equal(renameCalled, false, 'fs.renameSync must never be called during core authentication');
+      assert.equal(unlinkCalled, false, 'fs.unlinkSync must never be called during core authentication');
+      assert.equal(writeCalled, false, 'fs.writeSync must never be called during core authentication');
+      assert.equal(chmodCalled, false, 'fs.chmodSync must never be called during core authentication');
+    } finally {
+      fs.renameSync = origRename;
+      fs.unlinkSync = origUnlink;
+      fs.writeSync = origWrite;
+      fs.chmodSync = origChmod;
+
+      if (retainedFd !== null) {
+        fs.closeSync(retainedFd);
+      }
+    }
+
+    const afterSnapshot = snapshotDirectory(repo);
+    assert.equal(afterSnapshot.size, beforeSnapshot.size);
+    for (const [relPath, beforeStat] of beforeSnapshot.entries()) {
+      assert.ok(afterSnapshot.has(relPath), `File "${relPath}" must still exist`);
+      const afterStat = afterSnapshot.get(relPath);
+      assert.equal(afterStat.ino, beforeStat.ino, `Inode for "${relPath}" must match`);
+      assert.equal(afterStat.mode, beforeStat.mode, `Mode for "${relPath}" must match`);
+      assert.equal(afterStat.size, beforeStat.size, `Size for "${relPath}" must match`);
+      assert.equal(afterStat.contentSha, beforeStat.contentSha, `SHA-256 for "${relPath}" must match`);
+    }
+  });
+
+  test('C1-13: swapVerifiedTarget remains unimplemented regardless of caller options', async () => {
+    await assert.rejects(
+      async () => {
+        await swapVerifiedTarget();
+      },
+      { code: 'unimplemented-stage-c', message: /Live target swap is not implemented/ }
+    );
+
+    await assert.rejects(
+      async () => {
+        await swapVerifiedTarget({
+          repoRoot: '/fake',
+          txId: 'ci-tx-123-abc',
+          op: 'apply',
+          retainParentDescriptor: true,
+        });
+      },
+      { code: 'unimplemented-stage-c' }
+    );
+  });
+});

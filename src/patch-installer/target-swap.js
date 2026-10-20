@@ -427,51 +427,38 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
 }
 
 /**
- * Public Stage B read-only pre-swap authentication entry point.
- * Asynchronous function returning a Promise, strictly read-only:
- * never mutates, renames, writes, unlinks, or chmods any file.
+ * Internal private core for pre-swap prerequisites authentication.
  *
- * @param {object} options
- * @param {string} options.repoRoot
- * @param {string} options.txId
- * @param {'apply' | 'remove'} options.op
- * @param {import('./lock.js').TransactionLease} options.lease
- * @param {object|string} [options.manifest]
- * @param {string} [options.procDir='/proc/self/fd']
- * @param {object} [options.constants=fs.constants]
- * @param {number} [options.maxBytes=MAX_SWAP_FILE_BYTES]
- * @param {(stage: string, context?: object) => void} [options.faultHook=null]
- * @param {(absPath: string) => void} [options.beforeOpenHook=null]
- * @returns {Promise<{
- *   ok: boolean,
- *   verified?: boolean,
- *   txId?: string,
- *   op?: string,
- *   repoRoot?: string,
- *   targetFile?: string,
- *   targetMode?: string,
- *   isolatedStagedPath?: string,
- *   backupPath?: string,
- *   destinationStagedPath?: string,
- *   initialSha256?: string,
- *   resultSha256?: string,
- *   targetDev?: number|bigint,
- *   targetIno?: number|bigint,
- *   candidateDev?: number|bigint,
- *   candidateIno?: number|bigint,
- *   backupDev?: number|bigint,
- *   backupIno?: number|bigint,
- *   stagingDev?: number|bigint,
- *   stagingIno?: number|bigint,
- *   parentDev?: number|bigint,
- *   parentIno?: number|bigint,
- *   error?: string,
- *   code?: string,
- *   stage?: string,
- *   reason?: string
- * }>}
+ * Implements the full Stage B authentication sequence:
+ * - In-process lease, lock ownership, and journal phase READY_TO_SWAP validation
+ * - Certified package manifest binding and fingerprint verification
+ * - Hierarchy sanity checks (no symlinks in intermediate components)
+ * - Destination parent directory descriptor opening and procfs anchoring
+ * - Bounded nonblocking verification of staging, backup, live target, and destination candidate
+ * - Stable permission bits, single-link invariants, device containment, distinct inode identity
+ * - Post-verification parent pathname continuity
+ *
+ * Descriptor Ownership Model:
+ * 1. The core initially opens and owns `parentFd`.
+ * 2. If `retainParentDescriptor` is false (default):
+ *    - `parentFd` is closed unconditionally in `finally` before returning.
+ *    - If `fs.closeSync` fails on an otherwise successful authentication, returns ok: false with descriptorCloseUncertain.
+ *    - The return object never contains `parentFd`.
+ * 3. If `retainParentDescriptor` is true:
+ *    - On failure or thrown exception: `parentFd` is closed unconditionally in `finally`; never transferred.
+ *    - On success: ownership of `parentFd` is transferred to the caller; `parentFd` is set to null so the core's
+ *      `finally` block will NOT close it; the returned object includes `parentFd` and `parentStat`.
+ *    - The caller exclusively owns the descriptor and is responsible for an unconditional `try/finally` close.
+ *
+ * @private
+ * @param {object} options - Swap options (repoRoot, txId, op, lease, manifest, constants, etc.)
+ * @param {object} [coreOptions]
+ * @param {boolean} [coreOptions.retainParentDescriptor=false] - Whether to transfer parentFd ownership on success
+ * @returns {Promise<object>}
  */
-export async function authenticateSwapPrerequisites(options = {}) {
+async function authenticatePrerequisitesCore(options = {}, coreOptions = {}) {
+  const retainParentDescriptor = Boolean(coreOptions?.retainParentDescriptor);
+
   if (!options || typeof options !== 'object' || Array.isArray(options)) {
     return {
       ok: false,
@@ -1133,6 +1120,7 @@ export async function authenticateSwapPrerequisites(options = {}) {
 
   let verificationResult = null;
   let verificationException = null;
+  let descriptorTransferred = false;
 
   const fail = (res) => {
     if (!res.reason && res.error) {
@@ -1549,13 +1537,25 @@ export async function authenticateSwapPrerequisites(options = {}) {
       parentDev: parentStat.dev,
       parentIno: parentStat.ino,
     };
+
+    if (retainParentDescriptor) {
+      const transferredFd = parentFd;
+      parentFd = null; // Ownership transferred: core will not close in finally
+      descriptorTransferred = true;
+      return {
+        ...verificationResult,
+        parentFd: transferredFd,
+        parentStat,
+      };
+    }
+
     return verificationResult;
   } catch (err) {
     verificationException = err;
     throw err;
   } finally {
-    // F1-D: Fail closed on destination parent descriptor closure errors
-    if (parentFd !== null) {
+    // F1-D / C1: Fail closed on destination parent descriptor closure errors when not transferred
+    if (parentFd !== null && !descriptorTransferred) {
       const fdToClose = parentFd;
       parentFd = null; // Relinquish ownership immediately; do not retry close
       let closeErr = null;
@@ -1603,13 +1603,33 @@ export async function authenticateSwapPrerequisites(options = {}) {
 }
 
 /**
+ * Public Stage B read-only pre-swap authentication entry point.
+ * Asynchronous function returning a Promise, strictly read-only:
+ * never mutates, renames, writes, unlinks, or chmods any file.
+ *
+ * Always runs with descriptor retention disabled: all opened descriptors are
+ * closed before returning. Never exposes raw file descriptors.
+ *
+ * @param {object} options
+ * @returns {Promise<object>}
+ */
+export async function authenticateSwapPrerequisites(options = {}) {
+  return authenticatePrerequisitesCore(options, { retainParentDescriptor: false });
+}
+
+/**
  * Aliases for authenticateSwapPrerequisites.
  */
 export const authenticatePreSwap = authenticateSwapPrerequisites;
 
+// Private Symbol key used for test-local instrumentation of the internal core.
+// Not exported as a named symbol; does not expand the public export surface.
+const AUTH_CORE_KEY = Symbol.for('ci.patch-installer.target-swap.authenticatePrerequisitesCore');
+authenticateSwapPrerequisites[AUTH_CORE_KEY] = authenticatePrerequisitesCore;
+
 /**
  * Reserved placeholder for future Stage C live-target swap.
- * Intentionally unimplemented in Stage B; fails closed.
+ * Intentionally unimplemented in Stage B and Stage C1; fails closed.
  */
 export async function swapVerifiedTarget() {
   const err = new Error('Live target swap is not implemented: reserved for Stage C (D01-P3B-2D-2-C)');
