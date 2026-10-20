@@ -4,7 +4,7 @@
 
 It belongs to the planned **Chromatic** family of SillyTavern extensions alongside Chromatic Dialogue.
 
-> **Project status (2026-10-19):** M01–M03 are accepted; explicit settings-only diagnostic image generation is verified. Distribution installer track D01 has completed and accepted its read-only preflight, transaction foundation, isolated preparation, verified backup, and verified destination staging (**P3B-2C**). Public patch application/removal is **not yet implemented**; atomic live-file replacement (**P3B-2D**) awaits a separate security plan. Automatic roleplay generation is still disabled; M04 character identity/reference management and M05 proposal-card Generate wiring remain future work.
+> **Project status (2026-10-20):** M01–M03 are accepted; explicit settings-only diagnostic image generation is verified. Distribution installer D01 has accepted read-only preflight, transaction foundation, isolated preparation, verified backup, destination staging (**P3B-2C**), and read-only post-swap inspection (**P3B-2D-1**). Public patch application/removal remains **disabled**; atomic live-file replacement (**P3B-2D-2**) awaits a separate security plan and Android/Termux capability verification. Automatic roleplay generation remains disabled; M04 character identity/reference management and M05 proposal-card Generate wiring are future work.
 
 ## Product goal
 
@@ -442,9 +442,9 @@ This is a responsibility map, not an instruction to create every module immediat
 
 ## Distribution installer status (D01)
 
-The packaged SillyTavern NanoGPT proxy patches target **only** the certified release `06bde939fb1e9c4c8d8641d810f0a916b5bce127`. The installer currently supports read-only inspection and internal, lease-authorized transaction primitives through the `READY_TO_SWAP` journal phase. These primitives prepare authenticated resulting bytes, preserve a verified original backup, and create a durable same-directory replacement candidate **without touching the live endpoint**.
+The packaged SillyTavern NanoGPT proxy patches target **only** the certified release `06bde939fb1e9c4c8d8641d810f0a916b5bce127`. The installer currently supports read-only inspection and internal, lease-authorized transaction primitives through the `READY_TO_SWAP` journal phase. These primitives prepare authenticated resulting bytes, preserve a verified original backup, and create a durable same-directory replacement candidate **without touching the live endpoint**. Accepted P3B-2D-1 read-only inspection detects consistent `SWAPPED`/`COMPLETED` states and potential unrecorded swaps without performing a rename or journal transition.
 
-**Not yet supported:** publicly callable `--apply`, `--remove`, `--recover`, atomic candidate-to-live-target replacement, or automatic rollback/recovery. P3B-2D is the next planning checkpoint, not an implemented or authorized mutation command.
+**Not yet supported:** publicly callable `--apply`, `--remove`, `--recover`, atomic candidate-to-live-target replacement, or automatic rollback/recovery. P3B-2D-2 is the next architecture/security planning checkpoint, not an implemented or authorized mutation command. Physical Android/Termux filesystem validation is still pending.
 
 See [D01 installer status and handoff](docs/d01-installer-progress.md) for accepted evidence, safety invariants, and the next bounded stage.
 ## Development model

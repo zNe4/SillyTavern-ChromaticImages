@@ -6,7 +6,7 @@
 
 **Phase:** Phase M03 complete (accepted); Distribution track D01 active.
 
-**Current milestone:** D01-P3B-2C (verified destination-parent staging) formally accepted and closed on 2026-10-19. **Next:** D01-P3B-2D (atomic live-target replacement) requires a separate read-only security architecture review and explicit authorization before coding.
+**Current milestone:** D01-P3B-2D-1 (read-only post-swap state inspection) accepted and closed on 2026-10-20, after P3B-2C closed on 2026-10-19. **Next:** D01-P3B-2D-2 (atomic live-target replacement) remains a separate architecture/security planning checkpoint; implementation needs explicit authorization and Android/Termux filesystem capability validation.
 
 **Completed:** M01, M02, and M03-A through M03-H3; D01-P1, D01-P2A, D01-P2B, D01-P3A, D01-P3B transaction/locking foundation, and D01-P3B-2A/2B/2C (all accepted). Public patch application, removal, and recovery remain disabled.
 
@@ -726,7 +726,7 @@ Prepare public stable development release.
 
 ## D01 — SillyTavern patch distribution and safe installer
 
-**Status:** D01-P1, P2A, P2B, P3A, and internal P3B transaction stages through P3B-2C are accepted. This does **not** mean an end-user installer is operational.
+**Status:** D01-P1, P2A, P2B, P3A, internal P3B transaction stages through P3B-2C, and **P3B-2D-1 read-only post-swap inspection** are accepted. This does **not** mean an end-user installer is operational.
 
 | Stage | Status | Boundary |
 | --- | --- | --- |
@@ -738,14 +738,17 @@ Prepare public stable development release.
 | D01-P3B-2A | Accepted | Authenticated isolated patch preparation. |
 | D01-P3B-2B | Accepted | Verified original-target backup; no live mutation. |
 | **D01-P3B-2C** | **Accepted 2026-10-19** | Verified destination-parent candidate; journal reaches `READY_TO_SWAP`, live target unchanged. |
-| D01-P3B-2D | **Planning only; not authorized for implementation** | Atomic replacement of live target; first live-file mutation boundary. |
+| **D01-P3B-2D-1** | **Accepted 2026-10-20** | Read-only classification of live result, missing candidate, possible unrecorded swap and inconsistent later phases; no mutations. |
+| D01-P3B-2D-2 | **Planning only; not authorized for implementation** | Atomic replacement of live target; first live-file mutation boundary, with Android/Termux capability gate. |
 | D01-P3B-3 and later | Deferred | Completion/recovery/public CLI subject to separately reviewed contracts. |
 
 **Accepted P3B-2C code baseline:** `38043acd5a35e4087c2c7d214ee95f3a5f280323`. Gemini's read-only executable acceptance report recorded **1,043/1,043** full-suite tests, **63/63** focused destination-staging tests, zero failures/skips, `npm run verify:patches` PASS, and `node --check` passing for 64 tracked JavaScript files. The linked SillyTavern checkout was reported unchanged before and after. These are submitted execution results, not claims of independent local execution by the reviewer.
 
 **State-inspection correction:** `orphaned-artifact` has `isPending: true`, including when `.ci-patch` is absent. The acceptance report incorrectly displayed `false` in two table rows; source and regression tests support `true`.
 
-**Stop boundary:** P3B-2C does not rename the candidate onto `src/endpoints/stable-diffusion.js`, implement rollback, or enable public `--apply`/`--remove`/`--recover`. P3B-2D starts with a read-only design/security plan for independent review; no coding stage starts automatically.
+**Accepted P3B-2D-1 code baseline:** `fccce70936bec0b507964e6e6b3427ff75d93973`. Codex's verification report recorded **1,064/1,064** full-suite tests (61 suites), **146/146** focused transaction tests, zero failures/skips, authentic pinned fixture authentication, `npm run verify:patches` PASS, and 64 tracked JavaScript syntax checks passing. The original installation was reported unchanged. These are submitted execution results, not independently re-executed local tests by ChatGPT.
+
+**Stop boundary:** P3B-2D-1 does **not** rename the candidate onto `src/endpoints/stable-diffusion.js`, change the live target, advance the journal, implement rollback, or enable public `--apply`/`--remove`/`--recover`. P3B-2D-2 requires a separate security plan and explicit authorization; on-device Android/Termux filesystem verification remains an acceptance gate. No coding stage starts automatically.
 
 **Handoff reference:** [docs/d01-installer-progress.md](docs/d01-installer-progress.md) records source files, journal lifecycle, certified fingerprints, accepted security invariants, testing evidence, and P3B-2D questions.
 

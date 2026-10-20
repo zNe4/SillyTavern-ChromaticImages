@@ -12,7 +12,8 @@
 | D01-P3B-2A | Accepted | Authenticated isolated result preparation. |
 | D01-P3B-2B | Accepted | Verified backup of the live initial bytes and original mode; no live target mutation. |
 | **D01-P3B-2C** | **Accepted / closed** | Durable, independently authenticated destination candidate; `BACKUP_CREATED → READY_TO_SWAP`. |
-| D01-P3B-2D | **Not implemented; planning required** | Atomic candidate replacement of live target, with its own reviewed crash/identity contract. |
+| **D01-P3B-2D-1** | **Accepted / closed 2026-10-20** | Read-only post-swap inspection of live target, missing/leftover candidate, and possible unrecorded swap. |
+| D01-P3B-2D-2 | **Not implemented; planning required** | Atomic candidate replacement of live target, with its own reviewed crash/identity contract and Android/Termux gate. |
 | D01-P3B-3 and subsequent | Deferred | Completion, recovery/rollback and public mutation CLI gates. |
 
 The accepted code baseline is [`38043acd5a35e4087c2c7d214ee95f3a5f280323`](https://github.com/zNe4/SillyTavern-ChromaticImages/commit/38043acd5a35e4087c2c7d214ee95f3a5f280323) (P3B-2C-F2). The initial P3B-2C implementation and corrective commits F1/F2 were independently source-reviewed before executable acceptance.
@@ -72,9 +73,33 @@ Evidence provenance: test runs and installation observations were **reported by 
 
 An optional local, ignored `./SillyTavern` symlink may point to a separate installation and supply **read-only pinned Git objects** for tests (e.g., `SILLYTAVERN_TEST_REPO="$(realpath ./SillyTavern)" npm test`). Never apply patches, create transaction artifacts, reset/checkout, or mutate the target through the symlink. All mutation tests must use disposable independent fixtures.
 
-## Next planning checkpoint: D01-P3B-2D
+## D01-P3B-2D-1 acceptance record (2026-10-20)
 
-**Not authorized for implementation.** P3B-2D is the first stage permitted to change the live target, so require a separate read-only design and independent review before issuing a bounded Codex coding mission. The review should settle:
+The accepted implementation and F1 corrections occupy `src/patch-installer/transaction-state.js` and `tests/patch-installer-transaction.test.mjs`. The accepted head is [`fccce70936bec0b507964e6e6b3427ff75d93973`](https://github.com/zNe4/SillyTavern-ChromaticImages/commit/fccce70936bec0b507964e6e6b3427ff75d93973).
+
+- Scope: inspect the live target **only** when lock and journal are valid, agree on transaction identity, and the phase is `READY_TO_SWAP`, `SWAPPED`, or `COMPLETED`; preserve `none` for unrelated clean repositories.
+- Safety: bounded read (50 MiB), actual `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` flags without fallback, pre-open pathname type check, post-open regular-file check, device/inode/size/mode continuity, pathname-to-descriptor identity, SHA-256 comparison, descriptor cleanup, and distinct missing-versus-error handling. Unsupported special objects fail closed without becoming false orphan entries.
+- Semantics: `READY_TO_SWAP` with absent candidate and result live bytes means **possible**, not proven, unrecorded swap; classify `incomplete-transaction`. `SWAPPED` and `COMPLETED` with valid result bytes/mode and absent candidate are recognized as consistent. Other mismatches are reported safely; no auto journal change or recovery.
+- Regression corrections: mandatory nonblocking access, authentic oversized live-file diagnostic using a sparse fixture, explicit `EACCES`/`EIO` handling, and a deterministic precheck-to-open FIFO substitution test.
+
+Codex's **D01-P3B-2D-1-V — Executable Acceptance Report** dated 2026-10-20 records:
+
+| Verification | Reported result |
+| --- | --- |
+| Pinned upstream fixture | Disposable Git checkout under `/tmp`, certified release `06bde939fb1e9c4c8d8641d810f0a916b5bce127`, original and patched SHA-256 / Git blobs match manifest. |
+| Targeted transaction suite | **146/146 passed**, zero failures or skips. |
+| Authentic full Node suite | **1,064/1,064 passed** across 61 suites, zero failures or skips; both candidate staging directions exercised. |
+| FIFO safety tests | Both regular-FIFO and precheck-to-open substitution paths executed; `mkfifo` available. |
+| Package verification | `npm run verify:patches` PASS. |
+| Repository-wide syntax | 64 tracked `.js`/`.mjs` files passed `node --check`. |
+| Installation preservation | Linked SillyTavern installation reported unchanged; disposable fixture removed after the run. |
+| CLI mutation boundary | `--apply`/`--remove` still reject; `--recover` unavailable. |
+
+Evidence provenance: Codex performed and reported executable validation; ChatGPT independently reviewed the pushed source and the acceptance report, but **did not re-run** the suite on that host. GitHub had no associated workflow checks at the reviewed commit. On-device Android/Termux capability and filesystem behavior remain **unverified** and must be tested with disposable private-storage files before accepting P3B-2D-2. Acceptance of read-only P3B-2D-1 is not authorization for live target replacement.
+
+## Next planning checkpoint: D01-P3B-2D-2
+
+**Not authorized for implementation.** P3B-2D-2 is the first stage proposed to change the live target, so require a separate read-only design and independent review before issuing a bounded Codex coding mission. The review should settle:
 
 - Lease and journal authorization immediately before swapping; full authentication of live initial bytes/mode/inode, backup, isolated result, and same-directory candidate (including identity/permissions/durability).
 - Atomic rename semantics and directory fsync ordering; what happens if rename succeeds but subsequent directory synchronization or journal advance fails.
@@ -83,7 +108,7 @@ An optional local, ignored `./SillyTavern` symlink may point to a separate insta
 - Read-only status/inspection for the post-rename state without pretending P3B-3 recovery is implemented.
 - Deterministic forward and reverse fixture tests for every failure boundary, with **no changes** to the actual linked SillyTavern installation.
 
-These are open design questions, not an approved swap algorithm. Keep public `--apply`, `--remove`, and `--recover` unavailable until their own later authorization.
+These are open design questions, not an approved swap algorithm. Include an on-device Termux private-storage capability test for descriptor-anchored rename, fsync of candidate and parent directory, and post-rename inode identity before accepting the swap stage. If an operation is unsupported, fail closed without an unsafe fallback. Keep public `--apply`, `--remove`, and `--recover` unavailable until their own later authorization.
 
 ## Workflow
 
