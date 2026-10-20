@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import child_process from 'node:child_process';
 
 import {
   acquireLock,
@@ -35,7 +36,9 @@ import {
   inspectTransactionState,
   inspectBackupArtifactFile,
   inspectDestinationCandidateFile,
+  inspectLiveTargetFile,
   MAX_DESTINATION_INSPECT_BYTES,
+  MAX_LIVE_TARGET_INSPECT_BYTES,
   hasRequiredNoFollow,
   getPermittedArtifactNames,
 } from '../src/patch-installer/transaction-state.js';
@@ -4178,6 +4181,11 @@ describe('P3B-2C: Destination Candidate Inspection & Lifecycle (transaction-stat
     fs.mkdirSync(path.join(repo, `.ci-patch/backup/${txId}`), { recursive: true });
     fs.writeFileSync(path.join(repo, `.ci-patch/backup/${txId}/stable-diffusion.js`), stockContent);
 
+    // Live target contains certified initial stock bytes
+    const liveTargetPath = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTargetPath, stockContent);
+    fs.chmodSync(liveTargetPath, 0o644);
+
     // Create candidate matching patchedSha and targetMode 0644
     const candidatePath = path.join(endpointsDir, `.stable-diffusion.js.ci-staged-${txId}.tmp`);
     fs.writeFileSync(candidatePath, patchedContent);
@@ -4338,6 +4346,10 @@ describe('P3B-2C: Destination Candidate Inspection & Lifecycle (transaction-stat
       fs.writeFileSync(path.join(repo, `.ci-patch/backup/${txId}/stable-diffusion.js`), stockContent);
 
       // Candidate file is absent (already swapped into place)
+      const liveTargetPath = path.join(endpointsDir, 'stable-diffusion.js');
+      fs.writeFileSync(liveTargetPath, patchedContent);
+      fs.chmodSync(liveTargetPath, 0o644);
+
       const state = inspectTransactionState(repo);
       // Absent candidate does not make it incomplete-transaction
       assert.notEqual(state.state, 'incomplete-transaction');
@@ -4529,6 +4541,421 @@ describe('P3B-2C: Destination Candidate Inspection & Lifecycle (transaction-stat
     assert.equal(state.journal?.isValid, false);
     assert.ok(state.orphanedArtifacts.includes('src/endpoints/.stable-diffusion.js.ci-staged-orphanTx777.tmp'));
     assert.ok(state.reasons.some((r) => r.includes('corrupted') || r.includes('JSON') || r.includes('SyntaxError') || r.includes('failed to parse')));
+  });
+});
+
+describe('P3B-2D-1: Read-Only Post-Swap State Inspection (transaction-state.js)', () => {
+  const stockContent = 'function stockTarget() { return "stock"; }\n';
+  const stockSha = crypto.createHash('sha256').update(stockContent).digest('hex');
+  const patchedContent = 'function stockTarget() { return "patched"; }\n';
+  const patchedSha = crypto.createHash('sha256').update(patchedContent).digest('hex');
+
+  function setupTxAtPhase(repo, targetPhase, { txId = generateTxId(), op = 'apply' } = {}) {
+    const endpointsDir = path.join(repo, 'src/endpoints');
+    fs.mkdirSync(endpointsDir, { recursive: true });
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op,
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const phases = ['ISOLATED_PREPARED', 'BACKUP_CREATED', 'READY_TO_SWAP', 'SWAPPED', 'COMPLETED'];
+    for (const p of phases) {
+      if (p === 'ISOLATED_PREPARED') {
+        advanceJournalPhase({
+          repoRoot: repo,
+          txId,
+          nextPhase: p,
+          lease,
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+        });
+        fs.mkdirSync(path.join(repo, `.ci-patch/staging/${txId}`), { recursive: true });
+        fs.writeFileSync(path.join(repo, `.ci-patch/staging/${txId}/stable-diffusion.js`), patchedContent);
+      } else if (p === 'BACKUP_CREATED') {
+        advanceJournalPhase({
+          repoRoot: repo,
+          txId,
+          nextPhase: p,
+          lease,
+          metadataUpdate: { backupPath: `.ci-patch/backup/${txId}/stable-diffusion.js`, targetMode: '0644' },
+        });
+        fs.mkdirSync(path.join(repo, `.ci-patch/backup/${txId}`), { recursive: true });
+        fs.writeFileSync(path.join(repo, `.ci-patch/backup/${txId}/stable-diffusion.js`), stockContent);
+      } else if (p === 'READY_TO_SWAP') {
+        advanceJournalPhase({
+          repoRoot: repo,
+          txId,
+          nextPhase: p,
+          lease,
+          metadataUpdate: { destinationStagedPath: `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp` },
+        });
+      } else {
+        advanceJournalPhase({
+          repoRoot: repo,
+          txId,
+          nextPhase: p,
+          lease,
+        });
+      }
+      if (p === targetPhase) break;
+    }
+
+    return { txId, lease, endpointsDir };
+  }
+
+  test('1. Normal READY_TO_SWAP state with candidate', () => {
+    const repo = createTempDir('tx-p3b2d1-normal-ready-');
+    const { txId, endpointsDir } = setupTxAtPhase(repo, 'READY_TO_SWAP');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, stockContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    const candidate = path.join(endpointsDir, `.stable-diffusion.js.ci-staged-${txId}.tmp`);
+    fs.writeFileSync(candidate, patchedContent);
+    fs.chmodSync(candidate, 0o644);
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'ownership-unverified');
+    assert.equal(state.isPending, true);
+    assert.equal(state.orphanedArtifacts.length, 0);
+  });
+
+  test('2. Missing candidate and unchanged live target in READY_TO_SWAP', () => {
+    const repo = createTempDir('tx-p3b2d1-missing-cand-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'READY_TO_SWAP');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, stockContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    // Candidate absent
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Missing destination candidate in phase "READY_TO_SWAP"')));
+    assert.ok(!state.reasons.some((r) => r.includes('Possible unrecorded swap')));
+  });
+
+  test('3. Missing candidate but live target containing expected result in READY_TO_SWAP', () => {
+    const repo = createTempDir('tx-p3b2d1-unrecorded-swap-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'READY_TO_SWAP');
+
+    // Live target has patched bytes (expected result)
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, patchedContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    // Candidate absent
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Possible unrecorded swap detected')));
+    assert.ok(state.reasons.some((r) => r.includes('destination candidate absent, but live target contains expected result')));
+  });
+
+  test('4. SWAPPED with expected result and missing candidate', () => {
+    const repo = createTempDir('tx-p3b2d1-swapped-normal-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'SWAPPED');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, patchedContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    // Candidate absent (consumed by swap)
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'ownership-unverified');
+    assert.equal(state.isPending, true);
+    assert.equal(state.orphanedArtifacts.length, 0);
+  });
+
+  test('5. SWAPPED with initial bytes', () => {
+    const repo = createTempDir('tx-p3b2d1-swapped-initial-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'SWAPPED');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, stockContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Incomplete swap detected: journal phase is "SWAPPED" but live target still contains initial content')));
+  });
+
+  test('6. SWAPPED with unexpected bytes', () => {
+    const repo = createTempDir('tx-p3b2d1-swapped-unexpected-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'SWAPPED');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, 'completely unexpected content');
+    fs.chmodSync(liveTarget, 0o644);
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Live target content mismatch in phase "SWAPPED"')));
+  });
+
+  test('7. COMPLETED with valid result and missing candidate', () => {
+    const repo = createTempDir('tx-p3b2d1-completed-normal-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'COMPLETED');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, patchedContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'ownership-unverified');
+    assert.equal(state.isPending, true);
+    assert.equal(state.orphanedArtifacts.length, 0);
+  });
+
+  test('8. COMPLETED with wrong content', () => {
+    const repo = createTempDir('tx-p3b2d1-completed-wrong-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'COMPLETED');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, stockContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Live target content mismatch in phase "COMPLETED"')));
+  });
+
+  test('9. Live-target symlink triggers unsafe-symlink', () => {
+    const repo = createTempDir('tx-p3b2d1-target-symlink-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'READY_TO_SWAP');
+
+    const externalFile = path.join(repo, 'external.js');
+    fs.writeFileSync(externalFile, stockContent);
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.symlinkSync(externalFile, liveTarget);
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'unsafe-symlink');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Live target file is a symbolic link')));
+  });
+
+  test('10. Missing live target in SWAPPED triggers incomplete-transaction', () => {
+    const repo = createTempDir('tx-p3b2d1-target-missing-');
+    setupTxAtPhase(repo, 'SWAPPED');
+
+    // stable-diffusion.js does NOT exist
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Missing live target file in phase "SWAPPED"')));
+  });
+
+  test('11. Wrong live-target mode in SWAPPED triggers incomplete-transaction', () => {
+    const repo = createTempDir('tx-p3b2d1-target-mode-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'SWAPPED');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, patchedContent);
+    fs.chmodSync(liveTarget, 0o600); // 0600 instead of expected 0644
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'incomplete-transaction');
+    assert.equal(state.isPending, true);
+    assert.ok(state.reasons.some((r) => r.includes('Live target mode mismatch in phase "SWAPPED"')));
+  });
+
+  test('12. Oversized or concurrently changed live target', () => {
+    const repo = createTempDir('tx-p3b2d1-oversized-');
+    const { endpointsDir } = setupTxAtPhase(repo, 'SWAPPED');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, patchedContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    // Part A: Simulated oversized target (> 50 MiB)
+    const origFstatSync = fs.fstatSync;
+    try {
+      fs.fstatSync = (fd, ...args) => {
+        const s = origFstatSync(fd, ...args);
+        s.size = MAX_LIVE_TARGET_INSPECT_BYTES + 1;
+        return s;
+      };
+      const state = inspectTransactionState(repo);
+      assert.equal(state.state, 'inspection-error');
+      assert.equal(state.isPending, true);
+      assert.ok(state.reasons.some((r) => r.includes('exceeds safety limit')));
+    } finally {
+      fs.fstatSync = origFstatSync;
+    }
+
+    // Part B: Simulated concurrent permission change during descriptor readback
+    let callCount = 0;
+    try {
+      fs.fstatSync = (fd, ...args) => {
+        const s = origFstatSync(fd, ...args);
+        callCount++;
+        if (callCount > 1) {
+          s.mode = (s.mode & ~0o777) | 0o700;
+        }
+        return s;
+      };
+      const unitRes = inspectLiveTargetFile(
+        liveTarget,
+        stockSha,
+        patchedSha,
+        '0644',
+        'SWAPPED',
+        'src/endpoints/stable-diffusion.js'
+      );
+      assert.equal(unitRes.ok, false);
+      assert.equal(unitRes.isIncomplete, true);
+      assert.match(unitRes.reason, /permissions changed concurrently/);
+    } finally {
+      fs.fstatSync = origFstatSync;
+    }
+  });
+
+  test('13. Unexpected candidate remaining after swap triggers orphaned-artifact', () => {
+    const repo = createTempDir('tx-p3b2d1-leftover-cand-');
+    const { txId, endpointsDir } = setupTxAtPhase(repo, 'SWAPPED');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, patchedContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    const leftover = path.join(endpointsDir, `.stable-diffusion.js.ci-staged-${txId}.tmp`);
+    fs.writeFileSync(leftover, 'leftover');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.ok(state.orphanedArtifacts.includes(`src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`));
+  });
+
+  test('14. Existing orphan detection when .ci-patch is absent', () => {
+    const repo = createTempDir('tx-p3b2d1-no-patch-dir-');
+    const endpointsDir = path.join(repo, 'src/endpoints');
+    fs.mkdirSync(endpointsDir, { recursive: true });
+
+    const candidate = path.join(endpointsDir, '.stable-diffusion.js.ci-staged-tx9999.tmp');
+    fs.writeFileSync(candidate, 'orphaned candidate content');
+
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'orphaned-artifact');
+    assert.equal(state.isPending, true);
+    assert.ok(state.orphanedArtifacts.includes('src/endpoints/.stable-diffusion.js.ci-staged-tx9999.tmp'));
+  });
+
+  test('15. Preservation of isPending and existing state precedence', () => {
+    // Test A: unsafe-symlink takes precedence over incomplete-transaction
+    const repo1 = createTempDir('tx-p3b2d1-prec-symlink-');
+    const { endpointsDir: ed1 } = setupTxAtPhase(repo1, 'READY_TO_SWAP');
+    const ext = path.join(repo1, 'ext.js');
+    fs.writeFileSync(ext, 'content');
+    fs.symlinkSync(ext, path.join(ed1, 'stable-diffusion.js'));
+    const state1 = inspectTransactionState(repo1);
+    assert.equal(state1.state, 'unsafe-symlink');
+    assert.equal(state1.isPending, true);
+
+    // Test B: foreign-content takes precedence over incomplete-transaction
+    const repo2 = createTempDir('tx-p3b2d1-prec-foreign-');
+    setupTxAtPhase(repo2, 'SWAPPED');
+    fs.writeFileSync(path.join(repo2, '.ci-patch/foreign.txt'), 'extra');
+    const state2 = inspectTransactionState(repo2);
+    assert.equal(state2.state, 'foreign-content');
+    assert.equal(state2.isPending, true);
+
+    // Test C: isPending invariant: true for all non-none states, false only for none
+    const cleanRepo = createTempDir('tx-p3b2d1-clean-');
+    const cleanState = inspectTransactionState(cleanRepo);
+    assert.equal(cleanState.state, 'none');
+    assert.equal(cleanState.isPending, false);
+  });
+
+  test('16. Read-only behavior, with no mutations to inspected fixtures', () => {
+    const repo = createTempDir('tx-p3b2d1-readonly-');
+    const { txId, endpointsDir } = setupTxAtPhase(repo, 'READY_TO_SWAP');
+
+    const liveTarget = path.join(endpointsDir, 'stable-diffusion.js');
+    fs.writeFileSync(liveTarget, stockContent);
+    fs.chmodSync(liveTarget, 0o644);
+
+    const candidate = path.join(endpointsDir, `.stable-diffusion.js.ci-staged-${txId}.tmp`);
+    fs.writeFileSync(candidate, patchedContent);
+    fs.chmodSync(candidate, 0o644);
+
+    function snapshotRepo(dir) {
+      const snap = {};
+      for (const entry of fs.readdirSync(dir, { recursive: true })) {
+        const full = path.join(dir, entry);
+        const st = fs.lstatSync(full);
+        snap[entry] = {
+          mode: st.mode,
+          size: st.size,
+          dev: st.dev,
+          ino: st.ino,
+          mtimeMs: st.mtimeMs,
+          content: st.isFile() ? fs.readFileSync(full, 'hex') : null,
+        };
+      }
+      return snap;
+    }
+
+    const before = snapshotRepo(repo);
+    const state = inspectTransactionState(repo);
+    assert.equal(state.state, 'ownership-unverified');
+    const after = snapshotRepo(repo);
+
+    assert.deepEqual(after, before);
+  });
+
+  test('17. Amendments B & C: Live target is directory or FIFO fails closed without orphaned-artifact and without blocking', () => {
+    // Directory live target
+    const repoDir = createTempDir('tx-p3b2d1-target-dir-');
+    const { endpointsDir: edDir } = setupTxAtPhase(repoDir, 'SWAPPED');
+    fs.mkdirSync(path.join(edDir, 'stable-diffusion.js'));
+
+    const stateDir = inspectTransactionState(repoDir);
+    assert.equal(stateDir.state, 'incomplete-transaction');
+    assert.equal(stateDir.isPending, true);
+    assert.equal(stateDir.orphanedArtifacts.length, 0);
+    assert.ok(stateDir.reasons.some((r) => r.includes('not a regular file')));
+
+    // FIFO live target with mkfifo
+    const repoFifo = createTempDir('tx-p3b2d1-target-fifo-');
+    const { endpointsDir: edFifo } = setupTxAtPhase(repoFifo, 'SWAPPED');
+    const fifoTarget = path.join(edFifo, 'stable-diffusion.js');
+    try {
+      child_process.execFileSync('mkfifo', [fifoTarget]);
+      const stateFifo = inspectTransactionState(repoFifo);
+      assert.equal(stateFifo.state, 'incomplete-transaction');
+      assert.equal(stateFifo.isPending, true);
+      assert.equal(stateFifo.orphanedArtifacts.length, 0);
+      assert.ok(stateFifo.reasons.some((r) => r.includes('not a regular file')));
+
+      const fifoUnit = inspectLiveTargetFile(
+        fifoTarget,
+        stockSha,
+        patchedSha,
+        '0644',
+        'SWAPPED',
+        'src/endpoints/stable-diffusion.js'
+      );
+      assert.equal(fifoUnit.ok, false);
+      assert.equal(fifoUnit.isUnsupportedType, true);
+      assert.equal(fifoUnit.isIncomplete, true);
+    } catch (err) {
+      if (err?.code !== 'ENOENT') throw err;
+    }
   });
 });
 

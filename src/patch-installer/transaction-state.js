@@ -402,6 +402,208 @@ export function inspectDestinationCandidateFile(cPath, expectedSha, expectedMode
 }
 
 
+export const MAX_LIVE_TARGET_INSPECT_BYTES = 50 * 1024 * 1024; // 50 MiB
+
+/**
+ * Bounded, descriptor-based readback and verification of the live target file.
+ * Strictly read-only; imposes size bounds before allocating buffer.
+ * Prechecks pathname type and uses O_NONBLOCK to prevent blocking on FIFOs or special files.
+ * Verifies stable permissions across pre-read, post-read, and pathname checks.
+ *
+ * @param {string} cPath - Absolute path to live target file
+ * @param {string} expectedInitialSha - Expected initial SHA-256 hex digest
+ * @param {string} expectedResultSha - Expected result SHA-256 hex digest
+ * @param {string} expectedMode - Expected 4-character octal targetMode (e.g. "0644")
+ * @param {string} phase - Current journal phase
+ * @param {string} relTarget - Human-readable relative target name for error messages
+ * @returns {{
+ *   ok: boolean,
+ *   isMissing?: boolean,
+ *   isSymlink?: boolean,
+ *   isUnsupportedType?: boolean,
+ *   isForeign?: boolean,
+ *   isError?: boolean,
+ *   isOversized?: boolean,
+ *   isIncomplete?: boolean,
+ *   actualSha?: string,
+ *   actualMode?: string,
+ *   isInitial?: boolean,
+ *   isResult?: boolean,
+ *   modeMatches?: boolean,
+ *   size?: number,
+ *   reason?: string
+ * }}
+ */
+export function inspectLiveTargetFile(cPath, expectedInitialSha, expectedResultSha, expectedMode, phase, relTarget) {
+  if (!hasRequiredNoFollow(fs.constants)) {
+    return {
+      ok: false,
+      isError: true,
+      reason: `Unsupported platform: O_NOFOLLOW file open flag is required for safe live target inspection of "${relTarget}"`,
+    };
+  }
+
+  // Pathname precheck to avoid hanging on FIFOs or non-regular files
+  const preCheck = getPathLstat(cPath);
+  if (preCheck.error) {
+    if (preCheck.error.code === 'ENOENT') {
+      return { ok: false, isMissing: true, isIncomplete: true, reason: `Live target was not found: "${relTarget}"` };
+    }
+    return { ok: false, isError: true, reason: `Failed to inspect live target pathname before opening: ${preCheck.error.message}` };
+  }
+  if (!preCheck.exists) {
+    return { ok: false, isMissing: true, isIncomplete: true, reason: `Live target does not exist: "${relTarget}"` };
+  }
+  if (preCheck.isSymbolicLink) {
+    return { ok: false, isSymlink: true, reason: `Live target is a symbolic link: "${relTarget}"` };
+  }
+  if (!preCheck.isFile) {
+    return { ok: false, isUnsupportedType: true, isIncomplete: true, reason: `Live target pathname is not a regular file: "${relTarget}"` };
+  }
+
+  let fd = null;
+  const openFlags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (fs.constants.O_NONBLOCK || 0);
+  try {
+    fd = fs.openSync(cPath, openFlags);
+  } catch (err) {
+    if (err?.code === 'ELOOP') {
+      return { ok: false, isSymlink: true, reason: `Live target is a symbolic link: "${relTarget}"` };
+    }
+    if (err?.code === 'ENOENT') {
+      return { ok: false, isMissing: true, isIncomplete: true, reason: `Live target was not found when opening: "${relTarget}"` };
+    }
+    return { ok: false, isError: true, reason: `Failed to open live target descriptor: ${err.message}` };
+  }
+
+  try {
+    const preStat = fs.fstatSync(fd);
+    if (!preStat.isFile() || preStat.isSymbolicLink()) {
+      return { ok: false, isUnsupportedType: true, isIncomplete: true, reason: `Live target descriptor is not a regular file: "${relTarget}"` };
+    }
+    if (!isValidDeviceIdentifier(preStat.dev) || !isValidInodeIdentifier(preStat.ino)) {
+      return { ok: false, isError: true, reason: `Live target descriptor has invalid device or inode identity: "${relTarget}"` };
+    }
+    if (preStat.size > MAX_LIVE_TARGET_INSPECT_BYTES) {
+      return {
+        ok: false,
+        isOversized: true,
+        isError: true,
+        reason: `Live target size (${preStat.size} bytes) exceeds safety limit (${MAX_LIVE_TARGET_INSPECT_BYTES} bytes): "${relTarget}"`,
+      };
+    }
+
+    const expectedSize = preStat.size;
+    const preMode = preStat.mode & 0o777;
+    const buffer = Buffer.alloc(expectedSize);
+    let totalRead = 0;
+    while (totalRead < expectedSize) {
+      const chunk = fs.readSync(fd, buffer, totalRead, expectedSize - totalRead, totalRead);
+      if (chunk === 0) {
+        return {
+          ok: false,
+          isIncomplete: true,
+          reason: `Unexpected EOF reading live target: read ${totalRead} of ${expectedSize} bytes: "${relTarget}"`,
+        };
+      }
+      totalRead += chunk;
+    }
+
+    // Concurrent expansion check
+    const extraCheck = Buffer.alloc(1);
+    const extra = fs.readSync(fd, extraCheck, 0, 1, expectedSize);
+    if (extra !== 0) {
+      return {
+        ok: false,
+        isIncomplete: true,
+        reason: `Live target expanded concurrently during inspection: "${relTarget}"`,
+      };
+    }
+
+    // Post-read descriptor consistency check
+    const postStat = fs.fstatSync(fd);
+    if (
+      postStat.dev !== preStat.dev ||
+      postStat.ino !== preStat.ino ||
+      postStat.size !== expectedSize ||
+      !postStat.isFile()
+    ) {
+      return {
+        ok: false,
+        isIncomplete: true,
+        reason: `Live target identity or size changed concurrently during inspection: "${relTarget}"`,
+      };
+    }
+
+    // Stable Permissions Verification across descriptor readback
+    if ((postStat.mode & 0o777) !== preMode) {
+      return {
+        ok: false,
+        isIncomplete: true,
+        reason: `Live target permissions changed concurrently during descriptor readback: "${relTarget}"`,
+      };
+    }
+
+    // Pathname-to-descriptor identity and stable permissions check
+    const pathCheck = getPathLstat(cPath);
+    if (pathCheck.error) {
+      if (pathCheck.error.code === 'ENOENT') {
+        return { ok: false, isIncomplete: true, reason: `Live target was unlinked during inspection: "${relTarget}"` };
+      }
+      return { ok: false, isError: true, reason: `Failed to inspect live target pathname: ${pathCheck.error.message}` };
+    }
+    if (!pathCheck.exists) {
+      return { ok: false, isIncomplete: true, reason: `Live target was unlinked during inspection: "${relTarget}"` };
+    }
+    if (pathCheck.isSymbolicLink) {
+      return { ok: false, isSymlink: true, reason: `Live target was replaced by a symbolic link: "${relTarget}"` };
+    }
+    if (!pathCheck.isFile) {
+      return { ok: false, isUnsupportedType: true, isIncomplete: true, reason: `Live target pathname is no longer a regular file: "${relTarget}"` };
+    }
+    if (!pathCheck.stat || pathCheck.stat.dev !== preStat.dev || pathCheck.stat.ino !== preStat.ino) {
+      return { ok: false, isIncomplete: true, reason: `Live target pathname inode identity changed during inspection: "${relTarget}"` };
+    }
+    if ((pathCheck.stat.mode & 0o777) !== preMode) {
+      return {
+        ok: false,
+        isIncomplete: true,
+        reason: `Live target permissions changed concurrently between pathname and descriptor: "${relTarget}"`,
+      };
+    }
+
+    const actualSha = crypto.createHash('sha256').update(buffer).digest('hex').toLowerCase();
+    const actualMode = '0' + preMode.toString(8).padStart(3, '0');
+    const isInitial = typeof expectedInitialSha === 'string' && actualSha === expectedInitialSha.toLowerCase();
+    const isResult = typeof expectedResultSha === 'string' && actualSha === expectedResultSha.toLowerCase();
+
+    let modeMatches = true;
+    if (typeof expectedMode === 'string' && expectedMode.trim() !== '') {
+      modeMatches = preMode === parseInt(expectedMode, 8);
+    }
+
+    return {
+      ok: true,
+      actualSha,
+      actualMode,
+      isInitial,
+      isResult,
+      modeMatches,
+      size: expectedSize,
+    };
+  } catch (err) {
+    return { ok: false, isError: true, reason: `Error during live target descriptor inspection: ${err.message}` };
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+
 /**
  * Perform comprehensive read-only inspection of installer transaction metadata.
  * Never mutates, acquires, steals, or deletes locks or journals.
@@ -911,6 +1113,29 @@ export function inspectTransactionState(repoRoot) {
   const parentCheck = getPathLstat(absParentDir);
   const srcCheck = getPathLstat(path.join(repoRoot, 'src'));
 
+  const hasValidAgreedTransaction = Boolean(
+    hasLock &&
+    lockInspection.isValid &&
+    lockInspection.owner &&
+    hasJournal &&
+    journalInspection.isValid &&
+    journalInspection.journal &&
+    !isMismatched &&
+    lockInspection.owner.txId === journalInspection.journal.txId &&
+    lockInspection.owner.op === journalInspection.journal.op
+  );
+
+  const POST_SWAP_INSPECTION_PHASES = Object.freeze([
+    'READY_TO_SWAP',
+    'SWAPPED',
+    'COMPLETED',
+  ]);
+
+  const shouldInspectLiveTarget = Boolean(
+    hasValidAgreedTransaction &&
+    POST_SWAP_INSPECTION_PHASES.includes(journalInspection.journal.phase)
+  );
+
   if (srcCheck.isSymbolicLink || parentCheck.isSymbolicLink) {
     hasUnsafeSymlink = true;
     reasons.push('Destination parent directory contains a symbolic link');
@@ -919,12 +1144,10 @@ export function inspectTransactionState(repoRoot) {
     inspectionErrors.push(`Failed to inspect destination parent directory: ${parentCheck.error.message}`);
     reasons.push(`Failed to inspect destination parent directory: ${parentCheck.error.message}`);
   } else if (!parentCheck.exists) {
-    if (hasLock && lockInspection.isValid && hasJournal && journalInspection.isValid && !isMismatched) {
+    if (shouldInspectLiveTarget) {
       const jObj = journalInspection.journal;
-      if (jObj && jObj.phase === 'READY_TO_SWAP') {
-        isIncompleteTransaction = true;
-        reasons.push('Missing destination directory in phase "READY_TO_SWAP": "src/endpoints" does not exist');
-      }
+      isIncompleteTransaction = true;
+      reasons.push(`Missing destination directory in phase "${jObj.phase}": "src/endpoints" does not exist`);
     }
   } else if (parentCheck.exists && !parentCheck.isDirectory) {
     hasInspectionError = true;
@@ -994,7 +1217,157 @@ export function inspectTransactionState(repoRoot) {
         }
       }
 
-      if (journalObj && journalObj.phase === 'READY_TO_SWAP' && !foundRegisteredCandidate) {
+      // Live target inspection when active valid transaction is in READY_TO_SWAP, SWAPPED, or COMPLETED
+      if (shouldInspectLiveTarget) {
+        const jObj = journalInspection.journal;
+        const targetRelFile = path.join(targetRelDir, targetBase);
+        const absTargetFile = path.join(repoRoot, targetRelFile);
+
+        const targetCheck = getPathLstat(absTargetFile);
+        if (targetCheck.error) {
+          if (targetCheck.error.code === 'ENOENT') {
+            isIncompleteTransaction = true;
+            reasons.push(`Missing live target file in phase "${jObj.phase}": "${targetRelFile}" does not exist`);
+            if (jObj.phase === 'READY_TO_SWAP' && !foundRegisteredCandidate) {
+              const expectedCandidateName = `.${targetBase}.ci-staged-${jObj.txId}.tmp`;
+              reasons.push(`Missing destination candidate in phase "READY_TO_SWAP": "${expectedCandidateName}" not found in destination parent directory`);
+            }
+          } else {
+            hasInspectionError = true;
+            inspectionErrors.push(`Failed to inspect live target path ("${targetRelFile}"): ${targetCheck.error.message}`);
+            reasons.push(`Failed to inspect live target path ("${targetRelFile}"): ${targetCheck.error.message}`);
+          }
+        } else if (!targetCheck.exists) {
+          isIncompleteTransaction = true;
+          reasons.push(`Missing live target file in phase "${jObj.phase}": "${targetRelFile}" does not exist`);
+          if (jObj.phase === 'READY_TO_SWAP' && !foundRegisteredCandidate) {
+            const expectedCandidateName = `.${targetBase}.ci-staged-${jObj.txId}.tmp`;
+            reasons.push(`Missing destination candidate in phase "READY_TO_SWAP": "${expectedCandidateName}" not found in destination parent directory`);
+          }
+        } else if (targetCheck.isSymbolicLink) {
+          hasUnsafeSymlink = true;
+          reasons.push(`Live target file is a symbolic link: "${targetRelFile}"`);
+        } else if (!targetCheck.isFile) {
+          // Unsupported filesystem object type (FIFO, socket, directory, device)
+          isIncompleteTransaction = true;
+          reasons.push(`Live target path is not a regular file (unsupported filesystem object type): "${targetRelFile}"`);
+        } else {
+          const liveRes = inspectLiveTargetFile(
+            absTargetFile,
+            jObj.expectedInitialSha256,
+            jObj.expectedResultSha256,
+            jObj.targetMode,
+            jObj.phase,
+            targetRelFile
+          );
+
+          if (!liveRes.ok) {
+            if (liveRes.isSymlink) {
+              hasUnsafeSymlink = true;
+            } else if (liveRes.isError || liveRes.isOversized) {
+              hasInspectionError = true;
+              inspectionErrors.push(liveRes.reason);
+            } else if (liveRes.isUnsupportedType || liveRes.isIncomplete || liveRes.isMissing) {
+              isIncompleteTransaction = true;
+            }
+            reasons.push(liveRes.reason);
+          } else {
+            if (jObj.phase === 'READY_TO_SWAP') {
+              if (foundRegisteredCandidate) {
+                if (liveRes.isInitial) {
+                  if (!liveRes.modeMatches) {
+                    isIncompleteTransaction = true;
+                    reasons.push(
+                      `Live target mode mismatch in phase "READY_TO_SWAP": expected ${jObj.targetMode}, observed ${liveRes.actualMode}: "${targetRelFile}"`
+                    );
+                  }
+                } else if (liveRes.isResult) {
+                  isIncompleteTransaction = true;
+                  reasons.push(
+                    `Ambiguous transaction state: destination candidate remains present but live target already contains expected result in phase "READY_TO_SWAP": "${targetRelFile}"`
+                  );
+                } else {
+                  isIncompleteTransaction = true;
+                  reasons.push(
+                    `Live target content modified unexpectedly in phase "READY_TO_SWAP": "${targetRelFile}" SHA-256 (${liveRes.actualSha}) matches neither expected initial nor result`
+                  );
+                }
+              } else {
+                // Destination candidate is ABSENT in READY_TO_SWAP
+                if (liveRes.isResult) {
+                  isIncompleteTransaction = true;
+                  reasons.push(
+                    `Possible unrecorded swap detected: journal phase is "READY_TO_SWAP" with destination candidate absent, but live target contains expected result: "${targetRelFile}"`
+                  );
+                  if (!liveRes.modeMatches) {
+                    reasons.push(
+                      `Live target mode mismatch in phase "READY_TO_SWAP": expected ${jObj.targetMode}, observed ${liveRes.actualMode}: "${targetRelFile}"`
+                    );
+                  }
+                } else if (liveRes.isInitial) {
+                  isIncompleteTransaction = true;
+                  const expectedCandidateName = `.${targetBase}.ci-staged-${jObj.txId}.tmp`;
+                  reasons.push(
+                    `Missing destination candidate in phase "READY_TO_SWAP": "${expectedCandidateName}" not found in destination parent directory`
+                  );
+                  if (!liveRes.modeMatches) {
+                    reasons.push(
+                      `Live target mode mismatch in phase "READY_TO_SWAP": expected ${jObj.targetMode}, observed ${liveRes.actualMode}: "${targetRelFile}"`
+                    );
+                  }
+                } else {
+                  isIncompleteTransaction = true;
+                  const expectedCandidateName = `.${targetBase}.ci-staged-${jObj.txId}.tmp`;
+                  reasons.push(
+                    `Missing destination candidate in phase "READY_TO_SWAP": "${expectedCandidateName}" not found in destination parent directory`
+                  );
+                  reasons.push(
+                    `Live target content modified unexpectedly in phase "READY_TO_SWAP": "${targetRelFile}" SHA-256 (${liveRes.actualSha}) matches neither expected initial nor result`
+                  );
+                }
+              }
+            } else if (jObj.phase === 'SWAPPED') {
+              if (!foundRegisteredCandidate) {
+                if (liveRes.isResult) {
+                  if (!liveRes.modeMatches) {
+                    isIncompleteTransaction = true;
+                    reasons.push(
+                      `Live target mode mismatch in phase "SWAPPED": expected ${jObj.targetMode}, observed ${liveRes.actualMode}: "${targetRelFile}"`
+                    );
+                  }
+                } else if (liveRes.isInitial) {
+                  isIncompleteTransaction = true;
+                  reasons.push(
+                    `Incomplete swap detected: journal phase is "SWAPPED" but live target still contains initial content: "${targetRelFile}"`
+                  );
+                } else {
+                  isIncompleteTransaction = true;
+                  reasons.push(
+                    `Live target content mismatch in phase "SWAPPED": "${targetRelFile}" SHA-256 (${liveRes.actualSha}) does not match expected result SHA-256`
+                  );
+                }
+              }
+            } else if (jObj.phase === 'COMPLETED') {
+              if (!foundRegisteredCandidate) {
+                if (liveRes.isResult) {
+                  if (!liveRes.modeMatches) {
+                    isIncompleteTransaction = true;
+                    reasons.push(
+                      `Live target mode mismatch in phase "COMPLETED": expected ${jObj.targetMode}, observed ${liveRes.actualMode}: "${targetRelFile}"`
+                    );
+                  }
+                } else {
+                  isIncompleteTransaction = true;
+                  reasons.push(
+                    `Live target content mismatch in phase "COMPLETED": "${targetRelFile}" SHA-256 (${liveRes.actualSha}) does not match expected result SHA-256`
+                  );
+                }
+              }
+            }
+          }
+        }
+      } else if (journalObj && journalObj.phase === 'READY_TO_SWAP' && !foundRegisteredCandidate) {
+        // Fallback for phase inconsistency if journal exists but transaction is unverified
         isIncompleteTransaction = true;
         const expectedCandidateName = `.${targetBase}.ci-staged-${journalObj.txId}.tmp`;
         reasons.push(`Missing destination candidate in phase "READY_TO_SWAP": "${expectedCandidateName}" not found in destination parent directory`);
