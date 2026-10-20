@@ -1,6 +1,6 @@
 # D01 installer status and implementation handoff
 
-> Acceptance record dated **2026-10-19** for `zNe4/SillyTavern-ChromaticImages`. This records accepted stages; it does **not** authorize new installer mutation code.
+> Stage acceptance records updated **2026-10-20** for `zNe4/SillyTavern-ChromaticImages`. Acceptance of the disposable Android capability probe does **not** authorize live installer mutation.
 
 ## Stage ledger and current stop boundary
 
@@ -13,7 +13,9 @@
 | D01-P3B-2B | Accepted | Verified backup of the live initial bytes and original mode; no live target mutation. |
 | **D01-P3B-2C** | **Accepted / closed** | Durable, independently authenticated destination candidate; `BACKUP_CREATED → READY_TO_SWAP`. |
 | **D01-P3B-2D-1** | **Accepted / closed 2026-10-20** | Read-only post-swap inspection of live target, missing/leftover candidate, and possible unrecorded swap. |
-| D01-P3B-2D-2 | **Not implemented; planning required** | Atomic candidate replacement of live target, with its own reviewed crash/identity contract and Android/Termux gate. |
+| **D01-P3B-2D-2-A** | **Source reviewed; Android device gate accepted 2026-10-20** | Non-destructive Termux filesystem capability probe; disposable `$HOME` files only. |
+| D01-P3B-2D-2-B | **Next bounded implementation stage; not yet implemented** | Authentication and pre-rename refusals only; no live replacement. |
+| D01-P3B-2D-2-C | **Not authorized** | First live-target atomic replacement, durability and journal advancement; must be reviewed separately. |
 | D01-P3B-3 and subsequent | Deferred | Completion, recovery/rollback and public mutation CLI gates. |
 
 The accepted code baseline is [`38043acd5a35e4087c2c7d214ee95f3a5f280323`](https://github.com/zNe4/SillyTavern-ChromaticImages/commit/38043acd5a35e4087c2c7d214ee95f3a5f280323) (P3B-2C-F2). The initial P3B-2C implementation and corrective commits F1/F2 were independently source-reviewed before executable acceptance.
@@ -95,11 +97,19 @@ Codex's **D01-P3B-2D-1-V — Executable Acceptance Report** dated 2026-10-20 rec
 | Installation preservation | Linked SillyTavern installation reported unchanged; disposable fixture removed after the run. |
 | CLI mutation boundary | `--apply`/`--remove` still reject; `--recover` unavailable. |
 
-Evidence provenance: Codex performed and reported executable validation; ChatGPT independently reviewed the pushed source and the acceptance report, but **did not re-run** the suite on that host. GitHub had no associated workflow checks at the reviewed commit. On-device Android/Termux capability and filesystem behavior remain **unverified** and must be tested with disposable private-storage files before accepting P3B-2D-2. Acceptance of read-only P3B-2D-1 is not authorization for live target replacement.
+Evidence provenance: Codex performed and reported executable validation; ChatGPT independently reviewed the pushed source and the acceptance report, but **did not re-run** the suite on that host. GitHub had no associated workflow checks at the reviewed commit. A subsequent device-run capability probe has since verified the tested Termux-private-storage filesystem operations (see Stage A below); acceptance of P3B-2D-1 is not authorization for live target replacement.
 
-## Next planning checkpoint: D01-P3B-2D-2
+## D01-P3B-2D-2-A — Termux capability probe (2026-10-20)
 
-**Not authorized for implementation.** P3B-2D-2 is the first stage proposed to change the live target, so require a separate read-only design and independent review before issuing a bounded Codex coding mission. The review should settle:
+The standalone `scripts/check-termux-swap-capabilities.mjs` and `tests/termux-swap-capabilities.test.mjs` were implemented and independently source-reviewed in commits `116647c0` (A), `fab479d` (F1), `8e43e5e` (F2) and [`2735039aa4916cd1d89a5dec4006f9ab7d2123ff`](https://github.com/zNe4/SillyTavern-ChromaticImages/commit/2735039aa4916cd1d89a5dec4006f9ab7d2123ff) (F3). The successive corrections address descriptor-close errors, foreign/ambiguous cleanup ownership, short I/O, strict constant checks, cleanup-hook exceptions, and phase-aware target ownership. Only probe/tests changed; no live installer swap was enabled.
+
+The user ran `node ci-termux-swap-probe.mjs --json` **on a physical Termux Android/ARM64 environment**, Node.js **v26.4.0**, under `/data/data/com.termux/files/home`. The reported result was `ok: true`, `failedStage: null`, `error: null`, `cleanupSucceeded: true`. **All 13 capability flags returned `true`:** `oNoFollow`, `oNonBlock`, `oDirectory`, `directoryDescriptorOpen`, `procfsDescriptorAnchoring`, `descriptorFileCreation`, `fileDataFsync`, `fileMetadataFsync`, `descriptorAnchoredRename`, `directoryFsync`, `inodeContinuityPreserved`, `modePreserved`, and `candidateConsumed`. The unique disposable probe directory was `.ci-termux-probe-oY2dSo` in Termux-private `$HOME`. This is **user-supplied on-device execution evidence**; ChatGPT reviewed the JSON and source but did not run the probe on that device. These findings certify the probed filesystem capabilities **on that environment**, not arbitrary Android filesystems or all future devices. No real SillyTavern target was accessed.
+
+**Stage A accepted for source and device capability verification.** Authentic full-suite CI/verification results for the F3 head have not been independently confirmed by ChatGPT; there were no GitHub check runs. Do not infer that the complete installer is implemented. The next authorized coding boundary is Stage B pre-rename authentication/refusal, with no live mutation. Stage C remains separately gated.
+
+## Next implementation checkpoint: D01-P3B-2D-2-B
+
+**Stage B may implement only internal authentication and deterministic pre-rename refusal tests.** A separate security/source review is required before Stage C's candidate-to-live rename and journal mutation. The reviewed plan should settle:
 
 - Lease and journal authorization immediately before swapping; full authentication of live initial bytes/mode/inode, backup, isolated result, and same-directory candidate (including identity/permissions/durability).
 - Atomic rename semantics and directory fsync ordering; what happens if rename succeeds but subsequent directory synchronization or journal advance fails.
@@ -108,7 +118,7 @@ Evidence provenance: Codex performed and reported executable validation; ChatGPT
 - Read-only status/inspection for the post-rename state without pretending P3B-3 recovery is implemented.
 - Deterministic forward and reverse fixture tests for every failure boundary, with **no changes** to the actual linked SillyTavern installation.
 
-These are open design questions, not an approved swap algorithm. Include an on-device Termux private-storage capability test for descriptor-anchored rename, fsync of candidate and parent directory, and post-rename inode identity before accepting the swap stage. If an operation is unsupported, fail closed without an unsafe fallback. Keep public `--apply`, `--remove`, and `--recover` unavailable until their own later authorization.
+The on-device Termux capability gate has now passed for the tested environment. This does **not** certify the future production rename implementation. Before Stage C is authorized, review the swap authentication, descriptor lifetime, rename/error provenance, fsync ordering and journal crash-boundary semantics against its actual code. If any required operation is unsupported in the deployment environment, fail closed without fallback. Keep public `--apply`, `--remove`, and `--recover` unavailable until their own later authorization.
 
 ## Workflow
 
