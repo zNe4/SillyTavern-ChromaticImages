@@ -44,7 +44,7 @@ function getOpenFdCount() {
   }
 }
 
-describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
+describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F3 Hardening)', () => {
   // --------------------------------------------------------------------------
   // Core Baseline & CLI Regressions
   // --------------------------------------------------------------------------
@@ -154,9 +154,106 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
   });
 
   // --------------------------------------------------------------------------
+  // F3: Phase-Aware Target Ownership
+  // --------------------------------------------------------------------------
+  test('5. F3: External hard link target.txt before rename fails target creation, refuses unowned cleanup, and preserves artifact', async () => {
+    const fixtureDir = createTempFixtureDir('probe-f3-hardlink-target-');
+    let capturedProbeDir = null;
+    let candIno = null;
+    const expectedCandidateContent = 'ci-termux-probe-candidate-payload\n';
+
+    const res = await runTermuxSwapCapabilityProbe({
+      baseDir: fixtureDir,
+      faultHook: (stage, ctx) => {
+        if (stage === 'after-probe-dir-create') {
+          capturedProbeDir = ctx.probeDir;
+        } else if (stage === 'after-candidate-closed') {
+          // At after-candidate-closed, create target.txt as a hard link to candidate.tmp
+          const candidatePath = path.join(capturedProbeDir, 'candidate.tmp');
+          const targetPath = path.join(capturedProbeDir, 'target.txt');
+          candIno = fs.lstatSync(candidatePath).ino;
+          fs.linkSync(candidatePath, targetPath);
+        }
+      },
+    });
+
+    // 1. Probe O_CREAT | O_EXCL target creation must fail
+    assert.equal(res.ok, false);
+    assert.equal(res.failedStage, 'create-initial-target');
+
+    // 2. Cleanup must NOT classify external hard link as an owned renamed target
+    assert.equal(res.cleanupSucceeded, false);
+    assert.match(res.error, /target\.txt was not registered as probe-owned prior to rename/);
+
+    // 3. target.txt must remain present with unchanged inode and contents
+    const targetPath = path.join(capturedProbeDir, 'target.txt');
+    assert.ok(fs.existsSync(targetPath), 'External hard link target.txt must be preserved on disk');
+    const targetStat = fs.lstatSync(targetPath);
+    assert.equal(targetStat.ino, candIno, 'target.txt inode must match candidate inode');
+    assert.equal(fs.readFileSync(targetPath, 'utf8'), expectedCandidateContent, 'target.txt content must remain unchanged');
+
+    // 4. candidate.tmp must also remain present and unlinked
+    const candidatePath = path.join(capturedProbeDir, 'candidate.tmp');
+    assert.ok(fs.existsSync(candidatePath), 'candidate.tmp must be preserved on disk');
+    const candidateStat = fs.lstatSync(candidatePath);
+    assert.equal(candidateStat.ino, candIno, 'candidate.tmp inode must match original candidate inode');
+  });
+
+  test('6. F3: Uncertain rename outcome preserves ambiguous target artifact without unlinking', async () => {
+    const fixtureDir = createTempFixtureDir('probe-f3-uncertain-rename-');
+    let capturedProbeDir = null;
+    let candIno = null;
+
+    const res = await runTermuxSwapCapabilityProbe({
+      baseDir: fixtureDir,
+      faultHook: (stage, ctx) => {
+        if (stage === 'after-probe-dir-create') {
+          capturedProbeDir = ctx.probeDir;
+        } else if (stage === 'before-rename') {
+          candIno = ctx.candidateIno;
+          // Simulate rename failure/uncertainty where rename threw
+          // Even if target.txt has candidate inode, unconfirmed rename must not clean it up
+          fs.renameSync(ctx.procCandidatePath, ctx.procTargetPath);
+          throw new Error('Simulated rename syscall failure');
+        }
+      },
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.cleanupSucceeded, false);
+    assert.match(res.error, /target\.txt was not registered as probe-owned prior to rename/);
+
+    const targetPath = path.join(capturedProbeDir, 'target.txt');
+    assert.ok(fs.existsSync(targetPath), 'Ambiguous target.txt must be preserved on disk');
+    assert.equal(fs.lstatSync(targetPath).ino, candIno, 'target.txt retained candidate inode');
+  });
+
+  test('7. F3: Genuine resulting target after normal confirmed rename is cleaned up without residue', async () => {
+    const fixtureDir = createTempFixtureDir('probe-f3-confirmed-rename-');
+    let capturedProbeDir = null;
+
+    const res = await runTermuxSwapCapabilityProbe({
+      baseDir: fixtureDir,
+      faultHook: (stage, ctx) => {
+        if (stage === 'after-probe-dir-create') {
+          capturedProbeDir = ctx.probeDir;
+        }
+      },
+    });
+
+    assert.equal(res.ok, true);
+    assert.equal(res.cleanupSucceeded, true);
+    assert.equal(res.capabilities.descriptorAnchoredRename, true);
+    assert.equal(res.capabilities.candidateConsumed, true);
+    assert.equal(res.capabilities.inodeContinuityPreserved, true);
+
+    assert.ok(!fs.existsSync(capturedProbeDir), 'Probe directory must be cleaned up');
+  });
+
+  // --------------------------------------------------------------------------
   // F2-A: Proven Artifact Ownership and Directory Disappearance
   // --------------------------------------------------------------------------
-  test('5. F2-A: Unexpected candidate.tmp present before creation causes failure, unowned cleanup refusal, and preservation', async () => {
+  test('8. F2-A: Unexpected candidate.tmp present before creation causes failure, unowned cleanup refusal, and preservation', async () => {
     const fixtureDir = createTempFixtureDir('probe-unowned-candidate-');
     let capturedProbeDir = null;
     let foreignIno = null;
@@ -191,7 +288,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     assert.equal(fs.readFileSync(candPath, 'utf8'), foreignContent, 'Preserved file content must remain unchanged');
   });
 
-  test('6. F2-A: Unexpected directory disappearance before cleanup reports failure rather than success', async () => {
+  test('9. F2-A: Unexpected directory disappearance before cleanup reports failure rather than success', async () => {
     const fixtureDir = createTempFixtureDir('probe-disappeared-dir-');
     let capturedProbeDir = null;
 
@@ -221,7 +318,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     }
   });
 
-  test('7. F2-A: Substituted target.txt with foreign inode causes cleanup refusal and artifact preservation', async () => {
+  test('10. F2-A: Substituted target.txt with foreign inode causes cleanup refusal and artifact preservation', async () => {
     const fixtureDir = createTempFixtureDir('probe-target-inode-sub-');
     let capturedProbeDir = null;
 
@@ -248,7 +345,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     assert.ok(fs.existsSync(targetPath), 'Substituted target must be preserved');
   });
 
-  test('8. F2-A: Unrecognized foreign file in probe directory causes cleanup refusal and artifact preservation', async () => {
+  test('11. F2-A: Unrecognized foreign file in probe directory causes cleanup refusal and artifact preservation', async () => {
     const fixtureDir = createTempFixtureDir('probe-foreign-file-');
     let capturedProbeDir = null;
 
@@ -273,7 +370,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     assert.ok(fs.existsSync(foreignPath), 'Foreign artifact must be preserved on disk');
   });
 
-  test('9. F2-A: Safe cleanup refuses deletion if directory identity changed', async () => {
+  test('12. F2-A: Safe cleanup refuses deletion if directory identity changed', async () => {
     const fixtureDir = createTempFixtureDir('probe-cleanup-safety-');
     let capturedProbeDir = null;
 
@@ -310,7 +407,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
   // --------------------------------------------------------------------------
   // F2-B: Correct Close-Fault Behavior (Descriptor Safety Across Hook Failures)
   // --------------------------------------------------------------------------
-  test('10. F2-B: Pre-close hook failure on candidate descriptor still performs closeSync without fd leak', async () => {
+  test('13. F2-B: Pre-close hook failure on candidate descriptor still performs closeSync without fd leak', async () => {
     const fixtureDir = createTempFixtureDir('probe-close-fault-cand-');
     const startFds = getOpenFdCount();
 
@@ -335,7 +432,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     }
   });
 
-  test('11. F2-B: Pre-close hook failure on parent descriptor in finally still performs closeSync without fd leak', async () => {
+  test('14. F2-B: Pre-close hook failure on parent descriptor in finally still performs closeSync without fd leak', async () => {
     const fixtureDir = createTempFixtureDir('probe-close-fault-parent-');
     const startFds = getOpenFdCount();
 
@@ -358,7 +455,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     }
   });
 
-  test('12. F2-B: Primary operational failure is preserved alongside secondary close failure', async () => {
+  test('15. F2-B: Primary operational failure is preserved alongside secondary close failure', async () => {
     const fixtureDir = createTempFixtureDir('probe-dual-fail-');
 
     const res = await runTermuxSwapCapabilityProbe({
@@ -379,7 +476,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     assert.match(res.error, /destination-parent/);
   });
 
-  test('13. F2-B: Zero descriptor leaks on normal execution and operational failures', async () => {
+  test('16. F2-B: Zero descriptor leaks on normal execution and operational failures', async () => {
     const fixtureDir = createTempFixtureDir('probe-fd-leaks-');
     const startFds = getOpenFdCount();
 
@@ -410,7 +507,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
   // --------------------------------------------------------------------------
   // F2-C: Hardened Finalization Errors (before-artifact-cleanup hook)
   // --------------------------------------------------------------------------
-  test('14. F2-C: Thrown before-artifact-cleanup hook does not reject promise and reports structured diagnostic', async () => {
+  test('17. F2-C: Thrown before-artifact-cleanup hook does not reject promise and reports structured diagnostic', async () => {
     const fixtureDir = createTempFixtureDir('probe-cleanup-hook-throw-');
     let capturedProbeDir = null;
 
@@ -442,7 +539,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
   // --------------------------------------------------------------------------
   // F1-C: Capability Constants & I/O Validation
   // --------------------------------------------------------------------------
-  test('15. F1-C: isValidOpenConstant unit tests across invalid inputs', () => {
+  test('18. F1-C: isValidOpenConstant unit tests across invalid inputs', () => {
     assert.equal(isValidOpenConstant(1), true);
     assert.equal(isValidOpenConstant(128), true);
     assert.equal(isValidOpenConstant(-1), true);
@@ -460,7 +557,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     assert.equal(isValidOpenConstant(true), false);
   });
 
-  test('16. F1-C: Non-finite, zero, or fractional constants fail closed for O_NOFOLLOW', async () => {
+  test('19. F1-C: Non-finite, zero, or fractional constants fail closed for O_NOFOLLOW', async () => {
     const fixtureDir = createTempFixtureDir('probe-bad-onofollow-');
     const invalidValues = [0, NaN, Infinity, 1.5, '128', null, undefined];
 
@@ -476,7 +573,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     }
   });
 
-  test('17. F1-C: Non-finite, zero, or fractional constants fail closed for O_NONBLOCK', async () => {
+  test('20. F1-C: Non-finite, zero, or fractional constants fail closed for O_NONBLOCK', async () => {
     const fixtureDir = createTempFixtureDir('probe-bad-ononblock-');
     const invalidValues = [0, NaN, -Infinity, 2.7, 'nonblock', null, undefined];
 
@@ -492,7 +589,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     }
   });
 
-  test('18. F1-C: Non-finite, zero, or fractional constants fail closed for O_DIRECTORY', async () => {
+  test('21. F1-C: Non-finite, zero, or fractional constants fail closed for O_DIRECTORY', async () => {
     const fixtureDir = createTempFixtureDir('probe-bad-odirectory-');
     const invalidValues = [0, NaN, Infinity, 3.14, 'directory', null, undefined];
 
@@ -508,7 +605,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     }
   });
 
-  test('19. F1-C: Candidate short write failure is caught and reported', async () => {
+  test('22. F1-C: Candidate short write failure is caught and reported', async () => {
     const fixtureDir = createTempFixtureDir('probe-cand-short-write-');
     const origWriteSync = fs.writeSync;
 
@@ -531,7 +628,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     }
   });
 
-  test('20. F1-C: Target short write failure is caught and reported', async () => {
+  test('23. F1-C: Target short write failure is caught and reported', async () => {
     const fixtureDir = createTempFixtureDir('probe-target-short-write-');
     const origWriteSync = fs.writeSync;
 
@@ -554,7 +651,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     }
   });
 
-  test('21. F1-C: Target short read (unexpected EOF) is caught and reported', async () => {
+  test('24. F1-C: Target short read (unexpected EOF) is caught and reported', async () => {
     const fixtureDir = createTempFixtureDir('probe-short-read-');
     const origReadSync = fs.readSync;
 
@@ -577,7 +674,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     }
   });
 
-  test('22. F1-C: Target concurrent expansion during readback is caught and reported', async () => {
+  test('25. F1-C: Target concurrent expansion during readback is caught and reported', async () => {
     const fixtureDir = createTempFixtureDir('probe-concurrent-expand-');
     const origReadSync = fs.readSync;
 
@@ -602,7 +699,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
   // --------------------------------------------------------------------------
   // Missing Procfs & Directory Inode / Identity Checks
   // --------------------------------------------------------------------------
-  test('23. Missing procfs directory fails closed', async () => {
+  test('26. Missing procfs directory fails closed', async () => {
     const fixtureDir = createTempFixtureDir('probe-fail-procfs-');
 
     const res = await runTermuxSwapCapabilityProbe({
@@ -616,7 +713,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     assert.match(res.error, /Procfs descriptor directory/);
   });
 
-  test('24. Inode continuity and content verification', async () => {
+  test('27. Inode continuity and content verification', async () => {
     const fixtureDir = createTempFixtureDir('probe-inode-continuity-');
     let capturedCandIno = null;
     let capturedInitialTargetIno = null;
@@ -641,7 +738,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     assert.equal(res.capabilities.candidateConsumed, true);
   });
 
-  test('25. Directory fsync actually attempted and executed', async () => {
+  test('28. Directory fsync actually attempted and executed', async () => {
     const fixtureDir = createTempFixtureDir('probe-fsync-');
     let fsyncBeforeCalled = false;
     let fsyncAfterCalled = false;
@@ -663,7 +760,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     assert.equal(res.capabilities.directoryFsync, true);
   });
 
-  test('26. Inaccessible or invalid baseDir fails closed', async () => {
+  test('29. Inaccessible or invalid baseDir fails closed', async () => {
     const res = await runTermuxSwapCapabilityProbe({ baseDir: '/nonexistent/base/dir/path' });
     assert.equal(res.ok, false);
     assert.equal(res.failedStage, 'base-dir-inaccessible');
@@ -674,7 +771,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     assert.equal(res2.failedStage, 'invalid-base-dir');
   });
 
-  test('27. Candidate inode continuity failure is detected if rename does not retain inode', async () => {
+  test('30. Candidate inode continuity failure is detected if rename does not retain inode', async () => {
     const fixtureDir = createTempFixtureDir('probe-fail-inode-check-');
 
     const res = await runTermuxSwapCapabilityProbe({
@@ -694,7 +791,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     );
   });
 
-  test('28. No modification of pre-existing files outside probe directory', async () => {
+  test('31. No modification of pre-existing files outside probe directory', async () => {
     const fixtureDir = createTempFixtureDir('probe-isolation-');
     const canaryFile = path.join(fixtureDir, 'canary-user-file.txt');
     const canaryContent = 'pre-existing authentic user data\n';
@@ -707,7 +804,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F2 Hardening)', () => {
     assert.equal(fs.readFileSync(canaryFile, 'utf8'), canaryContent, 'Canary content must not be modified');
   });
 
-  test('29. No residual temporary probe directories after successful execution', async () => {
+  test('32. No residual temporary probe directories after successful execution', async () => {
     const fixtureDir = createTempFixtureDir('probe-no-residue-');
     const res = await runTermuxSwapCapabilityProbe({ baseDir: fixtureDir });
     assert.equal(res.ok, true);

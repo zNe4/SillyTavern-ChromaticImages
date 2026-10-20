@@ -144,6 +144,7 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
   let initialIno = null;
   let createdCandidateIno = null;
   let createdTargetIno = null;
+  let renameConfirmed = false;
   let cleanupSucceeded = false;
   let cleanupError = null;
 
@@ -434,7 +435,7 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
     // Safely close candidate descriptor
     safelyCloseDescriptor(ownedDescriptors.candidate);
 
-    runFault('after-candidate-closed');
+    runFault('after-candidate-closed', { probeDir, candidateIno: createdCandidateIno });
 
     // 10. Creating an independent disposable initial target with short-write handling
     const procTargetPath = path.join(parentProcDir, 'target.txt');
@@ -494,6 +495,7 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
     // 12. Descriptor-anchored replacement using fs.renameSync
     try {
       fs.renameSync(procCandidatePath, procTargetPath);
+      renameConfirmed = true;
     } catch (err) {
       return fail('descriptor-anchored-rename', `Descriptor-anchored fs.renameSync failed: ${err.message}`);
     }
@@ -700,19 +702,30 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
 
               // Verify ownership against tracked creation identities
               // F2-A: Missing creation identity must result in cleanup refusal, not filename-based deletion.
+              // F3: Explicit phase-aware target and candidate ownership.
               if (entry === 'candidate.tmp') {
-                if (createdCandidateIno === null || entryStat.ino !== createdCandidateIno) {
+                if (renameConfirmed || createdCandidateIno === null || entryStat.ino !== createdCandidateIno) {
                   hasForeignArtifact = true;
-                  artifactValidationErr = `Refusing cleanup: candidate.tmp was not registered as probe-owned or inode mismatch (expected ${createdCandidateIno}, observed ${entryStat.ino})`;
+                  artifactValidationErr = renameConfirmed
+                    ? 'Refusing cleanup: candidate.tmp exists after confirmed rename to target.txt'
+                    : `Refusing cleanup: candidate.tmp was not registered as probe-owned or inode mismatch (expected ${createdCandidateIno}, observed ${entryStat.ino})`;
                   break;
                 }
               } else if (entry === 'target.txt') {
-                const matchesInitial = createdTargetIno !== null && entryStat.ino === createdTargetIno;
-                const matchesCandidate = createdCandidateIno !== null && entryStat.ino === createdCandidateIno;
-                if (!matchesInitial && !matchesCandidate) {
-                  hasForeignArtifact = true;
-                  artifactValidationErr = `Refusing cleanup: target.txt was not registered as probe-owned or inode mismatch (observed ${entryStat.ino}; initial=${createdTargetIno}, candidate=${createdCandidateIno})`;
-                  break;
+                if (!renameConfirmed) {
+                  // Before a confirmed rename, target.txt is owned only if the probe successfully created it and recorded its identity
+                  if (createdTargetIno === null || entryStat.ino !== createdTargetIno) {
+                    hasForeignArtifact = true;
+                    artifactValidationErr = `Refusing cleanup: target.txt was not registered as probe-owned prior to rename (expected initial target ino ${createdTargetIno}, observed ${entryStat.ino})`;
+                    break;
+                  }
+                } else {
+                  // After a confirmed rename, target.txt may legitimately have the recorded candidate inode
+                  if (createdCandidateIno === null || entryStat.ino !== createdCandidateIno) {
+                    hasForeignArtifact = true;
+                    artifactValidationErr = `Refusing cleanup: target.txt was not registered as probe-owned post-rename (expected candidate ino ${createdCandidateIno}, observed ${entryStat.ino})`;
+                    break;
+                  }
                 }
               }
             }
