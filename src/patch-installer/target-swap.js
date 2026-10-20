@@ -1622,11 +1622,6 @@ export async function authenticateSwapPrerequisites(options = {}) {
  */
 export const authenticatePreSwap = authenticateSwapPrerequisites;
 
-// Private Symbol key used for test-local instrumentation of the internal core.
-// Not exported as a named symbol; does not expand the public export surface.
-const AUTH_CORE_KEY = Symbol.for('ci.patch-installer.target-swap.authenticatePrerequisitesCore');
-authenticateSwapPrerequisites[AUTH_CORE_KEY] = authenticatePrerequisitesCore;
-
 /**
  * Reserved placeholder for future Stage C live-target swap.
  * Intentionally unimplemented in Stage B and Stage C1; fails closed.

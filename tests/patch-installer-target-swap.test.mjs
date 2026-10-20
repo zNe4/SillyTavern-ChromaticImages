@@ -5,7 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import child_process from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   acquireLock,
@@ -1948,12 +1948,113 @@ describe('D01-P3B-2D-2-B: Transaction Pre-Swap Authentication (authenticateSwapP
   });
 });
 
-describe('D01-P3B-2D-2-C1: Private Authentication Core and Descriptor Retention', () => {
-  const AUTH_CORE_KEY = Symbol.for('ci.patch-installer.target-swap.authenticatePrerequisitesCore');
-  const authenticatePrerequisitesCore = authenticateSwapPrerequisites[AUTH_CORE_KEY];
+async function loadIsolatedTestHarness() {
+  const targetSwapPath = path.resolve(REPO_ROOT, 'src/patch-installer/target-swap.js');
+  let src = fs.readFileSync(targetSwapPath, 'utf8');
+  const targetDir = path.dirname(targetSwapPath);
+  src = src.replace(/from '\.\/([^']+)'/g, (m, p) => `from '${pathToFileURL(path.join(targetDir, p)).href}'`);
+  src = src.replace(/from '\.\.\/\.\.\/scripts\/([^']+)'/g, (m, p) => `from '${pathToFileURL(path.join(REPO_ROOT, 'scripts', p)).href}'`);
+  src = src.replace(/const REPO_ROOT = path\.resolve\(__dirname, '\.\.\/\.\.'\);/, `const REPO_ROOT = ${JSON.stringify(REPO_ROOT)};`);
+  src += '\nexport { authenticatePrerequisitesCore };\n';
+  const tmpDir = createTempDir('target-swap-harness-');
+  const tmpFile = path.join(tmpDir, 'target-swap.instrumented.mjs');
+  fs.writeFileSync(tmpFile, src);
+  return import(pathToFileURL(tmpFile).href);
+}
 
-  test('C1-01: authenticatePrerequisitesCore is accessible via internal symbol and is an async function', () => {
+const harness = await loadIsolatedTestHarness();
+const authenticatePrerequisitesCore = harness.authenticatePrerequisitesCore;
+
+describe('D01-P3B-2D-2-C1: Private Authentication Core and Descriptor Retention', () => {
+  test('C1-01: authenticatePrerequisitesCore is accessible via test-isolated harness and is an async function', () => {
     assert.equal(typeof authenticatePrerequisitesCore, 'function');
+  });
+
+  test('F1-C-01: Public module exports contain only accepted Stage B/C1 functions and constants', () => {
+    const expectedExports = [
+      'CERTIFIED_TARGET_FILE',
+      'MAX_SWAP_FILE_BYTES',
+      'SPECIAL_MODE_MASK',
+      'authenticatePreSwap',
+      'authenticateSwapPrerequisites',
+      'isValidOpenConstant',
+      'readBoundedNonblockingFile',
+      'swapVerifiedTarget',
+    ].sort();
+
+    const actualExports = Object.keys(targetSwapModule).sort();
+    assert.deepEqual(actualExports, expectedExports);
+    assert.equal(targetSwapModule.authenticatePrerequisitesCore, undefined);
+  });
+
+  test('F1-C-02: Public authenticateSwapPrerequisites and authenticatePreSwap expose zero Symbol properties', () => {
+    const swapSymbols = Object.getOwnPropertySymbols(authenticateSwapPrerequisites);
+    assert.deepEqual(swapSymbols, [], 'authenticateSwapPrerequisites must have no Symbol properties');
+
+    const preSwapSymbols = Object.getOwnPropertySymbols(authenticatePreSwap);
+    assert.deepEqual(preSwapSymbols, [], 'authenticatePreSwap must have no Symbol properties');
+
+    const globalSymbol = Symbol.for('ci.patch-installer.target-swap.authenticatePrerequisitesCore');
+    assert.equal(authenticateSwapPrerequisites[globalSymbol], undefined);
+    assert.equal(authenticatePreSwap[globalSymbol], undefined);
+  });
+
+  test('F1-C-03: No caller can retrieve authenticatePrerequisitesCore from public exports or function instances', () => {
+    assert.equal(targetSwapModule.authenticatePrerequisitesCore, undefined);
+    assert.equal(authenticateSwapPrerequisites.authenticatePrerequisitesCore, undefined);
+    assert.equal(authenticatePreSwap.authenticatePrerequisitesCore, undefined);
+
+    const standardProps = new Set(['length', 'name', 'prototype', 'arguments', 'caller']);
+    const nonStandardSwapProps = Object.getOwnPropertyNames(authenticateSwapPrerequisites).filter((p) => !standardProps.has(p));
+    assert.deepEqual(nonStandardSwapProps, []);
+
+    const nonStandardPreSwapProps = Object.getOwnPropertyNames(authenticatePreSwap).filter((p) => !standardProps.has(p));
+    assert.deepEqual(nonStandardPreSwapProps, []);
+  });
+
+  test('F1-C-04: Passing { retainParentDescriptor: true } to public APIs never returns parentFd and closes all descriptors', async (t) => {
+    if (skipIfNoAuthenticFixture(t, 'F1-C-04')) return;
+    const repo = setupDisposableRepo('tx-swap-f1c-pub-ignore-');
+    const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+    for (const apiFn of [authenticateSwapPrerequisites, authenticatePreSwap]) {
+      const openedFds = new Set();
+      const closedFds = new Set();
+      const origOpen = fs.openSync;
+      const origClose = fs.closeSync;
+
+      try {
+        fs.openSync = (...args) => {
+          const fd = origOpen.apply(fs, args);
+          openedFds.add(fd);
+          return fd;
+        };
+        fs.closeSync = (fd) => {
+          closedFds.add(fd);
+          return origClose(fd);
+        };
+
+        const res = await apiFn({
+          repoRoot: repo,
+          txId,
+          op,
+          lease,
+          manifest,
+          retainParentDescriptor: true,
+        });
+
+        assert.equal(res.ok, true);
+        assert.equal(res.verified, true);
+        assert.equal(res.parentFd, undefined, 'Public API must never return parentFd');
+        assert.equal(res.parentStat, undefined, 'Public API must never return parentStat');
+
+        const unclosed = Array.from(openedFds).filter((fd) => !closedFds.has(fd));
+        assert.equal(unclosed.length, 0, `All descriptors must be closed; leaked fds: ${unclosed.join(', ')}`);
+      } finally {
+        fs.openSync = origOpen;
+        fs.closeSync = origClose;
+      }
+    }
   });
 
   test('C1-02: Stage B public authenticateSwapPrerequisites API signature and result shape are strictly preserved without parentFd', async (t) => {
