@@ -6,7 +6,7 @@
 
 **Phase:** Phase M03 complete (accepted); Distribution track D01 active.
 
-**Current milestone:** D01-P3B-2D-2-A (standalone Termux filesystem capability probe) accepted for source and physical Android verification on 2026-10-20. **Next:** D01-P3B-2D-2-B bounded pre-rename authentication only; the actual live-target swap (Stage C) is not authorized.
+**Current milestone:** D01-P3B-2D-2-B (read-only pre-swap authentication) **accepted and closed 2026-10-20** after authentic pinned-release executable verification; Stage A's Termux capability probe is also accepted. **Next:** D01-P3B-2D-2-C **read-only architecture/security planning**, not live-target swap implementation.
 
 **Completed:** M01, M02, and M03-A through M03-H3; D01-P1, D01-P2A, D01-P2B, D01-P3A, D01-P3B transaction/locking foundation, and D01-P3B-2A/2B/2C (all accepted). Public patch application, removal, and recovery remain disabled.
 
@@ -740,8 +740,8 @@ Prepare public stable development release.
 | **D01-P3B-2C** | **Accepted 2026-10-19** | Verified destination-parent candidate; journal reaches `READY_TO_SWAP`, live target unchanged. |
 | **D01-P3B-2D-1** | **Accepted 2026-10-20** | Read-only classification of live result, missing candidate, possible unrecorded swap and inconsistent later phases; no mutations. |
 | **D01-P3B-2D-2-A** | **Source and device gate accepted 2026-10-20** | Termux-private `$HOME` probe: 13/13 filesystem capabilities, no errors, cleanup succeeded. |
-| D01-P3B-2D-2-B | **Next bounded coding stage** | Internal pre-rename authentication and fail-closed refusal; no live mutation. |
-| D01-P3B-2D-2-C | **Not authorized** | Actual candidate-to-live atomic rename, directory fsync and `SWAPPED` journal transition. |
+| **D01-P3B-2D-2-B** | **Accepted / closed 2026-10-20** | Internal authenticated `READY_TO_SWAP` preconditions; 75/75 focused, 1,171/1,171 full suite reported passed; no live mutation. |
+| D01-P3B-2D-2-C | **Read-only planning next; coding not authorized** | Actual candidate-to-live atomic rename, directory fsync and `SWAPPED` journal transition. |
 | D01-P3B-3 and later | Deferred | Completion/recovery/public CLI subject to separately reviewed contracts. |
 
 **Accepted P3B-2C code baseline:** `38043acd5a35e4087c2c7d214ee95f3a5f280323`. Gemini's read-only executable acceptance report recorded **1,043/1,043** full-suite tests, **63/63** focused destination-staging tests, zero failures/skips, `npm run verify:patches` PASS, and `node --check` passing for 64 tracked JavaScript files. The linked SillyTavern checkout was reported unchanged before and after. These are submitted execution results, not claims of independent local execution by the reviewer.
@@ -752,7 +752,9 @@ Prepare public stable development release.
 
 **Accepted Stage A probe baseline:** `2735039aa4916cd1d89a5dec4006f9ab7d2123ff`. User-provided device JSON reports Termux `platform: android`, `arch: arm64`, Node.js `v26.4.0`, **13/13** mandatory capabilities true, `ok: true`, `failedStage: null`, and `cleanupSucceeded: true`. This is user-run device evidence reviewed against the source, not a reviewer-executed Android run. GitHub did not expose CI checks for the probe commit.
 
-**Stop boundary:** Neither P3B-2D-1 nor Stage A renames the installer candidate onto `src/endpoints/stable-diffusion.js`, advances its journal to `SWAPPED`, implements rollback, or enables `--apply`/`--remove`/`--recover`. Only Stage B pre-rename checks may proceed under a separately bounded mission. Stage C remains unauthorized; on-device probe success is **not** permission to replace the real SillyTavern file.
+**Accepted Stage B baseline:** `00bcee97a1e0dca71efbc9cab2dbc00a96881d8c` (B-F2). Codex's executable acceptance report of 2026-10-20 records **75/75 focused** tests (8 suites), **1,171/1,171 full-suite** tests (70 suites), zero failures/skips, authentic pinned apply/remove cases, FIFO and hard-link races, descriptor-close fault regressions, patch verification PASS and clean worktree. The installed SillyTavern checkout and ignored symlink were reported preserved. This is Codex-run evidence reviewed by ChatGPT; no independent local re-execution or GitHub CI results were available. These totals are not code-coverage measurements.
+
+**Stop boundary:** P3B-2D-1 and Stages A/B never rename the installer candidate onto `src/endpoints/stable-diffusion.js` or advance its journal to `SWAPPED`, implement rollback, or enable public `--apply`/`--remove`/`--recover`. Stage C requires separate **read-only planning and explicit future implementation authorization**; passing Stage A on-device checks and Stage B authentic tests does **not** permit real-installation replacement.
 
 **Handoff reference:** [docs/d01-installer-progress.md](docs/d01-installer-progress.md) records source files, journal lifecycle, certified fingerprints, accepted security invariants, testing evidence, and P3B-2D questions.
 

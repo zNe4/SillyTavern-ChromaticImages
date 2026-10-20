@@ -14,8 +14,8 @@
 | **D01-P3B-2C** | **Accepted / closed** | Durable, independently authenticated destination candidate; `BACKUP_CREATED → READY_TO_SWAP`. |
 | **D01-P3B-2D-1** | **Accepted / closed 2026-10-20** | Read-only post-swap inspection of live target, missing/leftover candidate, and possible unrecorded swap. |
 | **D01-P3B-2D-2-A** | **Source reviewed; Android device gate accepted 2026-10-20** | Non-destructive Termux filesystem capability probe; disposable `$HOME` files only. |
-| D01-P3B-2D-2-B | **Next bounded implementation stage; not yet implemented** | Authentication and pre-rename refusals only; no live replacement. |
-| D01-P3B-2D-2-C | **Not authorized** | First live-target atomic replacement, durability and journal advancement; must be reviewed separately. |
+| **D01-P3B-2D-2-B** | **Accepted / closed 2026-10-20** | Lease-authorized read-only pre-swap authentication, certified bytes, directory/descriptor continuity, fail-closed refusals; no live rename. |
+| D01-P3B-2D-2-C | **Planning only; not authorized for coding** | First live-target atomic replacement, durability and journal advancement; requires reviewed design and explicit authorization. |
 | D01-P3B-3 and subsequent | Deferred | Completion, recovery/rollback and public mutation CLI gates. |
 
 The accepted code baseline is [`38043acd5a35e4087c2c7d214ee95f3a5f280323`](https://github.com/zNe4/SillyTavern-ChromaticImages/commit/38043acd5a35e4087c2c7d214ee95f3a5f280323) (P3B-2C-F2). The initial P3B-2C implementation and corrective commits F1/F2 were independently source-reviewed before executable acceptance.
@@ -107,9 +107,32 @@ The user ran `node ci-termux-swap-probe.mjs --json` **on a physical Termux Andro
 
 **Stage A accepted for source and device capability verification.** Authentic full-suite CI/verification results for the F3 head have not been independently confirmed by ChatGPT; there were no GitHub check runs. Do not infer that the complete installer is implemented. The next authorized coding boundary is Stage B pre-rename authentication/refusal, with no live mutation. Stage C remains separately gated.
 
-## Next implementation checkpoint: D01-P3B-2D-2-B
+## D01-P3B-2D-2-B — Pre-swap authentication accepted (2026-10-20)
 
-**Stage B may implement only internal authentication and deterministic pre-rename refusal tests.** A separate security/source review is required before Stage C's candidate-to-live rename and journal mutation. The reviewed plan should settle:
+**Accepted source baseline:** [`00bcee97a1e0dca71efbc9cab2dbc00a96881d8c`](https://github.com/zNe4/SillyTavern-ChromaticImages/commit/00bcee97a1e0dca71efbc9cab2dbc00a96881d8c) (Stage B-F2), after source review of initial B, F1 and F2. Only `src/patch-installer/target-swap.js` and `tests/patch-installer-target-swap.test.mjs` changed. The new read-only `authenticateSwapPrerequisites()` validates the active transaction lease/lock, exact `READY_TO_SWAP` journal, canonical artifact paths, certified bundled manifest and SHA-256/Git blob digests, no-follow/nonblocking bounded reads, single-link identity, file modes and special-bit refusals, staging/backup directory contents, destination-parent descriptor/procfs anchoring and final pathname continuity. `swapVerifiedTarget()` remains deliberately unimplemented.
+
+Codex's **D01-P3B-2D-2-B-V executable acceptance report**, dated **2026-10-20**, records verification against real pinned upstream Git objects at `06bde939fb1e9c4c8d8641d810f0a916b5bce127` with certified original SHA-256 `15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43` and blob `077c2f961b528afa10376a7cc20a62132cf9fcd8`; certified patched SHA-256 `16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6` and blob `e8bcfb652520450951268bd7521fdc6eae1aa2b6`. It used the existing `/home/zzzne4/SillyTavern` **as a read-only Git object source**; patch application and installer transaction tests occurred in disposable sandboxes.
+
+| Verification gate | Reported result |
+| --- | --- |
+| Focused `tests/patch-installer-target-swap.test.mjs` | **75/75 passed, 8 suites, 0 failures/skips**. |
+| `npm test`, authenticated `SILLYTAVERN_TEST_REPO` | **1,171/1,171 passed, 70 suites, 0 failures/skips**. |
+| Authentic apply/remove pre-swap authentication | Both executed and passed. |
+| FIFO race and concurrent hard-link test | Both executed and passed; required mutation/race evidence reported. |
+| Descriptor closure + secondary error diagnostics | Regression tests executed and passed, including child-process isolation. |
+| Strict Stage B read-only snapshots and Stage C placeholder | Tests passed; no live rename or `SWAPPED` transition. |
+| `npm run verify:patches` | PASS; certified patch artifacts unchanged. |
+| Tracked `.js`/`.mjs` syntax, `git diff --check`, `git status --short` | All PASS; clean local worktree. |
+| Existing installation and `./SillyTavern` symlink | Reported unchanged; active SillyTavern checkout retained its existing HEAD and modifications. |
+| Public `--apply` / `--remove` / `--recover` | Continue to refuse. |
+
+**Evidence provenance:** Codex performed and submitted these runs; ChatGPT independently reviewed the pushed source, GitHub commit scope, and the supplied report, but **did not rerun** the suite on the user's host. GitHub returned **no CI statuses or workflow runs**. These are passing test totals, not an instrumented 100% code/branch-coverage measurement. This acceptance does not extend Stage A's Termux capability result to the full production installer.
+
+**Stage B is formally accepted and closed.** No Stage C implementation is authorized yet. The next checkpoint is a read-only Stage C design/contract review, followed by separately bounded coding and authentic disposable-fixture acceptance.
+
+## Next planning checkpoint: D01-P3B-2D-2-C
+
+**Planning only: do not rename live files or advance the journal.** Stage C will require a new reviewed contract for candidate-to-live rename and crash/identity handling. The plan must settle:
 
 - Lease and journal authorization immediately before swapping; full authentication of live initial bytes/mode/inode, backup, isolated result, and same-directory candidate (including identity/permissions/durability).
 - Atomic rename semantics and directory fsync ordering; what happens if rename succeeds but subsequent directory synchronization or journal advance fails.
@@ -118,7 +141,7 @@ The user ran `node ci-termux-swap-probe.mjs --json` **on a physical Termux Andro
 - Read-only status/inspection for the post-rename state without pretending P3B-3 recovery is implemented.
 - Deterministic forward and reverse fixture tests for every failure boundary, with **no changes** to the actual linked SillyTavern installation.
 
-The on-device Termux capability gate has now passed for the tested environment. This does **not** certify the future production rename implementation. Before Stage C is authorized, review the swap authentication, descriptor lifetime, rename/error provenance, fsync ordering and journal crash-boundary semantics against its actual code. If any required operation is unsupported in the deployment environment, fail closed without fallback. Keep public `--apply`, `--remove`, and `--recover` unavailable until their own later authorization.
+The on-device Termux capability gate has now passed for the tested environment. This does **not** certify the future production rename implementation. Before Stage C is authorized, review Stage B's accepted authentication contract, descriptor lifetime, rename/error provenance, fsync ordering and journal crash-boundary semantics against the actual accepted code. If any required operation is unsupported in the deployment environment, fail closed without fallback. Keep public `--apply`, `--remove`, and `--recover` unavailable until their own later authorization.
 
 ## Workflow
 
