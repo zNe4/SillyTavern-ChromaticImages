@@ -159,12 +159,42 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
   function safelyCloseDescriptor(ref) {
     if (ref.fd === null) return;
     const toClose = ref.fd;
-    ref.fd = null; // Unbind immediately to prevent double-closing or closing a reused descriptor
+    ref.fd = null; // Unbind immediately to prevent double-closing or closing an unrelated/reused descriptor
+
+    // 1. Pre-close fault hook executed in its own isolated try-catch
+    let hookError = null;
     try {
       runFault(`close-${ref.name}`, { fd: toClose });
+    } catch (err) {
+      hookError = err;
+    }
+
+    // 2. The close syscall is ALWAYS attempted, even if the pre-close hook threw
+    let closeSyscallError = null;
+    try {
       fs.closeSync(toClose);
     } catch (err) {
-      closeErrors.push({ name: ref.name, fd: toClose, error: err });
+      // Real closeSync error: completion status is uncertain; do not retry
+      closeSyscallError = err;
+    }
+
+    // 3. Record hook and/or syscall errors
+    if (hookError) {
+      closeErrors.push({
+        name: ref.name,
+        fd: toClose,
+        error: hookError,
+        isHookFault: true,
+      });
+    }
+    if (closeSyscallError) {
+      closeErrors.push({
+        name: ref.name,
+        fd: toClose,
+        error: closeSyscallError,
+        isSyscallError: true,
+        uncertain: true,
+      });
     }
   }
 
@@ -608,7 +638,8 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
         cleanupStat = fs.lstatSync(probeDir);
       } catch (err) {
         if (err?.code === 'ENOENT') {
-          cleanupSucceeded = true;
+          // Unexpected disappearance before cleanup must not be reported as successful cleanup
+          cleanupError = 'Refusing cleanup: probe directory unexpectedly disappeared before cleanup could be performed';
         } else {
           cleanupError = `Failed to lstat probe directory before cleanup: ${err.message}`;
         }
@@ -628,7 +659,11 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
             cleanupError = `Failed to read probe directory entries for cleanup: ${readDirErr.message}`;
           }
 
-          runFault('before-artifact-cleanup', { probeDir, entries });
+          try {
+            runFault('before-artifact-cleanup', { probeDir, entries });
+          } catch (hookErr) {
+            cleanupError = `Fault hook failed during before-artifact-cleanup: ${hookErr.message}`;
+          }
 
           if (!cleanupError) {
             const recognizedNames = new Set(['candidate.tmp', 'target.txt']);
@@ -663,11 +698,12 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
                 break;
               }
 
-              // Verify ownership against tracked inodes
+              // Verify ownership against tracked creation identities
+              // F2-A: Missing creation identity must result in cleanup refusal, not filename-based deletion.
               if (entry === 'candidate.tmp') {
-                if (createdCandidateIno !== null && entryStat.ino !== createdCandidateIno) {
+                if (createdCandidateIno === null || entryStat.ino !== createdCandidateIno) {
                   hasForeignArtifact = true;
-                  artifactValidationErr = `Refusing cleanup: candidate.tmp inode (${entryStat.ino}) does not match probe creation inode (${createdCandidateIno})`;
+                  artifactValidationErr = `Refusing cleanup: candidate.tmp was not registered as probe-owned or inode mismatch (expected ${createdCandidateIno}, observed ${entryStat.ino})`;
                   break;
                 }
               } else if (entry === 'target.txt') {
@@ -675,7 +711,7 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
                 const matchesCandidate = createdCandidateIno !== null && entryStat.ino === createdCandidateIno;
                 if (!matchesInitial && !matchesCandidate) {
                   hasForeignArtifact = true;
-                  artifactValidationErr = `Refusing cleanup: target.txt inode (${entryStat.ino}) matches neither initial target (${createdTargetIno}) nor swapped candidate (${createdCandidateIno})`;
+                  artifactValidationErr = `Refusing cleanup: target.txt was not registered as probe-owned or inode mismatch (observed ${entryStat.ino}; initial=${createdTargetIno}, candidate=${createdCandidateIno})`;
                   break;
                 }
               }
@@ -729,7 +765,7 @@ export async function runTermuxSwapCapabilityProbe(options = {}) {
     // Check for descriptor closure errors
     if (closeErrors.length > 0) {
       const closeErrMsg = closeErrors
-        .map((e) => `${e.name} (fd ${e.fd}): ${e.error.message}`)
+        .map((e) => `${e.name} (fd ${e.fd})${e.uncertain ? ' [uncertain]' : ''}: ${e.error.message}`)
         .join('; ');
       if (result.ok) {
         result.ok = false;
