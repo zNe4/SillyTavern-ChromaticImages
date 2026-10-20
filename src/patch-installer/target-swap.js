@@ -155,6 +155,13 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
     throw err;
   }
 
+  // F2-B: Check preliminary link count when requireSingleLink is enabled
+  if (requireSingleLink && preCheck.stat.nlink !== 1) {
+    const err = new Error(`File "${absPath}" unexpected link count: expected 1, observed ${preCheck.stat.nlink}`);
+    err.code = 'unexpected-link-count';
+    throw err;
+  }
+
   // F1-C: Reject unsupported setuid, setgid, and sticky permission bits
   if ((preCheck.stat.mode & SPECIAL_MODE_MASK) !== 0) {
     const err = new Error(`File "${absPath}" has unsupported special permission bits (setuid/setgid/sticky): 0o${(preCheck.stat.mode & 0o7777).toString(8)}`);
@@ -219,6 +226,12 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
     if (requireSingleLink && preStat.nlink !== 1) {
       const err = new Error(`File "${absPath}" unexpected link count: expected 1, observed ${preStat.nlink}`);
       err.code = 'unexpected-link-count';
+      throw err;
+    }
+
+    if (preCheck.stat.nlink !== preStat.nlink) {
+      const err = new Error(`Pathname link count does not match descriptor for "${absPath}": preliminary ${preCheck.stat.nlink}, descriptor ${preStat.nlink}`);
+      err.code = 'descriptor-identity-mismatch';
       throw err;
     }
 
@@ -294,6 +307,19 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
       throw err;
     }
 
+    // F2-B: Recheck descriptor link count after reading
+    if (requireSingleLink && postStat.nlink !== 1) {
+      const err = new Error(`File "${absPath}" unexpected link count after reading: expected 1, observed ${postStat.nlink}`);
+      err.code = 'unexpected-link-count';
+      throw err;
+    }
+
+    if (postStat.nlink !== preStat.nlink) {
+      const err = new Error(`File "${absPath}" link count modified concurrently during reading: initially ${preStat.nlink}, observed ${postStat.nlink}`);
+      err.code = 'concurrent-modification';
+      throw err;
+    }
+
     // F1-C: Reject special bits on postStat
     if ((postStat.mode & SPECIAL_MODE_MASK) !== 0) {
       const err = new Error(`File "${absPath}" has unsupported special permission bits after reading: 0o${(postStat.mode & 0o7777).toString(8)}`);
@@ -325,6 +351,19 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
       postCheck.size !== preStat.size
     ) {
       const err = new Error(`Pathname "${absPath}" identity, mode, or type modified concurrently after reading`);
+      err.code = 'pathname-continuity-error';
+      throw err;
+    }
+
+    // F2-B: Check pathname link-count consistency in final validation
+    if (requireSingleLink && postCheck.nlink !== 1) {
+      const err = new Error(`Pathname "${absPath}" unexpected link count after reading: expected 1, observed ${postCheck.nlink}`);
+      err.code = 'unexpected-link-count';
+      throw err;
+    }
+
+    if (postCheck.nlink !== postStat.nlink) {
+      const err = new Error(`Pathname "${absPath}" link count does not match descriptor: pathname ${postCheck.nlink}, descriptor ${postStat.nlink}`);
       err.code = 'pathname-continuity-error';
       throw err;
     }
@@ -374,7 +413,13 @@ export function readBoundedNonblockingFile(absPath, options = {}) {
           throw err;
         } else if (typeof primaryError === 'object' && primaryError !== null && !primaryError.closeError) {
           // Preserve primary verification error when cleanup also fails
-          primaryError.closeError = closeErr;
+          primaryError.closeError = {
+            error: closeErr.message,
+            message: closeErr.message,
+            code: closeErr.code || 'descriptor-close-error',
+            uncertain: true,
+            status: 'failed',
+          };
         }
       }
     }
@@ -1090,6 +1135,9 @@ export async function authenticateSwapPrerequisites(options = {}) {
   let verificationException = null;
 
   const fail = (res) => {
+    if (!res.reason && res.error) {
+      res.reason = res.error;
+    }
     verificationResult = res;
     return res;
   };
@@ -1518,10 +1566,18 @@ export async function authenticateSwapPrerequisites(options = {}) {
       }
 
       if (closeErr) {
+        const secondaryDiagnostic = {
+          error: closeErr.message,
+          message: closeErr.message,
+          code: closeErr.code || 'parent-dir-close-error',
+          uncertain: true,
+          status: 'failed',
+        };
+
         if (verificationException) {
           // Preserve primary verification exception when cleanup also fails
           if (typeof verificationException === 'object' && verificationException !== null && !verificationException.closeError) {
-            verificationException.closeError = closeErr;
+            verificationException.closeError = secondaryDiagnostic;
           }
         } else if (verificationResult && verificationResult.ok === true) {
           // A failed descriptor close cannot return verified: true
@@ -1532,7 +1588,14 @@ export async function authenticateSwapPrerequisites(options = {}) {
             code: closeErr.code || 'parent-dir-close-error',
             stage: 'destination-parent',
             reason: closeErr.message,
+            closeError: secondaryDiagnostic,
+            descriptorCloseUncertain: true,
           };
+        } else if (verificationResult && verificationResult.ok === false) {
+          // F2-A: When authentication has already produced a structured { ok: false } result,
+          // preserve primary code, stage, reason, and attach secondary close error in diagnostic field.
+          verificationResult.closeError = secondaryDiagnostic;
+          verificationResult.descriptorCloseUncertain = true;
         }
       }
     }

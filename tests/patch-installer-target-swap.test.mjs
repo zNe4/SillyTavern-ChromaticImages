@@ -684,6 +684,7 @@ describe('D01-P3B-2D-2-B: Secure Bounded Nonblocking Reader (readBoundedNonblock
     try {
       fs.closeSync = (fd) => {
         attemptedCloseFd = fd;
+        origClose(fd); // simulate post-close error reporting: genuine close happens first
         const err = new Error('simulated close EIO failure');
         err.code = 'EIO';
         throw err;
@@ -713,6 +714,7 @@ describe('D01-P3B-2D-2-B: Secure Bounded Nonblocking Reader (readBoundedNonblock
     try {
       fs.closeSync = (fd) => {
         closeAttempted = true;
+        origClose(fd); // simulate post-close error reporting: genuine close happens first
         const err = new Error('secondary cleanup close failure');
         err.code = 'EIO';
         throw err;
@@ -725,6 +727,8 @@ describe('D01-P3B-2D-2-B: Secure Bounded Nonblocking Reader (readBoundedNonblock
           assert.equal(err.code, 'empty-file');
           assert.ok(err.closeError, 'Close error attached as secondary property');
           assert.equal(err.closeError.code, 'EIO');
+          assert.equal(err.closeError.status, 'failed');
+          assert.equal(err.closeError.uncertain, true);
           return true;
         }
       );
@@ -732,6 +736,84 @@ describe('D01-P3B-2D-2-B: Secure Bounded Nonblocking Reader (readBoundedNonblock
     } finally {
       fs.closeSync = origClose;
     }
+  });
+
+  // F2-B: Revalidate single-link identity
+  test('F2-B: detects hard link created concurrently after initial descriptor open and refuses authentication', () => {
+    const dir = createTempDir('reader-concurrent-hardlink-');
+    const filePath = path.join(dir, 'target.txt');
+    const linkPath = path.join(dir, 'target-hardlink.txt');
+    fs.writeFileSync(filePath, 'data for hardlink concurrency test\n');
+
+    let linkCreatedDuringRead = false;
+
+    assert.throws(
+      () =>
+        readBoundedNonblockingFile(filePath, {
+          requireSingleLink: true,
+          runFault: (stage) => {
+            if (stage === 'read-chunk' && !linkCreatedDuringRead) {
+              // Create hard link after initial descriptor validation, before reading completes
+              fs.linkSync(filePath, linkPath);
+              linkCreatedDuringRead = true;
+            }
+          },
+        }),
+      (err) => {
+        assert.ok(
+          err.code === 'unexpected-link-count' || err.code === 'concurrent-modification',
+          `Expected unexpected-link-count or concurrent-modification, got ${err.code}`
+        );
+        return true;
+      }
+    );
+
+    // Prove intended mutation occurred: file on disk now has link count 2
+    assert.equal(linkCreatedDuringRead, true, 'Hard link creation hook was executed');
+    const st = fs.statSync(filePath);
+    assert.equal(st.nlink, 2, 'File on disk has link count 2 proving intended mutation occurred');
+  });
+
+  // F2-C: Uncertain close failure isolated in disposable child process
+  test('F2-C: uncertain descriptor close failure without prior close is isolated in disposable child process', () => {
+    const dir = createTempDir('reader-child-close-failure-');
+    const filePath = path.join(dir, 'file.txt');
+    fs.writeFileSync(filePath, 'valid read content for child process test\n');
+
+    const script = `
+      import fs from 'node:fs';
+      import assert from 'node:assert/strict';
+      import { readBoundedNonblockingFile } from './src/patch-installer/target-swap.js';
+
+      const filePath = ${JSON.stringify(filePath)};
+      let closeCalled = false;
+
+      fs.closeSync = (fd) => {
+        closeCalled = true;
+        // Strictly do NOT call origClose: simulates uncertain descriptor ownership where close fails
+        const err = new Error('simulated uncertain kernel close failure');
+        err.code = 'EIO';
+        throw err;
+      };
+
+      let threw = false;
+      try {
+        readBoundedNonblockingFile(filePath);
+      } catch (err) {
+        threw = true;
+        assert.ok(err.code === 'EIO' || err.code === 'descriptor-close-error');
+        assert.match(err.message, /Failed to close descriptor/);
+      }
+
+      assert.equal(threw, true, 'Reader must fail closed on uncertain descriptor close failure');
+      assert.equal(closeCalled, true, 'closeSync was called');
+      process.exit(0);
+    `;
+
+    child_process.execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: REPO_ROOT,
+      stdio: 'pipe',
+    });
   });
 });
 
@@ -1717,6 +1799,7 @@ describe('D01-P3B-2D-2-B: Transaction Pre-Swap Authentication (authenticateSwapP
             const st = fs.fstatSync(fd);
             if (st.isDirectory() && st.ino === parentStat.ino) {
               parentCloseAttempted = true;
+              origClose(fd); // simulate post-close error reporting: genuine close happens first
               const err = new Error('simulated parent directory close EIO failure');
               err.code = 'EIO';
               throw err;
@@ -1732,13 +1815,16 @@ describe('D01-P3B-2D-2-B: Transaction Pre-Swap Authentication (authenticateSwapP
         assert.equal(res.verified, false);
         assert.ok(res.code === 'parent-dir-close-error' || res.code === 'EIO');
         assert.match(res.error, /Failed to close destination parent directory descriptor/);
+        assert.ok(res.closeError, 'closeError diagnostic attached');
+        assert.equal(res.closeError.uncertain, true);
+        assert.equal(res.descriptorCloseUncertain, true);
         assert.equal(parentCloseAttempted, true, 'Destination parent directory closeSync was attempted');
       } finally {
         fs.closeSync = origClose;
       }
     });
 
-    test('F1-D: preserves primary verification error when destination parent directory closeSync also fails', async () => {
+    test('F2-A: preserves primary verification error and attaches secondary diagnostic when destination parent directory closeSync fails', async () => {
       const repo = setupDisposableRepo('tx-swap-parent-primary-close-');
       const { txId, op, lease, stagingFile } = setupTxAtReadyToSwap({ repo, op: 'apply' });
 
@@ -1758,6 +1844,7 @@ describe('D01-P3B-2D-2-B: Transaction Pre-Swap Authentication (authenticateSwapP
             const st = fs.fstatSync(fd);
             if (st.isDirectory() && st.ino === parentStat.ino) {
               parentCloseAttempted = true;
+              origClose(fd); // simulate post-close error reporting: genuine close happens first
               const err = new Error('secondary parent directory close failure');
               err.code = 'EIO';
               throw err;
@@ -1773,6 +1860,18 @@ describe('D01-P3B-2D-2-B: Transaction Pre-Swap Authentication (authenticateSwapP
         assert.equal(res.verified, false);
         // Primary error (staging digest mismatch) must be preserved!
         assert.equal(res.code, 'staging-digest-mismatch');
+        assert.equal(res.stage, 'isolated-staging-verification');
+        assert.ok(res.reason, 'Primary reason is preserved');
+        assert.match(res.reason, /staging SHA-256 mismatch/i);
+
+        // Secondary descriptor-close error must be attached in structured diagnostic field (F2-A)
+        assert.ok(res.closeError, 'Secondary closeError diagnostic is attached');
+        assert.equal(res.closeError.code, 'EIO');
+        assert.equal(res.closeError.status, 'failed');
+        assert.equal(res.closeError.uncertain, true);
+        assert.match(res.closeError.message, /secondary parent directory close failure/);
+        assert.equal(res.descriptorCloseUncertain, true, 'descriptorCloseUncertain flag is set');
+
         assert.equal(parentCloseAttempted, true, 'Parent close was attempted during cleanup');
       } finally {
         fs.closeSync = origClose;
