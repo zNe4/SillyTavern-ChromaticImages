@@ -2876,28 +2876,84 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
         fs.lstatSync = origLstat;
       }
     });
-  });
 
-  describe('Rename & Directory Fsync Syscall Failures', () => {
-    test('fs.renameSync throw records renameConfirmed: null, durabilityUncertain: true, and aborts before journal advance', async (t) => {
-      if (skipIfNoAuthenticFixture(t, 'renameSync throw')) return;
+    test('F1-B & F1-D: late parent-directory replacement after all checks refuses mutation before renameSync is called', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'late parent replacement')) return;
 
-      const repo = setupDisposableRepo('tx-swap-c2c3-rename-throw-');
-      const { txId, op, lease } = setupTxAtReadyToSwap({
+      const repo = setupDisposableRepo('tx-swap-c2c3-late-parent-replace-');
+      const { txId, op, lease, candidateFile, liveTarget } = setupTxAtReadyToSwap({
         repo,
         op: 'apply',
       });
 
+      const absParentDir = path.resolve(repo, 'src/endpoints');
+      const lockDirPath = path.join(repo, '.ci-patch/lock.d');
+      const origLstat = fs.lstatSync;
+      const origRename = fs.renameSync;
+      let renameAttemptedOnDisk = false;
+      let lockCheckCount = 0;
+
+      try {
+        fs.renameSync = (...args) => {
+          renameAttemptedOnDisk = true;
+          return origRename(...args);
+        };
+
+        fs.lstatSync = (p, ...rest) => {
+          if (p === lockDirPath) {
+            lockCheckCount++;
+          } else if (lockCheckCount >= 2 && p === absParentDir) {
+            // Substitute parent directory on disk right at the late pre-rename check!
+            origRename(absParentDir, absParentDir + '.substituted');
+            fs.mkdirSync(absParentDir);
+            lockCheckCount = 0;
+          }
+          return origLstat(p, ...rest);
+        };
+
+        const res = await swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+
+        assert.equal(res.ok, false);
+        assert.equal(res.code, 'parent-dir-continuity-error');
+        assert.equal(res.stage, 'final-pre-rename-checks');
+
+        assert.equal(res.renameAttempted, false, 'renameAttempted must be false');
+        assert.equal(res.renameConfirmed, false, 'renameConfirmed must be false');
+        assert.equal(res.journalAdvanceAttempted, false, 'journalAdvanceAttempted must be false');
+        assert.equal(res.durabilityUncertain, false);
+        assert.equal(renameAttemptedOnDisk, false, 'Live-target rename must never have been called');
+
+        const journal = inspectJournal(repo);
+        assert.equal(journal.journal.phase, 'READY_TO_SWAP', 'Journal must remain unchanged');
+      } finally {
+        fs.renameSync = origRename;
+        fs.lstatSync = origLstat;
+      }
+    });
+  });
+
+  describe('Rename & Directory Fsync Syscall Failures', () => {
+    test('F1-D: fs.renameSync throw before syscall records renameConfirmed: null, durabilityUncertain: true, and preserves on-disk state', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'renameSync throw')) return;
+
+      const repo = setupDisposableRepo('tx-swap-c2c3-rename-throw-');
+      const { txId, op, lease, candidateFile, liveTarget } = setupTxAtReadyToSwap({
+        repo,
+        op: 'apply',
+      });
+
+      const candStatBefore = fs.statSync(candidateFile);
+      const targetStatBefore = fs.statSync(liveTarget);
+
       const origRename = fs.renameSync;
       try {
         fs.renameSync = (src, dst) => {
-          const err = new Error('Simulated EIO on renameSync');
+          const err = new Error('Simulated EIO on renameSync before syscall');
           err.code = 'EIO';
           throw err;
         };
 
         const res = await swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
-
 
         assert.equal(res.ok, false);
         assert.equal(res.renameAttempted, true);
@@ -2908,6 +2964,59 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
         assert.equal(res.observedTargetState, 'uninspected');
         assert.equal(res.candidateConsumed, null);
         assert.equal(res.journalAdvanceAttempted, false);
+
+        // Filesystem inspection: rename was not executed on disk
+        assert.equal(fs.existsSync(candidateFile), true, 'Candidate file remains on disk');
+        assert.equal(fs.statSync(candidateFile).ino, candStatBefore.ino);
+        assert.equal(fs.statSync(liveTarget).ino, targetStatBefore.ino, 'Live target was not replaced');
+        const journal = inspectJournal(repo);
+        assert.equal(journal.journal.phase, 'READY_TO_SWAP', 'Journal remains at READY_TO_SWAP');
+      } finally {
+        fs.renameSync = origRename;
+      }
+    });
+
+    test('F1-D: target rename performs actual replacement on disk but throws in wrapper; preserves renameConfirmed: null and durabilityUncertain: true', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'renameSync wrapper throw')) return;
+
+      const repo = setupDisposableRepo('tx-swap-c2c3-rename-wrapper-throw-');
+      const { txId, op, lease, candidateFile, liveTarget } = setupTxAtReadyToSwap({
+        repo,
+        op: 'apply',
+      });
+
+      const candStatBefore = fs.statSync(candidateFile);
+      const candIno = candStatBefore.ino;
+
+      const origRename = fs.renameSync;
+      try {
+        fs.renameSync = (src, dst) => {
+          // Perform genuine rename on disk first
+          origRename(src, dst);
+          // Then throw wrapper error
+          const err = new Error('Simulated wrapper exception immediately following rename syscall');
+          err.code = 'EIO';
+          throw err;
+        };
+
+        const res = await swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+
+        assert.equal(res.ok, false);
+        assert.equal(res.renameAttempted, true);
+        assert.equal(res.renameConfirmed, null, 'renameConfirmed must be null when syscall/wrapper throws, regardless of on-disk state');
+        assert.equal(res.durabilityUncertain, true, 'durabilityUncertain must be true when rename throws');
+        assert.equal(res.uncertain, true);
+        assert.equal(res.targetDirectoryFsyncAttempted, false);
+        assert.equal(res.observedTargetState, 'uninspected');
+        assert.equal(res.candidateConsumed, null);
+        assert.equal(res.journalAdvanceAttempted, false);
+
+        // Crucial verification: establish actual filesystem state using disposable fixture inspection
+        assert.equal(fs.existsSync(candidateFile), false, 'Candidate was consumed on disk');
+        const targetStatAfter = fs.statSync(liveTarget);
+        assert.equal(targetStatAfter.ino, candIno, 'Live target was actually replaced on disk despite thrown error');
+        const journal = inspectJournal(repo);
+        assert.equal(journal.journal.phase, 'READY_TO_SWAP', 'Journal was never advanced');
       } finally {
         fs.renameSync = origRename;
       }
@@ -3028,7 +3137,7 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
       }
     });
 
-    test('post-swap target pathname disappearance records observedTargetState: missing and does not advance journal', async (t) => {
+    test('F1-C & F1-D: post-swap target pathname confirmed ENOENT records observedTargetState: missing and code: ENOENT', async (t) => {
       if (skipIfNoAuthenticFixture(t, 'post-swap missing')) return;
 
       const repo = setupDisposableRepo('tx-swap-c2c3-readback-missing-');
@@ -3058,10 +3167,105 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
 
         const res = await swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
 
+        assert.equal(res.ok, false);
+        assert.equal(res.code, 'ENOENT');
+        assert.equal(res.stage, 'post-rename-readback');
+        assert.equal(res.observedTargetState, 'missing');
+        assert.equal(res.targetIno, undefined);
+        assert.equal(res.renameConfirmed, true);
+        assert.equal(res.targetDirectoryFsyncConfirmed, true);
+        assert.equal(res.journalAdvanceAttempted, false);
+        assert.equal(res.uncertain, true);
+      } finally {
+        fs.renameSync = origRename;
+        fs.lstatSync = origLstat;
+      }
+    });
+
+    test('F1-C & F1-D: post-swap target pathname EIO records observedTargetState: inaccessible and code: EIO', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'post-swap eio')) return;
+
+      const repo = setupDisposableRepo('tx-swap-c2c3-readback-eio-path-');
+      const { txId, op, lease, candidateFile, liveTarget } = setupTxAtReadyToSwap({
+        repo,
+        op: 'apply',
+      });
+
+      const origLstat = fs.lstatSync;
+      let targetRenamed = false;
+      const origRename = fs.renameSync;
+
+      try {
+        fs.renameSync = (...args) => {
+          origRename(...args);
+          targetRenamed = true;
+        };
+
+        fs.lstatSync = (p, ...rest) => {
+          if (targetRenamed && p === path.resolve(liveTarget)) {
+            const err = new Error('EIO: input/output error during target pathname lstat');
+            err.code = 'EIO';
+            throw err;
+          }
+          return origLstat(p, ...rest);
+        };
+
+        const res = await swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
 
         assert.equal(res.ok, false);
-        assert.equal(res.observedTargetState, 'missing');
+        assert.equal(res.code, 'EIO');
+        assert.equal(res.stage, 'post-rename-readback');
+        assert.equal(res.observedTargetState, 'inaccessible');
+        assert.equal(res.targetIno, undefined);
+        assert.equal(res.renameConfirmed, true);
+        assert.equal(res.targetDirectoryFsyncConfirmed, true);
         assert.equal(res.journalAdvanceAttempted, false);
+        assert.equal(res.uncertain, true);
+      } finally {
+        fs.renameSync = origRename;
+        fs.lstatSync = origLstat;
+      }
+    });
+
+    test('F1-C & F1-D: post-swap target pathname EACCES records observedTargetState: inaccessible and code: EACCES', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'post-swap eacces')) return;
+
+      const repo = setupDisposableRepo('tx-swap-c2c3-readback-eacces-path-');
+      const { txId, op, lease, candidateFile, liveTarget } = setupTxAtReadyToSwap({
+        repo,
+        op: 'apply',
+      });
+
+      const origLstat = fs.lstatSync;
+      let targetRenamed = false;
+      const origRename = fs.renameSync;
+
+      try {
+        fs.renameSync = (...args) => {
+          origRename(...args);
+          targetRenamed = true;
+        };
+
+        fs.lstatSync = (p, ...rest) => {
+          if (targetRenamed && p === path.resolve(liveTarget)) {
+            const err = new Error('EACCES: permission denied during target pathname lstat');
+            err.code = 'EACCES';
+            throw err;
+          }
+          return origLstat(p, ...rest);
+        };
+
+        const res = await swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+
+        assert.equal(res.ok, false);
+        assert.equal(res.code, 'EACCES');
+        assert.equal(res.stage, 'post-rename-readback');
+        assert.equal(res.observedTargetState, 'inaccessible');
+        assert.equal(res.targetIno, undefined);
+        assert.equal(res.renameConfirmed, true);
+        assert.equal(res.targetDirectoryFsyncConfirmed, true);
+        assert.equal(res.journalAdvanceAttempted, false);
+        assert.equal(res.uncertain, true);
       } finally {
         fs.renameSync = origRename;
         fs.lstatSync = origLstat;
@@ -3292,6 +3496,104 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
         fs.fsyncSync = origFsync;
       }
     });
+
+    test('F1-A & F1-D: unexpected journal exception before publication records null provenance and preserves target replacement evidence', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'unexpected journal exception before pub')) return;
+
+      const repo = setupDisposableRepo('tx-swap-c2c3-jexc-pre-');
+      const { txId, op, lease, candidateFile, liveTarget } = setupTxAtReadyToSwap({
+        repo,
+        op: 'apply',
+      });
+
+      const candIno = fs.statSync(candidateFile).ino;
+
+      const res = await swapVerifiedTarget(
+        { repoRoot: repo, txId, op, lease },
+        {
+          advanceJournalPhaseFn: () => {
+            const err = new Error('Simulated process panic before journal publication');
+            err.code = 'ENOSPC';
+            throw err;
+          },
+        }
+      );
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'ENOSPC');
+      assert.equal(res.stage, 'journal-advancement');
+      assert.equal(res.renameConfirmed, true);
+      assert.equal(res.targetDirectoryFsyncConfirmed, true);
+      assert.equal(res.observedTargetState, 'result');
+      assert.equal(res.candidateConsumed, true);
+      assert.equal(res.targetIno, candIno);
+
+      assert.equal(res.journalAdvanceAttempted, true);
+      assert.equal(res.publicationAttempted, null, 'publicationAttempted must be null when advance throws');
+      assert.equal(res.publicationConfirmed, null, 'publicationConfirmed must be null when advance throws');
+      assert.equal(res.directoryFsyncAttempted, null, 'directoryFsyncAttempted must be null when advance throws');
+      assert.equal(res.directoryFsyncConfirmed, null, 'directoryFsyncConfirmed must be null when advance throws');
+      assert.equal(res.observedJournalPhase, null);
+      assert.equal(res.durabilityUncertain, true);
+      assert.equal(res.uncertain, true);
+
+      // Verify on-disk state in disposable fixture
+      const journal = inspectJournal(repo);
+      assert.equal(journal.journal.phase, 'READY_TO_SWAP', 'Journal must remain READY_TO_SWAP on disk');
+      assert.equal(fs.existsSync(candidateFile), false, 'Candidate must be consumed on disk');
+      assert.equal(fs.statSync(liveTarget).ino, candIno, 'Live target was replaced on disk');
+    });
+
+    test('F1-A & F1-D: unexpected journal exception after publication records null provenance and preserves target replacement evidence', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'unexpected journal exception after pub')) return;
+
+      const repo = setupDisposableRepo('tx-swap-c2c3-jexc-post-');
+      const { txId, op, lease, candidateFile, liveTarget } = setupTxAtReadyToSwap({
+        repo,
+        op: 'apply',
+      });
+
+      const candIno = fs.statSync(candidateFile).ino;
+
+      const res = await swapVerifiedTarget(
+        { repoRoot: repo, txId, op, lease },
+        {
+          advanceJournalPhaseFn: (args) => {
+            // Advance the journal on disk for real
+            const realRes = advanceJournalPhase(args);
+            assert.equal(realRes.ok, true, 'Real journal advancement must succeed');
+            // Then throw an unexpected runtime error without returning structured JH2 result
+            const err = new Error('Simulated runtime error after journal publication');
+            err.code = 'EUNEXPECTED';
+            throw err;
+          },
+        }
+      );
+
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'EUNEXPECTED');
+      assert.equal(res.stage, 'journal-advancement');
+      assert.equal(res.renameConfirmed, true);
+      assert.equal(res.targetDirectoryFsyncConfirmed, true);
+      assert.equal(res.observedTargetState, 'result');
+      assert.equal(res.candidateConsumed, true);
+      assert.equal(res.targetIno, candIno);
+
+      assert.equal(res.journalAdvanceAttempted, true);
+      assert.equal(res.publicationAttempted, null, 'publicationAttempted must be null on unexpected throw');
+      assert.equal(res.publicationConfirmed, null, 'publicationConfirmed must be null on unexpected throw');
+      assert.equal(res.directoryFsyncAttempted, null, 'directoryFsyncAttempted must be null on unexpected throw');
+      assert.equal(res.directoryFsyncConfirmed, null, 'directoryFsyncConfirmed must be null on unexpected throw');
+      assert.equal(res.observedJournalPhase, null);
+      assert.equal(res.durabilityUncertain, true);
+      assert.equal(res.uncertain, true);
+
+      // Verify on-disk state in disposable fixture
+      const journal = inspectJournal(repo);
+      assert.equal(journal.journal.phase, 'SWAPPED', 'Journal is SWAPPED on disk');
+      assert.equal(fs.existsSync(candidateFile), false, 'Candidate must be consumed on disk');
+      assert.equal(fs.statSync(liveTarget).ino, candIno, 'Live target was replaced on disk');
+    });
   });
 
   describe('Descriptor Ownership, Cleanup, and Error Diagnostics', () => {
@@ -3451,6 +3753,55 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
         fs.renameSync = origRename;
         fs.closeSync = origClose;
       }
+    });
+
+    test('F1-D: intentional crash fault after actual target replacement but before journal advancement', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'crash fault after swap before journal')) return;
+
+      const baselineFds = fs.readdirSync('/proc/self/fd').length;
+      const repo = setupDisposableRepo('tx-swap-c2c3-panic-after-swap-');
+      const { txId, op, lease, candidateFile, liveTarget } = setupTxAtReadyToSwap({
+        repo,
+        op: 'apply',
+      });
+
+      const candIno = fs.statSync(candidateFile).ino;
+      let hookCalled = false;
+
+      await assert.rejects(
+        async () => {
+          await swapVerifiedTarget(
+            { repoRoot: repo, txId, op, lease },
+            {
+              beforeJournalAdvanceHook: () => {
+                hookCalled = true;
+                const fault = new Error('Intentional crash panic after target swap before journal advance');
+                fault._isFault = true;
+                throw fault;
+              },
+            }
+          );
+        },
+        (err) => {
+          assert.equal(err._isFault, true, 'Intentional crash fault must propagate unchanged');
+          assert.match(err.message, /Intentional crash panic after target swap before journal advance/);
+          return true;
+        }
+      );
+
+      assert.equal(hookCalled, true, 'Hook must have been invoked');
+
+      // 1. Verify descriptors were closed unconditionally
+      const currentFds = fs.readdirSync('/proc/self/fd').length;
+      assert.equal(currentFds, baselineFds, 'File descriptors must be cleaned up on crash fault');
+
+      // 2. Verify on-disk replacement: live target replaced, candidate consumed
+      assert.equal(fs.statSync(liveTarget).ino, candIno, 'Target was actually replaced on disk');
+      assert.equal(fs.existsSync(candidateFile), false, 'Candidate must be consumed on disk');
+
+      // 3. Verify journal remains at READY_TO_SWAP
+      const journal = inspectJournal(repo);
+      assert.equal(journal.journal.phase, 'READY_TO_SWAP', 'Journal must remain READY_TO_SWAP on disk');
     });
 
     test('zero file descriptor leaks across successful swap and failure paths', async (t) => {

@@ -1712,6 +1712,7 @@ function verifyParentPathnameContinuity(parentFd, absParentDir, expectedStat) {
   try {
     finalParentCheck = fs.lstatSync(absParentDir);
   } catch (err) {
+    if (err?._isFault) throw err;
     const e = new Error(`Destination parent directory disappeared after swap: ${err.message}`);
     e.code = 'parent-dir-continuity-error';
     e.stage = 'destination-parent-continuity';
@@ -2053,6 +2054,59 @@ async function verifyFinalPreRenameGate({
     };
   }
 
+  // 8. Late destination-parent continuity check (immediately before mutation authorization)
+  let lateParentStat;
+  try {
+    lateParentStat = fs.fstatSync(parentFd);
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'parent-dir-continuity-error',
+      stage: 'final-pre-rename-checks',
+      error: `Destination parent descriptor inspection failed during late check: ${err.message}`,
+    };
+  }
+
+  if (
+    !lateParentStat.isDirectory() ||
+    lateParentStat.isSymbolicLink() ||
+    lateParentStat.dev !== auth.parentDev ||
+    lateParentStat.ino !== auth.parentIno
+  ) {
+    return {
+      ok: false,
+      code: 'parent-dir-identity-mismatch',
+      stage: 'final-pre-rename-checks',
+      error: 'Destination parent descriptor identity modified during late check',
+    };
+  }
+
+  let lateParentPathStat;
+  try {
+    lateParentPathStat = fs.lstatSync(absParentDir);
+  } catch (err) {
+    return {
+      ok: false,
+      code: err.code === 'ENOENT' ? 'parent-dir-continuity-error' : (err.code || 'parent-dir-continuity-error'),
+      stage: 'final-pre-rename-checks',
+      error: `Destination parent directory disappeared during late check: ${err.message}`,
+    };
+  }
+
+  if (
+    !lateParentPathStat.isDirectory() ||
+    lateParentPathStat.isSymbolicLink() ||
+    lateParentPathStat.dev !== auth.parentDev ||
+    lateParentPathStat.ino !== auth.parentIno
+  ) {
+    return {
+      ok: false,
+      code: 'parent-dir-continuity-error',
+      stage: 'final-pre-rename-checks',
+      error: 'Destination parent directory pathname replaced or altered during late check',
+    };
+  }
+
   return { ok: true };
 }
 
@@ -2068,9 +2122,10 @@ async function verifyFinalPreRenameGate({
  * @param {string} options.txId - Transaction identifier (ci-tx-...)
  * @param {'apply' | 'remove'} options.op - Operation direction
  * @param {TransactionLease} options.lease - Transaction lease capability
+ * @param {object} [_internalTesting={}] - Private testing harness for fault injection
  * @returns {Promise<object>} Structured SwapResult object
  */
-export async function swapVerifiedTarget(options = {}) {
+export async function swapVerifiedTarget(options = {}, _internalTesting = {}) {
   // 1. Sanitize caller inputs: accept only mandatory arguments
   if (!options || typeof options !== 'object' || Array.isArray(options)) {
     return buildArgumentError('Options must be a non-null plain object');
@@ -2328,12 +2383,14 @@ export async function swapVerifiedTarget(options = {}) {
         try {
           postPathCheck = fs.lstatSync(absTargetPath);
         } catch (err) {
-          observedTargetState = 'missing';
           uncertain = true;
-          const e = new Error(`Live target pathname disappeared after rename: ${err.message}`);
-          e.code = 'target-continuity-error';
-          e.stage = 'post-rename-readback';
-          throw e;
+          if (err.code === 'ENOENT') {
+            observedTargetState = 'missing';
+          } else {
+            observedTargetState = 'inaccessible';
+          }
+          err.stage = 'post-rename-readback';
+          throw err;
         }
 
         if (
@@ -2366,40 +2423,67 @@ export async function swapVerifiedTarget(options = {}) {
         // --- STEP 7: Re-verify destination parent pathname continuity ---
         verifyParentPathnameContinuity(parentFd, absParentDir, auth.parentStat);
 
+        if (typeof _internalTesting?.beforeJournalAdvanceHook === 'function') {
+          _internalTesting.beforeJournalAdvanceHook();
+        }
+
         // --- STEP 8: Advance transaction journal to SWAPPED ---
         journalAdvanceAttempted = true;
         let journalRes;
         try {
-          journalRes = advanceJournalPhase({
+          const advanceFn = typeof _internalTesting?.advanceJournalPhaseFn === 'function'
+            ? _internalTesting.advanceJournalPhaseFn
+            : advanceJournalPhase;
+
+          journalRes = advanceFn({
             repoRoot: normRepo,
             txId: txId.trim(),
             nextPhase: 'SWAPPED',
             lease,
           });
         } catch (jThrewErr) {
-          publicationAttempted = true;
+          if (jThrewErr?._isFault) {
+            inFlightFault = jThrewErr;
+          } else {
+            pendingOutcome = {
+              type: 'failure',
+              err: {
+                error: `Journal advancement threw unexpected exception: ${jThrewErr.message}`,
+                message: jThrewErr.message,
+                code: jThrewErr.code || 'journal-advance-threw',
+                stage: 'journal-advancement',
+                reason: jThrewErr.message,
+                uncertain: true,
+                unexpectedException: true,
+                originalError: jThrewErr,
+              },
+            };
+          }
+          publicationAttempted = null;
           publicationConfirmed = null;
-          directoryFsyncAttempted = false;
-          directoryFsyncConfirmed = false;
+          directoryFsyncAttempted = null;
+          directoryFsyncConfirmed = null;
           observedJournalPhase = null;
           uncertain = true;
-          throw jThrewErr;
+          durabilityUncertain = true;
         }
 
-        publicationAttempted = Boolean(journalRes.publicationAttempted);
-        publicationConfirmed = journalRes.publicationConfirmed !== undefined ? journalRes.publicationConfirmed : null;
-        directoryFsyncAttempted = Boolean(journalRes.directoryFsyncAttempted);
-        directoryFsyncConfirmed = Boolean(journalRes.directoryFsyncConfirmed);
-        observedJournalPhase = journalRes.observedJournalPhase !== undefined ? journalRes.observedJournalPhase : null;
+        if (journalRes) {
+          publicationAttempted = Boolean(journalRes.publicationAttempted);
+          publicationConfirmed = journalRes.publicationConfirmed !== undefined ? journalRes.publicationConfirmed : null;
+          directoryFsyncAttempted = Boolean(journalRes.directoryFsyncAttempted);
+          directoryFsyncConfirmed = Boolean(journalRes.directoryFsyncConfirmed);
+          observedJournalPhase = journalRes.observedJournalPhase !== undefined ? journalRes.observedJournalPhase : null;
 
-        if (!journalRes.ok) {
-          uncertain = true;
-          if (publicationConfirmed === true && !directoryFsyncConfirmed) {
-            durabilityUncertain = true;
+          if (!journalRes.ok) {
+            uncertain = true;
+            if (publicationConfirmed === true && !directoryFsyncConfirmed) {
+              durabilityUncertain = true;
+            }
+            pendingOutcome = { type: 'failure', err: journalRes };
+          } else {
+            pendingOutcome = { type: 'success' };
           }
-          pendingOutcome = { type: 'failure', err: journalRes };
-        } else {
-          pendingOutcome = { type: 'success' };
         }
       }
     }
