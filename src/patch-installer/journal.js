@@ -643,6 +643,7 @@ export function safeUnlinkCreatedFile(targetPath, expectedDev, expectedIno) {
 
   try {
     const check = getPathLstat(targetPath);
+    if (check.error?._isFault) throw check.error;
     if (check.error || !check.exists || check.isSymbolicLink || !check.isFile || !check.stat) {
       return false;
     }
@@ -652,7 +653,8 @@ export function safeUnlinkCreatedFile(targetPath, expectedDev, expectedIno) {
     }
     fs.unlinkSync(targetPath);
     return true;
-  } catch {
+  } catch (err) {
+    if (err?._isFault) throw err;
     return false;
   }
 }
@@ -687,12 +689,16 @@ export function safeUnlinkCreatedFile(targetPath, expectedDev, expectedIno) {
  * }}
  */
 function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}) {
-  const opts = options.options && typeof options.options === 'object' ? { ...options, ...options.options } : options;
-  const constants = opts.constants || fs.constants;
-  const procDir = opts.procDir || '/proc/self/fd';
+  const constants = fs.constants;
+  const procDir = '/proc/self/fd';
   const runFault = (hookStage, ctx = {}) => {
-    if (typeof opts.faultHook === 'function') {
-      opts.faultHook(hookStage, ctx);
+    const faultHook = typeof options?.faultHook === 'function'
+      ? options.faultHook
+      : typeof options?.options?.faultHook === 'function'
+        ? options.options.faultHook
+        : null;
+    if (faultHook) {
+      faultHook(hookStage, ctx);
     }
   };
 
@@ -700,7 +706,6 @@ function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}
   const journalPath = getJournalPath(repoRoot);
   const tmpJournalBase = `.journal.${journal.txId}.tmp`;
   const journalBase = JOURNAL_FILE_NAME;
-  const absTmpJournalPath = path.join(ciPatchDir, tmpJournalBase);
   const absJournalPath = journalPath;
 
   const getObservedPhase = () => {
@@ -848,9 +853,32 @@ function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}
   // 4. Open and authenticate .ci-patch directory descriptor
   const dirOpenFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
   let dirFd = null;
+  let dirCloseError = null;
+  let descriptorCloseUncertain = false;
+  const closeDirFd = () => {
+    if (dirFd !== null) {
+      const fd = dirFd;
+      dirFd = null; // Relinquish ownership immediately; do not retry close!
+      try {
+        fs.closeSync(fd);
+      } catch (err) {
+        if (err?._isFault) throw err;
+        descriptorCloseUncertain = true;
+        dirCloseError = {
+          error: err.message,
+          message: err.message,
+          code: err.code || 'descriptor-close-error',
+          uncertain: true,
+          status: 'failed',
+        };
+      }
+    }
+  };
+
   try {
     dirFd = fs.openSync(ciPatchDir, dirOpenFlags);
   } catch (openDirErr) {
+    if (openDirErr?._isFault) throw openDirErr;
     return fail({
       error: `Failed to open .ci-patch directory descriptor: ${openDirErr.message}`,
       code: openDirErr.code || 'directory-open-failed',
@@ -865,6 +893,7 @@ function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}
     });
   }
 
+  let inFlightException = null;
   let tmpFd = null;
   try {
     const procDirPath = path.join(procDir, String(dirFd));
@@ -872,6 +901,8 @@ function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}
     try {
       dirStat = fs.statSync(procDirPath);
     } catch (procErr) {
+      if (procErr?._isFault) throw procErr;
+      closeDirFd();
       return fail({
         error: `Procfs descriptor path "${procDirPath}" cannot be accessed: ${procErr.message}`,
         code: 'procfs-descriptor-unavailable',
@@ -883,10 +914,13 @@ function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}
         directoryFsyncConfirmed: false,
         uncertain: false,
         observedJournalPhase: isCreation ? null : undefined,
+        descriptorCloseUncertain,
+        closeError: dirCloseError,
       });
     }
 
     if (!dirStat.isDirectory() || (typeof dirStat.isSymbolicLink === 'function' && dirStat.isSymbolicLink())) {
+      closeDirFd();
       return fail({
         error: 'Directory descriptor is not a directory or is a symbolic link',
         code: 'directory-invalid',
@@ -898,10 +932,13 @@ function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}
         directoryFsyncConfirmed: false,
         uncertain: false,
         observedJournalPhase: isCreation ? null : undefined,
+        descriptorCloseUncertain,
+        closeError: dirCloseError,
       });
     }
 
     if (dirStat.dev !== dirLstat.stat.dev || dirStat.ino !== dirLstat.stat.ino) {
+      closeDirFd();
       return fail({
         error: 'Directory descriptor identity does not match preliminary inspection',
         code: 'directory-identity-mismatch',
@@ -913,29 +950,10 @@ function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}
         directoryFsyncConfirmed: false,
         uncertain: false,
         observedJournalPhase: isCreation ? null : undefined,
+        descriptorCloseUncertain,
+        closeError: dirCloseError,
       });
     }
-
-    let dirCloseError = null;
-    let descriptorCloseUncertain = false;
-    const closeDirFd = () => {
-      if (dirFd !== null) {
-        const fd = dirFd;
-        dirFd = null; // Relinquish ownership immediately; do not retry close!
-        try {
-          fs.closeSync(fd);
-        } catch (err) {
-          descriptorCloseUncertain = true;
-          dirCloseError = {
-            error: err.message,
-            message: err.message,
-            code: err.code || 'descriptor-close-error',
-            uncertain: true,
-            status: 'failed',
-          };
-        }
-      }
-    };
 
     const procTmpJournalPath = path.join(procDirPath, tmpJournalBase);
     const procJournalPath = path.join(procDirPath, journalBase);
@@ -1060,42 +1078,60 @@ function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}
         // Primary error occurred AND secondary close failed!
         // Descriptor cleanup is uncertain: preserve evidence! Do NOT unlink!
         closeDirFd();
+        const combinedCloseErr = dirCloseError
+          ? { ...tmpCloseError, secondaryDirCloseError: dirCloseError }
+          : tmpCloseError;
         return fail({
           stage: isCreation ? 'pre-publication' : 'pre-rename',
           error: `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${primaryErr.message}`,
           code: primaryErr.code || 'write-error',
+          reason: primaryErr.message,
           publicationAttempted: false,
           publicationConfirmed: false,
           directoryFsyncAttempted: false,
           directoryFsyncConfirmed: false,
           uncertain: false,
           descriptorCloseUncertain: true,
-          closeError: tmpCloseError,
+          closeError: combinedCloseErr,
         });
       }
 
+      let cleanupFailed = false;
+      let cleanupErr = null;
       if (fileCreatedByUs) {
-        // Safely unlink ONLY if we created it, its identity matches, and close succeeded cleanly.
-        // Try descriptor-anchored path first while dirFd is still open, with abs path fallback.
+        // Safely unlink ONLY if we created it, its identity matches, and descriptor close succeeded cleanly.
+        // Cleanup MUST remain strictly anchored to the authenticated directory descriptor (procTmpJournalPath).
+        // NEVER retry through the absolute pathname!
         const unlinked = safeUnlinkCreatedFile(procTmpJournalPath, createdDev, createdIno);
         if (!unlinked) {
-          safeUnlinkCreatedFile(absTmpJournalPath, createdDev, createdIno);
+          cleanupFailed = true;
+          const check = getPathLstat(procTmpJournalPath);
+          if (check.error) {
+            cleanupErr = check.error;
+          } else if (check.exists) {
+            cleanupErr = new Error('Temporary journal artifact could not be securely unlinked through directory descriptor');
+            cleanupErr.code = 'cleanup-failed';
+          }
         }
       }
 
       closeDirFd();
 
+      const combinedCloseErr = dirCloseError || tmpCloseError;
       return fail({
         stage: isCreation ? 'pre-publication' : 'pre-rename',
-        error: `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${primaryErr.message}`,
+        error: cleanupFailed && cleanupErr
+          ? `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${primaryErr.message} (cleanup failed: ${cleanupErr.message})`
+          : `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${primaryErr.message}`,
         code: primaryErr.code || 'write-error',
+        reason: primaryErr.message,
         publicationAttempted: false,
         publicationConfirmed: false,
         directoryFsyncAttempted: false,
         directoryFsyncConfirmed: false,
-        uncertain: false,
-        descriptorCloseUncertain,
-        closeError: dirCloseError,
+        uncertain: cleanupFailed, // If cleanup could not be completed/verified, report cleanup uncertainty accurately
+        descriptorCloseUncertain: Boolean(descriptorCloseUncertain || tmpCloseError),
+        closeError: combinedCloseErr || undefined,
       });
     }
 
@@ -1241,14 +1277,51 @@ function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}
       runFault('before-link-cleanup', { procTmpJournalPath, createdDev, createdIno });
       let unlinkErr = null;
       try {
-        const unlinked = safeUnlinkCreatedFile(procTmpJournalPath, createdDev, createdIno);
-        if (!unlinked) {
-          const check = getPathLstat(procTmpJournalPath);
-          if (check.exists) {
-            throw new Error('Temporary link ownership or identity could not be verified for removal');
+        const check = getPathLstat(procTmpJournalPath);
+        if (check.error?._isFault) throw check.error;
+        if (check.error) {
+          // Case 3: Filesystem inspection failure
+          unlinkErr = new Error(`Failed to inspect temporary link path: ${check.error.message}`);
+          unlinkErr.code = check.error.code || 'inspection-error';
+        } else if (!check.exists) {
+          // Case 2: Confirmed ENOENT - temporary link already absent
+          unlinkErr = null;
+        } else if (check.isSymbolicLink) {
+          // Case 4: Temporary pathname replaced by symbolic link
+          unlinkErr = new Error('Temporary link pathname replaced by symbolic link');
+          unlinkErr.code = 'unsafe-symlink';
+        } else if (!check.isFile) {
+          // Case 4: Temporary pathname replaced by non-regular file
+          unlinkErr = new Error('Temporary link pathname replaced by non-regular file');
+          unlinkErr.code = 'temporary-link-replaced';
+        } else if (!check.stat || check.stat.dev !== createdDev || check.stat.ino !== createdIno) {
+          // Case 5: Identity verification failure
+          unlinkErr = new Error('Temporary link device or inode identity does not match created artifact');
+          unlinkErr.code = 'identity-mismatch';
+        } else {
+          // Case 1 & 6: Identity verified, attempt unlink syscall
+          try {
+            fs.unlinkSync(procTmpJournalPath);
+            // Verify removal after unlink
+            const postUnlinkCheck = getPathLstat(procTmpJournalPath);
+            if (postUnlinkCheck.error?._isFault) throw postUnlinkCheck.error;
+            if (postUnlinkCheck.error) {
+              unlinkErr = new Error(`Failed to verify temporary link removal: ${postUnlinkCheck.error.message}`);
+              unlinkErr.code = postUnlinkCheck.error.code || 'inspection-error';
+            } else if (postUnlinkCheck.exists) {
+              unlinkErr = new Error('Temporary link remains present after unlink');
+              unlinkErr.code = 'cleanup-failed';
+            }
+          } catch (err) {
+            if (err?._isFault) throw err;
+            // Case 6: Unlink syscall failure
+            unlinkErr = new Error(`Failed to unlink temporary link: ${err.message}`);
+            unlinkErr.code = 'cleanup-failed';
+            unlinkErr.syscallError = err;
           }
         }
       } catch (err) {
+        if (err?._isFault) throw err;
         unlinkErr = err;
       }
 
@@ -1381,20 +1454,43 @@ function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}
       observedJournalPhase: journal.phase,
       journal,
     };
+  } catch (err) {
+    inFlightException = err;
+    throw err;
   } finally {
     if (dirFd !== null) {
       const fd = dirFd;
       dirFd = null;
       try {
         fs.closeSync(fd);
-      } catch {}
+      } catch (closeErr) {
+        if (inFlightException && typeof inFlightException === 'object' && !inFlightException.closeError) {
+          inFlightException.closeError = {
+            error: closeErr.message,
+            message: closeErr.message,
+            code: closeErr.code || 'descriptor-close-error',
+            uncertain: true,
+            status: 'failed',
+          };
+        }
+      }
     }
     if (tmpFd !== null) {
       const fd = tmpFd;
       tmpFd = null;
       try {
         fs.closeSync(fd);
-      } catch {}
+      } catch (closeErr) {
+        if (inFlightException && typeof inFlightException === 'object' && !inFlightException.closeError) {
+          inFlightException.closeError = {
+            error: closeErr.message,
+            message: closeErr.message,
+            code: closeErr.code || 'descriptor-close-error',
+            uncertain: true,
+            status: 'failed',
+          };
+        }
+      }
     }
   }
 }
