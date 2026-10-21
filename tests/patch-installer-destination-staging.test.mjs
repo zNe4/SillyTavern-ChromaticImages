@@ -2134,3 +2134,48 @@ describe('P3B-2C: Authentic SillyTavern Fixture Integration Tests', () => {
     assert.equal(currentLiveStat.ino, initialStat.ino);
   });
 });
+
+describe('D01-P3B-2D-2-C-JH2: Journal Advancement Uncertainty Propagation in Destination Staging', () => {
+  test('stageDestinationCandidate propagates uncertain journal advancement failure with structured schema', async () => {
+    const repo = setupDisposableRepo('jh2-dest-adv-');
+    const tx = setupAuthenticBackupCreatedTx({ repo });
+
+    const origRenameSync = fs.renameSync;
+    try {
+      fs.renameSync = (src, dst) => {
+        if (typeof src === 'string' && src.includes(`.journal.${tx.txId}.tmp`)) {
+          const err = new Error('Simulated rename interruption during destination candidate advancement');
+          err.code = 'EIO';
+          throw err;
+        }
+        return origRenameSync(src, dst);
+      };
+
+      const res = await stageDestinationCandidate({
+        repoRoot: repo,
+        txId: tx.txId,
+        op: 'apply',
+        lease: tx.lease,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.uncertain, true);
+      assert.equal(res.publicationAttempted, true);
+      assert.equal(res.publicationConfirmed, null);
+      assert.equal(res.directoryFsyncConfirmed, false);
+      assert.equal(res.stage, 'rename-attempted');
+      assert.equal(res.code, 'EIO');
+      assert.match(res.error, /Failed to advance journal to READY_TO_SWAP/);
+
+      // Verify candidate was NOT deleted and is preserved for evidence
+      const candidateFile = path.join(repo, `src/endpoints/.stable-diffusion.js.ci-staged-${tx.txId}.tmp`);
+      assert.equal(fs.existsSync(candidateFile), true, 'Candidate file must be preserved for evidence');
+
+      // Verify journal remains at previous phase
+      const jInspect = inspectJournal(repo);
+      assert.equal(jInspect.journal?.phase, 'BACKUP_CREATED');
+    } finally {
+      fs.renameSync = origRenameSync;
+    }
+  });
+});

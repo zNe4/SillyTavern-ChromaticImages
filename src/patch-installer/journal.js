@@ -103,6 +103,13 @@ export function verifyLockOwnershipForMutation(repoRoot, txId, expectedOp, lease
 
   const lockInspection = inspectLock(repoRoot);
   if (!lockInspection.hasLock) {
+    if (lockInspection.isSymlink) {
+      return {
+        ok: false,
+        error: 'ci-patch-symlink',
+        reason: 'Installer directory .ci-patch is a symbolic link',
+      };
+    }
     return {
       ok: false,
       error: 'no-lock',
@@ -518,6 +525,81 @@ export function isValidDeviceIdentifier(val) {
 }
 
 /**
+ * Validate open constant (e.g. O_DIRECTORY, O_NOFOLLOW).
+ * Must be a finite non-zero positive integer.
+ * Rejects missing, zero, NaN, Infinity, negative, fractional, and non-numeric values.
+ *
+ * @param {unknown} val
+ * @returns {boolean}
+ */
+export function isValidOpenConstant(val) {
+  return (
+    typeof val === 'number' &&
+    Number.isFinite(val) &&
+    !Number.isNaN(val) &&
+    Number.isInteger(val) &&
+    val > 0
+  );
+}
+
+/**
+ * Validate read-only open constant (O_RDONLY). Must be a finite non-negative integer.
+ * In POSIX/Linux, O_RDONLY is 0.
+ * Rejects missing, NaN, Infinity, negative, fractional, and non-numeric values.
+ *
+ * @param {unknown} val
+ * @returns {boolean}
+ */
+export function isValidReadOnlyConstant(val) {
+  return (
+    typeof val === 'number' &&
+    Number.isFinite(val) &&
+    !Number.isNaN(val) &&
+    Number.isInteger(val) &&
+    val >= 0
+  );
+}
+
+/**
+ * Shared interpretation contract for journal advancement failures across transaction stages.
+ * Propagates uncertainty, publication confirmation, directory fsync confirmation,
+ * observed disk phase, primary failure code/stage/reason, and descriptor close diagnostics.
+ *
+ * @param {object} advanceRes
+ * @param {string} targetPhase
+ * @returns {object}
+ */
+export function formatJournalAdvancementFailure(advanceRes, targetPhase) {
+  const result = {
+    ok: false,
+    error: `Failed to advance journal to ${targetPhase}: ${advanceRes.error || advanceRes.reason || 'unknown error'}`,
+    code: advanceRes.code || 'journal-advancement-failed',
+    stage: advanceRes.stage,
+    uncertain: Boolean(advanceRes.uncertain),
+    publicationAttempted: Boolean(advanceRes.publicationAttempted),
+    publicationConfirmed: advanceRes.publicationConfirmed !== undefined ? advanceRes.publicationConfirmed : null,
+    directoryFsyncAttempted: Boolean(advanceRes.directoryFsyncAttempted),
+    directoryFsyncConfirmed: Boolean(advanceRes.directoryFsyncConfirmed),
+    observedJournalPhase: advanceRes.observedJournalPhase !== undefined ? advanceRes.observedJournalPhase : null,
+  };
+
+  if (advanceRes.reason) {
+    result.reason = advanceRes.reason;
+  }
+  if (advanceRes.descriptorCloseUncertain) {
+    result.descriptorCloseUncertain = true;
+  }
+  if (advanceRes.closeError) {
+    result.closeError = advanceRes.closeError;
+  }
+  if (advanceRes.journal) {
+    result.journal = advanceRes.journal;
+  }
+
+  return result;
+}
+
+/**
  * Validate inode identifier. Must be a finite positive (nonzero) integer (Number or BigInt).
  * In POSIX/Linux, inode 0 indicates an unused or sentinel inode.
  * Rejects null, undefined, NaN, zero, negative numbers, floats, strings, and non-numerics.
@@ -576,292 +658,744 @@ export function safeUnlinkCreatedFile(targetPath, expectedDev, expectedIno) {
 }
 
 /**
- * Atomically write and flush journal to disk with distinct pre-publication and post-publication error handling.
- * Employs atomic no-replace publication via same-directory hard link (link(2)) for initial creation.
- * Employs atomic replacement via rename(2) for later phase updates.
+ * Atomically write and flush journal to disk with descriptor-anchored operations,
+ * distinct pre-publication and post-publication error handling, and structured publication outcome.
+ * Employs atomic no-replace publication via descriptor-anchored hard link (link(2)) for initial creation.
+ * Employs atomic replacement via descriptor-anchored rename (rename(2)) for later phase updates.
  * Never unlinks a pre-existing temporary journal upon collision (EEXIST).
  * Positively verifies created file ownership and identity before permitted cleanup.
  *
  * @param {string} repoRoot
  * @param {object} journal
  * @param {boolean} [isCreation=false]
+ * @param {object} [options={}]
  * @returns {{
  *   ok: boolean,
  *   error?: string,
  *   code?: string,
- *   stage?: 'pre-publication' | 'post-publication' | 'pre-rename' | 'post-rename',
+ *   stage: string,
+ *   reason?: string,
+ *   publicationAttempted: boolean,
+ *   publicationConfirmed: boolean | null,
+ *   directoryFsyncAttempted: boolean,
+ *   directoryFsyncConfirmed: boolean,
+ *   uncertain: boolean,
+ *   observedJournalPhase: string | null,
  *   journal?: object,
  *   descriptorCloseUncertain?: boolean,
  *   closeError?: object
  * }}
  */
-function writeJournalDurable(repoRoot, journal, isCreation = false) {
+function writeJournalDurable(repoRoot, journal, isCreation = false, options = {}) {
+  const opts = options.options && typeof options.options === 'object' ? { ...options, ...options.options } : options;
+  const constants = opts.constants || fs.constants;
+  const procDir = opts.procDir || '/proc/self/fd';
+  const runFault = (hookStage, ctx = {}) => {
+    if (typeof opts.faultHook === 'function') {
+      opts.faultHook(hookStage, ctx);
+    }
+  };
+
   const ciPatchDir = getCiPatchDir(repoRoot);
   const journalPath = getJournalPath(repoRoot);
-  const tmpJournalPath = path.join(ciPatchDir, `.journal.${journal.txId}.tmp`);
+  const tmpJournalBase = `.journal.${journal.txId}.tmp`;
+  const journalBase = JOURNAL_FILE_NAME;
+  const absTmpJournalPath = path.join(ciPatchDir, tmpJournalBase);
+  const absJournalPath = journalPath;
 
-  // If this is initial creation, ensure destination doesn't exist before starting
-  if (isCreation) {
-    const jCheck = getPathLstat(journalPath);
-    if (jCheck.exists) {
-      return {
-        ok: false,
-        stage: 'pre-publication',
-        error: 'Cannot create journal: a journal already exists on disk',
-      };
-    }
-  }
-
-  const serialized = JSON.stringify(journal, null, 2) + '\n';
-  const serializedBuffer = Buffer.from(serialized, 'utf8');
-  const expectedBytes = serializedBuffer.length;
-
-  // 1. Exclusive temporary file creation, bounded complete write, and fsync
-  let tmpFd = null;
-  let createdDev = null;
-  let createdIno = null;
-  let fileCreatedByUs = false;
-  let primaryErr = null;
-
-  try {
-    tmpFd = fs.openSync(
-      tmpJournalPath,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
-      0o600
-    );
-    fileCreatedByUs = true;
-    const stat = fs.fstatSync(tmpFd);
-    if (!isValidDeviceIdentifier(stat?.dev) || !isValidInodeIdentifier(stat?.ino)) {
-      throw new Error(`Failed to establish usable file identity: dev=${stat?.dev}, ino=${stat?.ino}`);
-    }
-    createdDev = stat.dev;
-    createdIno = stat.ino;
-
-    let bytesWrittenTotal = 0;
-    while (bytesWrittenTotal < expectedBytes) {
-      let bytesWritten;
-      if (bytesWrittenTotal === 0) {
-        // Pass serialized string with explicit 'utf8' encoding and byte offset 0.
-        // This preserves backward compatibility with Stage B/C test mocks that intercept
-        // journal writes by inspecting typeof data === 'string' && data.includes(phase),
-        // while tracking exact bytes returned by the underlying write syscall.
-        bytesWritten = fs.writeSync(tmpFd, serialized, 0, 'utf8');
-      } else {
-        // For subsequent chunks after a partial write, write directly from the UTF-8 buffer
-        // using exact byte offsets to prevent any string character count discrepancies.
-        bytesWritten = fs.writeSync(
-          tmpFd,
-          serializedBuffer,
-          bytesWrittenTotal,
-          expectedBytes - bytesWrittenTotal,
-          bytesWrittenTotal
-        );
-      }
-
-      if (
-        typeof bytesWritten !== 'number' ||
-        !Number.isInteger(bytesWritten) ||
-        bytesWritten <= 0 ||
-        bytesWritten > (expectedBytes - bytesWrittenTotal)
-      ) {
-        const err = new Error(
-          `Non-positive or invalid progress writing temporary journal: wrote ${bytesWrittenTotal} of ${expectedBytes} bytes (last write returned ${bytesWritten})`
-        );
-        err.code = 'short-write';
-        throw err;
-      }
-
-      bytesWrittenTotal += bytesWritten;
-    }
-
-    fs.fsyncSync(tmpFd);
-  } catch (writeErr) {
-    primaryErr = writeErr;
-  }
-
-  // Handle temporary descriptor closure before publication (JH1-B)
-  let closeError = null;
-  if (tmpFd !== null) {
-    const fdToClose = tmpFd;
-    tmpFd = null; // Relinquish ownership immediately; do not retry close!
+  const getObservedPhase = () => {
     try {
-      fs.closeSync(fdToClose);
-    } catch (closeErr) {
-      closeError = {
-        error: closeErr.message,
-        message: closeErr.message,
-        code: closeErr.code || 'descriptor-close-error',
-        uncertain: true,
-        status: 'failed',
-      };
+      const insp = inspectJournal(repoRoot);
+      if (insp.hasJournal && insp.journal?.phase) {
+        return insp.journal.phase;
+      }
+    } catch {}
+    return null;
+  };
+
+  const fail = ({
+    error,
+    code,
+    reason,
+    stage,
+    publicationAttempted = false,
+    publicationConfirmed = false,
+    directoryFsyncAttempted = false,
+    directoryFsyncConfirmed = false,
+    uncertain = false,
+    observedJournalPhase = undefined,
+    descriptorCloseUncertain = false,
+    closeError = undefined,
+    journal: resJournal = undefined,
+  }) => {
+    const finalObserved = observedJournalPhase !== undefined ? observedJournalPhase : getObservedPhase();
+    const res = {
+      ok: false,
+      error,
+      code: code || 'journal-publication-failed',
+      stage: stage || (isCreation ? 'pre-publication' : 'pre-rename'),
+      reason: reason || error,
+      publicationAttempted,
+      publicationConfirmed,
+      directoryFsyncAttempted,
+      directoryFsyncConfirmed,
+      uncertain,
+      observedJournalPhase: finalObserved,
+    };
+    if (descriptorCloseUncertain) {
+      res.descriptorCloseUncertain = true;
     }
+    if (closeError) {
+      res.closeError = closeError;
+    }
+    if (resJournal) {
+      res.journal = resJournal;
+    }
+    return res;
+  };
+
+  // 1. Validate platform open constants: O_RDONLY, O_DIRECTORY, O_NOFOLLOW
+  if (
+    !constants ||
+    !isValidReadOnlyConstant(constants.O_RDONLY) ||
+    !isValidOpenConstant(constants.O_DIRECTORY) ||
+    !isValidOpenConstant(constants.O_NOFOLLOW)
+  ) {
+    return fail({
+      error: 'Platform capabilities missing or invalid: fs.constants.O_RDONLY, O_DIRECTORY, and O_NOFOLLOW are required for durable journal publication',
+      code: 'unsupported-platform',
+      reason: 'O_DIRECTORY and O_NOFOLLOW capabilities required',
+      stage: isCreation ? 'pre-publication' : 'pre-rename',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: isCreation ? null : undefined,
+    });
   }
 
-  if (primaryErr !== null) {
-    if (primaryErr.code === 'EEXIST') {
-      // PRESERVE PRE-EXISTING ARTIFACT: do NOT unlink!
-      return {
-        ok: false,
+  // 2. Authenticate .ci-patch directory without symlinks
+  const ciPatchCheck = validateCiPatchPath(repoRoot);
+  if (!ciPatchCheck.ok || ciPatchCheck.isSymlink) {
+    return fail({
+      error: ciPatchCheck.error || 'Directory component ".ci-patch" is a symbolic link',
+      code: ciPatchCheck.isSymlink ? 'unsafe-symlink' : 'invalid-ci-patch',
+      reason: ciPatchCheck.error || 'Directory component ".ci-patch" is a symbolic link',
+      stage: isCreation ? 'pre-publication' : 'pre-rename',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: null,
+    });
+  }
+
+  const dirLstat = getPathLstat(ciPatchDir);
+  if (dirLstat.error || !dirLstat.exists || !dirLstat.isDirectory || dirLstat.isSymbolicLink || !dirLstat.stat) {
+    return fail({
+      error: `Directory "${ciPatchDir}" does not exist, is not a directory, or is a symbolic link`,
+      code: dirLstat.isSymbolicLink ? 'unsafe-symlink' : 'invalid-ci-patch',
+      reason: dirLstat.error ? dirLstat.error.message : 'Directory invalid',
+      stage: isCreation ? 'pre-publication' : 'pre-rename',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: null,
+    });
+  }
+
+  if (!isValidDeviceIdentifier(dirLstat.stat.dev) || !isValidInodeIdentifier(dirLstat.stat.ino)) {
+    return fail({
+      error: `Directory "${ciPatchDir}" has invalid device or inode identity`,
+      code: 'directory-invalid',
+      reason: 'Invalid device or inode identifier',
+      stage: isCreation ? 'pre-publication' : 'pre-rename',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: null,
+    });
+  }
+
+  // 3. Verify procfs availability
+  let procAvailable = false;
+  try {
+    procAvailable = typeof procDir === 'string' && fs.existsSync(procDir);
+  } catch {
+    procAvailable = false;
+  }
+  if (!procAvailable) {
+    return fail({
+      error: `Procfs descriptor directory "${procDir}" is unavailable`,
+      code: 'procfs-unavailable',
+      reason: 'Procfs descriptor anchoring unavailable',
+      stage: isCreation ? 'pre-publication' : 'pre-rename',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: isCreation ? null : undefined,
+    });
+  }
+
+  // 4. Open and authenticate .ci-patch directory descriptor
+  const dirOpenFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+  let dirFd = null;
+  try {
+    dirFd = fs.openSync(ciPatchDir, dirOpenFlags);
+  } catch (openDirErr) {
+    return fail({
+      error: `Failed to open .ci-patch directory descriptor: ${openDirErr.message}`,
+      code: openDirErr.code || 'directory-open-failed',
+      reason: openDirErr.message,
+      stage: isCreation ? 'pre-publication' : 'pre-rename',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: isCreation ? null : undefined,
+    });
+  }
+
+  let tmpFd = null;
+  try {
+    const procDirPath = path.join(procDir, String(dirFd));
+    let dirStat;
+    try {
+      dirStat = fs.statSync(procDirPath);
+    } catch (procErr) {
+      return fail({
+        error: `Procfs descriptor path "${procDirPath}" cannot be accessed: ${procErr.message}`,
+        code: 'procfs-descriptor-unavailable',
+        reason: procErr.message,
         stage: isCreation ? 'pre-publication' : 'pre-rename',
-        error: `Cannot prepare temporary journal: pre-existing temporary artifact "${path.basename(tmpJournalPath)}" already exists (collision)`,
-        code: 'EEXIST',
-      };
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        observedJournalPhase: isCreation ? null : undefined,
+      });
     }
 
-    if (closeError !== null) {
-      // Primary error occurred AND secondary close failed!
-      // Descriptor cleanup is uncertain: preserve evidence! Do NOT unlink!
-      return {
-        ok: false,
+    if (!dirStat.isDirectory() || (typeof dirStat.isSymbolicLink === 'function' && dirStat.isSymbolicLink())) {
+      return fail({
+        error: 'Directory descriptor is not a directory or is a symbolic link',
+        code: 'directory-invalid',
+        reason: 'Descriptor is not a directory',
+        stage: isCreation ? 'pre-publication' : 'pre-rename',
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        observedJournalPhase: isCreation ? null : undefined,
+      });
+    }
+
+    if (dirStat.dev !== dirLstat.stat.dev || dirStat.ino !== dirLstat.stat.ino) {
+      return fail({
+        error: 'Directory descriptor identity does not match preliminary inspection',
+        code: 'directory-identity-mismatch',
+        reason: 'Device or inode mismatch on directory open',
+        stage: isCreation ? 'pre-publication' : 'pre-rename',
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        observedJournalPhase: isCreation ? null : undefined,
+      });
+    }
+
+    let dirCloseError = null;
+    let descriptorCloseUncertain = false;
+    const closeDirFd = () => {
+      if (dirFd !== null) {
+        const fd = dirFd;
+        dirFd = null; // Relinquish ownership immediately; do not retry close!
+        try {
+          fs.closeSync(fd);
+        } catch (err) {
+          descriptorCloseUncertain = true;
+          dirCloseError = {
+            error: err.message,
+            message: err.message,
+            code: err.code || 'descriptor-close-error',
+            uncertain: true,
+            status: 'failed',
+          };
+        }
+      }
+    };
+
+    const procTmpJournalPath = path.join(procDirPath, tmpJournalBase);
+    const procJournalPath = path.join(procDirPath, journalBase);
+
+    // 5. If this is initial creation, ensure destination doesn't exist before starting
+    if (isCreation) {
+      const jCheck = getPathLstat(journalPath);
+      if (jCheck.exists) {
+        closeDirFd();
+        return fail({
+          error: 'Cannot create journal: a journal already exists on disk',
+          code: 'EEXIST',
+          stage: 'pre-publication',
+          publicationAttempted: false,
+          publicationConfirmed: false,
+          directoryFsyncAttempted: false,
+          directoryFsyncConfirmed: false,
+          uncertain: false,
+          descriptorCloseUncertain,
+          closeError: dirCloseError,
+        });
+      }
+    }
+
+    // 6. Exclusive temporary file creation, complete bounded write, and fsync
+    const serialized = JSON.stringify(journal, null, 2) + '\n';
+    const serializedBuffer = Buffer.from(serialized, 'utf8');
+    const expectedBytes = serializedBuffer.length;
+
+    let createdDev = null;
+    let createdIno = null;
+    let fileCreatedByUs = false;
+    let primaryErr = null;
+
+    try {
+      tmpFd = fs.openSync(
+        procTmpJournalPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600
+      );
+      fileCreatedByUs = true;
+      const stat = fs.fstatSync(tmpFd);
+      if (!isValidDeviceIdentifier(stat?.dev) || !isValidInodeIdentifier(stat?.ino)) {
+        throw new Error(`Failed to establish usable file identity: dev=${stat?.dev}, ino=${stat?.ino}`);
+      }
+      createdDev = stat.dev;
+      createdIno = stat.ino;
+
+      let bytesWrittenTotal = 0;
+      while (bytesWrittenTotal < expectedBytes) {
+        let bytesWritten;
+        if (bytesWrittenTotal === 0) {
+          bytesWritten = fs.writeSync(tmpFd, serialized, 0, 'utf8');
+        } else {
+          bytesWritten = fs.writeSync(
+            tmpFd,
+            serializedBuffer,
+            bytesWrittenTotal,
+            expectedBytes - bytesWrittenTotal,
+            bytesWrittenTotal
+          );
+        }
+
+        if (
+          typeof bytesWritten !== 'number' ||
+          !Number.isInteger(bytesWritten) ||
+          bytesWritten <= 0 ||
+          bytesWritten > (expectedBytes - bytesWrittenTotal)
+        ) {
+          const err = new Error(
+            `Non-positive or invalid progress writing temporary journal: wrote ${bytesWrittenTotal} of ${expectedBytes} bytes (last write returned ${bytesWritten})`
+          );
+          err.code = 'short-write';
+          throw err;
+        }
+
+        bytesWrittenTotal += bytesWritten;
+      }
+
+      fs.fsyncSync(tmpFd);
+    } catch (writeErr) {
+      primaryErr = writeErr;
+    }
+
+    // Handle temporary descriptor closure before publication (JH1-B)
+    let tmpCloseError = null;
+    if (tmpFd !== null) {
+      const fdToClose = tmpFd;
+      tmpFd = null; // Relinquish ownership immediately; do not retry close!
+      try {
+        fs.closeSync(fdToClose);
+      } catch (closeErr) {
+        tmpCloseError = {
+          error: closeErr.message,
+          message: closeErr.message,
+          code: closeErr.code || 'descriptor-close-error',
+          uncertain: true,
+          status: 'failed',
+        };
+      }
+    }
+
+    if (primaryErr !== null) {
+      if (primaryErr.code === 'EEXIST') {
+        // PRESERVE PRE-EXISTING ARTIFACT: do NOT unlink!
+        closeDirFd();
+        return fail({
+          stage: isCreation ? 'pre-publication' : 'pre-rename',
+          error: `Cannot prepare temporary journal: pre-existing temporary artifact "${tmpJournalBase}" already exists (collision)`,
+          code: 'EEXIST',
+          publicationAttempted: false,
+          publicationConfirmed: false,
+          directoryFsyncAttempted: false,
+          directoryFsyncConfirmed: false,
+          uncertain: false,
+          descriptorCloseUncertain,
+          closeError: dirCloseError,
+        });
+      }
+
+      if (tmpCloseError !== null) {
+        // Primary error occurred AND secondary close failed!
+        // Descriptor cleanup is uncertain: preserve evidence! Do NOT unlink!
+        closeDirFd();
+        return fail({
+          stage: isCreation ? 'pre-publication' : 'pre-rename',
+          error: `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${primaryErr.message}`,
+          code: primaryErr.code || 'write-error',
+          publicationAttempted: false,
+          publicationConfirmed: false,
+          directoryFsyncAttempted: false,
+          directoryFsyncConfirmed: false,
+          uncertain: false,
+          descriptorCloseUncertain: true,
+          closeError: tmpCloseError,
+        });
+      }
+
+      if (fileCreatedByUs) {
+        // Safely unlink ONLY if we created it, its identity matches, and close succeeded cleanly.
+        // Try descriptor-anchored path first while dirFd is still open, with abs path fallback.
+        const unlinked = safeUnlinkCreatedFile(procTmpJournalPath, createdDev, createdIno);
+        if (!unlinked) {
+          safeUnlinkCreatedFile(absTmpJournalPath, createdDev, createdIno);
+        }
+      }
+
+      closeDirFd();
+
+      return fail({
         stage: isCreation ? 'pre-publication' : 'pre-rename',
         error: `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${primaryErr.message}`,
         code: primaryErr.code || 'write-error',
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        descriptorCloseUncertain,
+        closeError: dirCloseError,
+      });
+    }
+
+    if (tmpCloseError !== null) {
+      // Write and fsync succeeded, but temporary descriptor close failed before publication!
+      // A close error must prevent subsequent linkSync() or renameSync() publication.
+      // Descriptor closure was uncertain: preserve temporary artifact evidence! Do NOT unlink!
+      closeDirFd();
+      return fail({
+        stage: isCreation ? 'pre-publication' : 'pre-rename',
+        error: `Failed to close temporary journal descriptor before ${isCreation ? 'publication' : 'rename'}: ${tmpCloseError.message}`,
+        code: tmpCloseError.code || 'descriptor-close-error',
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
         descriptorCloseUncertain: true,
-        closeError,
-      };
+        closeError: tmpCloseError,
+      });
     }
 
-    if (fileCreatedByUs) {
-      // Safely unlink ONLY if we created it, its identity matches, and close succeeded cleanly
-      safeUnlinkCreatedFile(tmpJournalPath, createdDev, createdIno);
+    // 7. Check directory continuity BEFORE publication
+    runFault('before-publication', { isCreation, procTmpJournalPath, procJournalPath });
+
+    let prePubDirCheck;
+    try {
+      prePubDirCheck = fs.lstatSync(ciPatchDir);
+    } catch (err) {
+      closeDirFd();
+      return fail({
+        stage: isCreation ? 'pre-publication' : 'pre-rename',
+        error: `Directory "${ciPatchDir}" disappeared before publication: ${err.message}`,
+        code: 'directory-continuity-error',
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        descriptorCloseUncertain,
+        closeError: dirCloseError,
+      });
+    }
+
+    if (
+      prePubDirCheck.isSymbolicLink() ||
+      !prePubDirCheck.isDirectory() ||
+      prePubDirCheck.dev !== dirStat.dev ||
+      prePubDirCheck.ino !== dirStat.ino
+    ) {
+      closeDirFd();
+      return fail({
+        stage: isCreation ? 'pre-publication' : 'pre-rename',
+        error: `Directory "${ciPatchDir}" identity changed or replaced before publication`,
+        code: 'directory-identity-mismatch',
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        descriptorCloseUncertain,
+        closeError: dirCloseError,
+      });
+    }
+
+    // 8. ATOMIC PUBLICATION
+    let publicationAttempted = true;
+    let publicationConfirmed = false;
+    let publicationErr = null;
+
+    try {
+      if (isCreation) {
+        fs.linkSync(procTmpJournalPath, procJournalPath);
+      } else {
+        fs.renameSync(procTmpJournalPath, procJournalPath);
+      }
+      publicationConfirmed = true;
+    } catch (pubErr) {
+      publicationConfirmed = null; // Syscall was attempted but threw!
+      publicationErr = pubErr;
+    }
+
+    if (publicationConfirmed === null) {
+      // Syscall was attempted and threw: outcome is UNCERTAIN!
+      // NO SPECULATIVE DELETION OF EVIDENCE: DO NOT UNLINK!
+      closeDirFd();
+      return fail({
+        stage: isCreation ? 'publication-attempted' : 'rename-attempted',
+        error: isCreation
+          ? `Failed to publish journal atomically: ${publicationErr.message}`
+          : `Failed to replace journal atomically: ${publicationErr.message}`,
+        code: publicationErr.code || (isCreation ? 'link-error' : 'rename-error'),
+        reason: publicationErr.message,
+        publicationAttempted: true,
+        publicationConfirmed: null,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: true,
+        descriptorCloseUncertain,
+        closeError: dirCloseError,
+      });
+    }
+
+    runFault('after-publication', { isCreation, procTmpJournalPath, procJournalPath, journal });
+
+    // 9. Initial Directory Fsync
+    let directoryFsyncAttempted = true;
+    let directoryFsyncConfirmed = false;
+    let dirFsyncErr = null;
+
+    try {
+      fs.fsyncSync(dirFd);
+      directoryFsyncConfirmed = true;
+    } catch (err) {
+      dirFsyncErr = err;
+    }
+
+    if (dirFsyncErr !== null) {
+      closeDirFd();
+      return fail({
+        stage: isCreation ? 'post-publication' : 'post-rename',
+        error: isCreation
+          ? `Journal published on disk but initial directory synchronization failed: ${dirFsyncErr.message}`
+          : `Journal updated on disk but directory synchronization failed: ${dirFsyncErr.message}`,
+        code: dirFsyncErr.code || 'fsync-failed',
+        reason: dirFsyncErr.message,
+        publicationAttempted: true,
+        publicationConfirmed: true,
+        directoryFsyncAttempted: true,
+        directoryFsyncConfirmed: false,
+        uncertain: true,
+        journal,
+        observedJournalPhase: journal.phase,
+        descriptorCloseUncertain,
+        closeError: dirCloseError,
+      });
+    }
+
+    runFault('after-directory-fsync', { isCreation, dirFd, journal });
+
+    // 10. For initial creation: Cleanup temporary link and perform second directory sync
+    if (isCreation) {
+      runFault('before-link-cleanup', { procTmpJournalPath, createdDev, createdIno });
+      let unlinkErr = null;
+      try {
+        const unlinked = safeUnlinkCreatedFile(procTmpJournalPath, createdDev, createdIno);
+        if (!unlinked) {
+          const check = getPathLstat(procTmpJournalPath);
+          if (check.exists) {
+            throw new Error('Temporary link ownership or identity could not be verified for removal');
+          }
+        }
+      } catch (err) {
+        unlinkErr = err;
+      }
+
+      if (unlinkErr !== null) {
+        closeDirFd();
+        return fail({
+          stage: 'post-publication',
+          error: `Journal published on disk but removing temporary link failed: ${unlinkErr.message}`,
+          code: unlinkErr.code || 'cleanup-failed',
+          reason: unlinkErr.message,
+          publicationAttempted: true,
+          publicationConfirmed: true,
+          directoryFsyncAttempted: true,
+          directoryFsyncConfirmed: true,
+          uncertain: true,
+          journal,
+          observedJournalPhase: journal.phase,
+          descriptorCloseUncertain,
+          closeError: dirCloseError,
+        });
+      }
+
+      runFault('after-link-cleanup', { dirFd, journal });
+
+      // Second directory sync to flush temporary entry removal
+      let postCleanupSyncErr = null;
+      try {
+        fs.fsyncSync(dirFd);
+      } catch (err) {
+        postCleanupSyncErr = err;
+      }
+
+      if (postCleanupSyncErr !== null) {
+        closeDirFd();
+        return fail({
+          stage: 'post-publication',
+          error: `Journal published on disk but post-cleanup directory synchronization failed: ${postCleanupSyncErr.message}`,
+          code: postCleanupSyncErr.code || 'fsync-failed',
+          reason: postCleanupSyncErr.message,
+          publicationAttempted: true,
+          publicationConfirmed: true,
+          directoryFsyncAttempted: true,
+          directoryFsyncConfirmed: true,
+          uncertain: true,
+          journal,
+          observedJournalPhase: journal.phase,
+          descriptorCloseUncertain,
+          closeError: dirCloseError,
+        });
+      }
+    }
+
+    // 11. Check directory continuity after publication and synchronization
+    let postPubDirCheck;
+    try {
+      postPubDirCheck = fs.lstatSync(ciPatchDir);
+    } catch (err) {
+      closeDirFd();
+      return fail({
+        stage: isCreation ? 'post-publication' : 'post-rename',
+        error: `Directory "${ciPatchDir}" disappeared after publication: ${err.message}`,
+        code: 'directory-continuity-error',
+        reason: err.message,
+        publicationAttempted: true,
+        publicationConfirmed: true,
+        directoryFsyncAttempted: true,
+        directoryFsyncConfirmed: true,
+        uncertain: true,
+        journal,
+        observedJournalPhase: journal.phase,
+        descriptorCloseUncertain,
+        closeError: dirCloseError,
+      });
+    }
+
+    if (
+      postPubDirCheck.isSymbolicLink() ||
+      !postPubDirCheck.isDirectory() ||
+      postPubDirCheck.dev !== dirStat.dev ||
+      postPubDirCheck.ino !== dirStat.ino
+    ) {
+      closeDirFd();
+      return fail({
+        stage: isCreation ? 'post-publication' : 'post-rename',
+        error: `Directory "${ciPatchDir}" identity changed after publication`,
+        code: 'directory-identity-mismatch',
+        reason: 'Pathname device/inode mismatch after publication',
+        publicationAttempted: true,
+        publicationConfirmed: true,
+        directoryFsyncAttempted: true,
+        directoryFsyncConfirmed: true,
+        uncertain: true,
+        journal,
+        observedJournalPhase: journal.phase,
+        descriptorCloseUncertain,
+        closeError: dirCloseError,
+      });
+    }
+
+    // 12. Close directory descriptor
+    runFault('before-close', { dirFd, journal });
+    closeDirFd();
+
+    if (dirCloseError !== null) {
+      return fail({
+        stage: isCreation ? 'post-publication' : 'post-rename',
+        error: `Failed to close directory descriptor after publication: ${dirCloseError.message}`,
+        code: dirCloseError.code || 'descriptor-close-error',
+        reason: dirCloseError.message,
+        publicationAttempted: true,
+        publicationConfirmed: true,
+        directoryFsyncAttempted: true,
+        directoryFsyncConfirmed: true,
+        uncertain: true,
+        journal,
+        observedJournalPhase: journal.phase,
+        descriptorCloseUncertain: true,
+        closeError: dirCloseError,
+      });
     }
 
     return {
-      ok: false,
-      stage: isCreation ? 'pre-publication' : 'pre-rename',
-      error: `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${primaryErr.message}`,
-      code: primaryErr.code || 'write-error',
+      ok: true,
+      stage: isCreation ? 'post-publication' : 'post-rename',
+      publicationAttempted: true,
+      publicationConfirmed: true,
+      directoryFsyncAttempted: true,
+      directoryFsyncConfirmed: true,
+      uncertain: false,
+      observedJournalPhase: journal.phase,
+      journal,
     };
-  }
-
-  if (closeError !== null) {
-    // Write and fsync succeeded, but temporary descriptor close failed before publication!
-    // A close error must prevent subsequent linkSync() or renameSync() publication.
-    // Descriptor closure was uncertain: preserve temporary artifact evidence! Do NOT unlink!
-    return {
-      ok: false,
-      stage: isCreation ? 'pre-publication' : 'pre-rename',
-      error: `Failed to close temporary journal descriptor before ${isCreation ? 'publication' : 'rename'}: ${closeError.message}`,
-      code: closeError.code || 'descriptor-close-error',
-      descriptorCloseUncertain: true,
-      closeError,
-    };
-  }
-
-  if (isCreation) {
-    // ATOMIC NO-REPLACE PUBLICATION VIA HARD LINK (link(2))
-    // link(2) is guaranteed by POSIX / Linux to fail with EEXIST if destination already exists.
-    try {
-      fs.linkSync(tmpJournalPath, journalPath);
-    } catch (linkErr) {
-      safeUnlinkCreatedFile(tmpJournalPath, createdDev, createdIno);
-
-      if (linkErr.code === 'EEXIST') {
-        return {
-          ok: false,
-          stage: 'pre-publication',
-          error: 'Cannot create journal: destination journal.json already exists (atomic publication collision)',
-        };
-      }
-
-      if (linkErr.code === 'EXDEV' || linkErr.code === 'ENOTSUP' || linkErr.code === 'EPERM') {
-        return {
-          ok: false,
-          stage: 'pre-publication',
-          error: `Atomic no-replace journal publication unsupported on this filesystem (${linkErr.code}): ${linkErr.message}`,
-        };
-      }
-
-      return {
-        ok: false,
-        stage: 'pre-publication',
-        error: `Failed to publish journal atomically: ${linkErr.message}`,
-      };
-    }
-
-    // --- AT THIS POINT, journalPath IS PUBLISHED AND VISIBLE ON DISK ---
-
-    // 1. Directory sync to flush new directory entry
-    try {
-      const dirFd = fs.openSync(ciPatchDir, 'r');
+  } finally {
+    if (dirFd !== null) {
+      const fd = dirFd;
+      dirFd = null;
       try {
-        fs.fsyncSync(dirFd);
-      } finally {
-        fs.closeSync(dirFd);
-      }
-    } catch (syncErr) {
-      return {
-        ok: false,
-        stage: 'post-publication',
-        error: `Journal published on disk but initial directory synchronization failed: ${syncErr.message}`,
-        journal,
-      };
+        fs.closeSync(fd);
+      } catch {}
     }
-
-    // 2. Remove the temporary link name with verified identity
-    try {
-      const unlinked = safeUnlinkCreatedFile(tmpJournalPath, createdDev, createdIno);
-      if (!unlinked && getPathLstat(tmpJournalPath).exists) {
-        throw new Error('Temporary link ownership or identity could not be verified for removal');
-      }
-    } catch (unlinkErr) {
-      return {
-        ok: false,
-        stage: 'post-publication',
-        error: `Journal published on disk but removing temporary link failed: ${unlinkErr.message}`,
-        journal,
-      };
-    }
-
-    // 3. Directory sync to flush temporary entry removal
-    try {
-      const dirFd = fs.openSync(ciPatchDir, 'r');
+    if (tmpFd !== null) {
+      const fd = tmpFd;
+      tmpFd = null;
       try {
-        fs.fsyncSync(dirFd);
-      } finally {
-        fs.closeSync(dirFd);
-      }
-    } catch (syncErr) {
-      return {
-        ok: false,
-        stage: 'post-publication',
-        error: `Journal published on disk but post-cleanup directory synchronization failed: ${syncErr.message}`,
-        journal,
-      };
+        fs.closeSync(fd);
+      } catch {}
     }
-
-    return { ok: true, journal };
-  } else {
-    // PHASE UPDATE: ATOMIC REPLACEMENT VIA rename(2)
-    try {
-      fs.renameSync(tmpJournalPath, journalPath);
-    } catch (renameErr) {
-      safeUnlinkCreatedFile(tmpJournalPath, createdDev, createdIno);
-      return {
-        ok: false,
-        stage: 'pre-rename',
-        error: `Failed to replace journal atomically: ${renameErr.message}`,
-      };
-    }
-
-    // Directory sync post-rename
-    try {
-      const dirFd = fs.openSync(ciPatchDir, 'r');
-      try {
-        fs.fsyncSync(dirFd);
-      } finally {
-        fs.closeSync(dirFd);
-      }
-    } catch (syncErr) {
-      return {
-        ok: false,
-        stage: 'post-rename',
-        error: `Journal updated on disk but directory synchronization failed: ${syncErr.message}`,
-        journal,
-      };
-    }
-
-    return { ok: true, journal };
   }
 }
 
@@ -878,7 +1412,20 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
  * @param {string} options.expectedResultSha256
  * @param {object} [options.extraMetadata]
  * @param {import('./lock.js').TransactionLease} [options.lease]
- * @returns {{ ok: boolean, error?: string, stage?: string, journal?: object }}
+ * @returns {{
+ *   ok: boolean,
+ *   error?: string,
+ *   code?: string,
+ *   stage?: string,
+ *   reason?: string,
+ *   publicationAttempted?: boolean,
+ *   publicationConfirmed?: boolean | null,
+ *   directoryFsyncAttempted?: boolean,
+ *   directoryFsyncConfirmed?: boolean,
+ *   uncertain?: boolean,
+ *   observedJournalPhase?: string | null,
+ *   journal?: object
+ * }}
  */
 export function createJournal(options = {}) {
   const {
@@ -893,19 +1440,55 @@ export function createJournal(options = {}) {
   } = options;
 
   if (!repoRoot || !txId || !op || !targetFile || !expectedInitialSha256 || !expectedResultSha256) {
-    return { ok: false, error: 'Missing required options to create journal' };
+    return {
+      ok: false,
+      error: 'Missing required options to create journal',
+      code: 'missing-arguments',
+      stage: 'arguments',
+      reason: 'Missing required options to create journal',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: null,
+    };
   }
 
   // 1. POSITIVE VERIFICATION OF EXCLUSIVE LOCK OWNERSHIP AND LEASE CAPABILITY
   const lockAuth = verifyLockOwnershipForMutation(repoRoot, txId, op, lease);
   if (!lockAuth.ok) {
-    return { ok: false, error: lockAuth.reason || lockAuth.error, code: lockAuth.error, reason: lockAuth.reason };
+    return {
+      ok: false,
+      error: lockAuth.reason || lockAuth.error,
+      code: lockAuth.error,
+      reason: lockAuth.reason,
+      stage: 'lock-authentication',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: null,
+    };
   }
 
   // 2. Prevent overriding immutable or forbidden fields
   const metaCheck = validateAuxiliaryMetadata(extraMetadata, true);
   if (!metaCheck.valid) {
-    return { ok: false, error: metaCheck.error };
+    return {
+      ok: false,
+      error: metaCheck.error,
+      code: 'invalid-auxiliary-metadata',
+      stage: 'arguments',
+      reason: metaCheck.error,
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: null,
+    };
   }
 
   // 3. Ensure no existing journal is present
@@ -914,6 +1497,15 @@ export function createJournal(options = {}) {
     return {
       ok: false,
       error: `Cannot create journal: an existing journal is already present (phase: ${existingInspection.journal?.phase || 'unknown'})`,
+      code: 'journal-exists',
+      stage: 'pre-publication',
+      reason: 'Existing journal present on disk',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: existingInspection.journal?.phase || null,
     };
   }
 
@@ -933,10 +1525,22 @@ export function createJournal(options = {}) {
 
   const val = validateJournalStructure(journal);
   if (!val.valid) {
-    return { ok: false, error: val.errors.join('; ') };
+    return {
+      ok: false,
+      error: val.errors.join('; '),
+      code: 'invalid-journal-structure',
+      stage: 'arguments',
+      reason: val.errors.join('; '),
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: null,
+    };
   }
 
-  return writeJournalDurable(repoRoot, journal, true);
+  return writeJournalDurable(repoRoot, journal, true, options);
 }
 
 /**
@@ -950,23 +1554,69 @@ export function createJournal(options = {}) {
  * @param {string} options.nextPhase
  * @param {object} [options.metadataUpdate]
  * @param {import('./lock.js').TransactionLease} [options.lease]
- * @returns {{ ok: boolean, error?: string, stage?: string, journal?: object }}
+ * @returns {{
+ *   ok: boolean,
+ *   error?: string,
+ *   code?: string,
+ *   stage?: string,
+ *   reason?: string,
+ *   publicationAttempted?: boolean,
+ *   publicationConfirmed?: boolean | null,
+ *   directoryFsyncAttempted?: boolean,
+ *   directoryFsyncConfirmed?: boolean,
+ *   uncertain?: boolean,
+ *   observedJournalPhase?: string | null,
+ *   journal?: object
+ * }}
  */
 export function advanceJournalPhase(options = {}) {
   const { repoRoot, txId, nextPhase, metadataUpdate = {}, lease = null } = options;
 
   if (!repoRoot || !txId || !nextPhase) {
-    return { ok: false, error: 'repoRoot, txId, and nextPhase are required' };
+    return {
+      ok: false,
+      error: 'repoRoot, txId, and nextPhase are required',
+      code: 'missing-arguments',
+      stage: 'arguments',
+      reason: 'repoRoot, txId, and nextPhase are required',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: null,
+    };
   }
 
   const inspection = inspectJournal(repoRoot);
   if (!inspection.hasJournal) {
-    return { ok: false, error: 'No journal exists to advance' };
+    return {
+      ok: false,
+      error: 'No journal exists to advance',
+      code: 'no-journal',
+      stage: 'journal-inspection',
+      reason: 'No journal exists to advance',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: null,
+    };
   }
   if (!inspection.isValid || !inspection.journal) {
     return {
       ok: false,
       error: `Cannot advance corrupted journal: ${inspection.errors.join('; ')}`,
+      code: 'corrupt-journal',
+      stage: 'journal-inspection',
+      reason: inspection.errors.join('; '),
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: null,
     };
   }
 
@@ -974,13 +1624,34 @@ export function advanceJournalPhase(options = {}) {
     return {
       ok: false,
       error: `Cannot advance journal: owned by transaction "${inspection.journal.txId}", not "${txId}"`,
+      code: 'txid-mismatch',
+      stage: 'journal-inspection',
+      reason: `Owned by transaction "${inspection.journal.txId}", not "${txId}"`,
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: inspection.journal.phase,
     };
   }
 
   // 1. POSITIVE VERIFICATION OF EXCLUSIVE LOCK OWNERSHIP AND LEASE CAPABILITY
   const lockAuth = verifyLockOwnershipForMutation(repoRoot, txId, inspection.journal.op, lease);
   if (!lockAuth.ok) {
-    return { ok: false, error: lockAuth.reason || lockAuth.error, code: lockAuth.error, reason: lockAuth.reason };
+    return {
+      ok: false,
+      error: lockAuth.reason || lockAuth.error,
+      code: lockAuth.error,
+      reason: lockAuth.reason,
+      stage: 'lock-authentication',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: inspection.journal.phase,
+    };
   }
 
   // 2. Refuse phase advancement for legacy journals containing stagedPath
@@ -989,19 +1660,51 @@ export function advanceJournalPhase(options = {}) {
       ok: false,
       error: 'Cannot advance journal: legacy journals containing "stagedPath" are refused for automatic phase advancement',
       code: 'legacy-schema',
+      stage: 'pre-rename',
+      reason: 'Legacy journals containing stagedPath are refused for automatic phase advancement',
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: inspection.journal.phase,
     };
   }
 
   // 3. Prevent overriding immutable identity or phase fields via metadataUpdate
   const metaCheck = validateAuxiliaryMetadata(metadataUpdate, false);
   if (!metaCheck.valid) {
-    return { ok: false, error: metaCheck.error };
+    return {
+      ok: false,
+      error: metaCheck.error,
+      code: 'invalid-auxiliary-metadata',
+      stage: 'arguments',
+      reason: metaCheck.error,
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: inspection.journal.phase,
+    };
   }
 
   // 4. Strict phase transition validation
   const transitionCheck = validatePhaseTransition(inspection.journal.phase, nextPhase);
   if (!transitionCheck.ok) {
-    return { ok: false, error: transitionCheck.error };
+    return {
+      ok: false,
+      error: transitionCheck.error,
+      code: 'illegal-phase-transition',
+      stage: 'pre-rename',
+      reason: transitionCheck.error,
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: inspection.journal.phase,
+    };
   }
 
   // 5. Premature metadata enforcement
@@ -1012,6 +1715,14 @@ export function advanceJournalPhase(options = {}) {
           ok: false,
           error: `Premature auxiliary metadata: field "${key}" cannot be introduced before phase "${FIELD_INTRODUCTION_PHASE[key]}" (attempted at "${nextPhase}")`,
           code: 'premature-metadata',
+          stage: 'pre-rename',
+          reason: `Field "${key}" cannot be introduced before phase "${FIELD_INTRODUCTION_PHASE[key]}"`,
+          publicationAttempted: false,
+          publicationConfirmed: false,
+          directoryFsyncAttempted: false,
+          directoryFsyncConfirmed: false,
+          uncertain: false,
+          observedJournalPhase: inspection.journal.phase,
         };
       }
     }
@@ -1026,6 +1737,14 @@ export function advanceJournalPhase(options = {}) {
         ok: false,
         error: `Missing mandatory auxiliary metadata for transition to "${nextPhase}": "${reqField}"`,
         code: 'missing-mandatory-metadata',
+        stage: 'pre-rename',
+        reason: `Missing mandatory auxiliary metadata "${reqField}"`,
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        observedJournalPhase: inspection.journal.phase,
       };
     }
   }
@@ -1038,6 +1757,14 @@ export function advanceJournalPhase(options = {}) {
           ok: false,
           error: `Immutable auxiliary field conflict: "${key}" cannot be modified once set (current: "${inspection.journal[key]}", update: "${metadataUpdate[key]}")`,
           code: 'immutable-field-conflict',
+          stage: 'pre-rename',
+          reason: `Immutable field "${key}" cannot be modified`,
+          publicationAttempted: false,
+          publicationConfirmed: false,
+          directoryFsyncAttempted: false,
+          directoryFsyncConfirmed: false,
+          uncertain: false,
+          observedJournalPhase: inspection.journal.phase,
         };
       }
     }
@@ -1055,6 +1782,14 @@ export function advanceJournalPhase(options = {}) {
         ok: false,
         error: `Invalid isolatedStagedPath "${effectiveIsolatedPath}": must strictly equal "${expectedIsolated}"`,
         code: 'invalid-resource-path',
+        stage: 'pre-rename',
+        reason: `Must strictly equal "${expectedIsolated}"`,
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        observedJournalPhase: inspection.journal.phase,
       };
     }
   }
@@ -1067,6 +1802,14 @@ export function advanceJournalPhase(options = {}) {
         ok: false,
         error: `Invalid backupPath "${effectiveBackupPath}": must strictly equal "${expectedBackup}"`,
         code: 'invalid-resource-path',
+        stage: 'pre-rename',
+        reason: `Must strictly equal "${expectedBackup}"`,
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        observedJournalPhase: inspection.journal.phase,
       };
     }
   }
@@ -1079,6 +1822,14 @@ export function advanceJournalPhase(options = {}) {
         ok: false,
         error: `Invalid destinationStagedPath "${effectiveDestPath}": must strictly equal "${expectedDest}"`,
         code: 'invalid-resource-path',
+        stage: 'pre-rename',
+        reason: `Must strictly equal "${expectedDest}"`,
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        observedJournalPhase: inspection.journal.phase,
       };
     }
   }
@@ -1090,6 +1841,14 @@ export function advanceJournalPhase(options = {}) {
         ok: false,
         error: `Invalid targetMode "${effectiveTargetMode}": must be 4-character octal string matching /^0[0-7]{3}$/`,
         code: 'invalid-target-mode',
+        stage: 'pre-rename',
+        reason: 'Invalid targetMode regex',
+        publicationAttempted: false,
+        publicationConfirmed: false,
+        directoryFsyncAttempted: false,
+        directoryFsyncConfirmed: false,
+        uncertain: false,
+        observedJournalPhase: inspection.journal.phase,
       };
     }
   }
@@ -1111,10 +1870,22 @@ export function advanceJournalPhase(options = {}) {
 
   const val = validateJournalStructure(updatedJournal);
   if (!val.valid) {
-    return { ok: false, error: `Invalid updated journal: ${val.errors.join('; ')}` };
+    return {
+      ok: false,
+      error: `Invalid updated journal: ${val.errors.join('; ')}`,
+      code: 'invalid-journal-structure',
+      stage: 'pre-rename',
+      reason: val.errors.join('; '),
+      publicationAttempted: false,
+      publicationConfirmed: false,
+      directoryFsyncAttempted: false,
+      directoryFsyncConfirmed: false,
+      uncertain: false,
+      observedJournalPhase: inspection.journal.phase,
+    };
   }
 
-  return writeJournalDurable(repoRoot, updatedJournal, false);
+  return writeJournalDurable(repoRoot, updatedJournal, false, options);
 }
 
 /**

@@ -15,6 +15,7 @@ import {
   isValidDeviceIdentifier,
   isValidInodeIdentifier,
   TARGET_MODE_REGEX,
+  formatJournalAdvancementFailure,
 } from './journal.js';
 
 import {
@@ -1752,12 +1753,7 @@ export async function createVerifiedBackup(options = {}) {
   });
 
   if (!advanceRes.ok) {
-    return {
-      ok: false,
-      error: `Failed to advance journal to BACKUP_CREATED: ${advanceRes.error}`,
-      code: advanceRes.code || 'journal-advancement-failed',
-      stage: advanceRes.stage,
-    };
+    return formatJournalAdvancementFailure(advanceRes, 'BACKUP_CREATED');
   }
 
   runFault('after-journal-advancement', { journal: advanceRes.journal });

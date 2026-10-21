@@ -16,6 +16,7 @@ import {
   isValidDeviceIdentifier,
   isValidInodeIdentifier,
   TARGET_MODE_REGEX,
+  formatJournalAdvancementFailure,
 } from './journal.js';
 
 import {
@@ -1588,13 +1589,7 @@ export async function stageDestinationCandidate(options = {}) {
     });
 
     if (!advanceRes.ok) {
-      return {
-        ok: false,
-        error: `Failed to advance journal to READY_TO_SWAP: ${advanceRes.error}`,
-        code: advanceRes.code || 'journal-advancement-failed',
-        stage: advanceRes.stage,
-        uncertain: advanceRes.stage === 'post-rename',
-      };
+      return formatJournalAdvancementFailure(advanceRes, 'READY_TO_SWAP');
     }
 
     runFault('after-journal-advancement', { journal: advanceRes.journal });

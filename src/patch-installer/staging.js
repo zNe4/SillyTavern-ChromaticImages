@@ -18,6 +18,7 @@ import {
   verifyLockOwnershipForMutation,
   isValidDeviceIdentifier,
   isValidInodeIdentifier,
+  formatJournalAdvancementFailure,
 } from './journal.js';
 
 import {
@@ -1134,12 +1135,7 @@ export async function prepareIsolatedPatch(options = {}) {
   });
 
   if (!advanceRes.ok) {
-    return {
-      ok: false,
-      error: `Failed to advance journal to ISOLATED_PREPARED: ${advanceRes.error}`,
-      code: advanceRes.code || 'journal-advancement-failed',
-      stage: advanceRes.stage,
-    };
+    return formatJournalAdvancementFailure(advanceRes, 'ISOLATED_PREPARED');
   }
 
   runFault('after-journal-advancement', { journal: advanceRes.journal });

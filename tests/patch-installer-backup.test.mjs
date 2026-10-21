@@ -2294,3 +2294,66 @@ describe('P3B-2B-F2: Finding A — Structured Filesystem Failure Handling during
     assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
   });
 });
+
+describe('D01-P3B-2D-2-C-JH2: Journal Advancement Uncertainty Propagation in Backup', () => {
+  test('createVerifiedBackup propagates uncertain journal advancement failure with structured schema', async () => {
+    const repo = setupDisposableRepo('jh2-backup-adv-');
+    const txId = generateTxId();
+    const liveTarget = path.join(repo, 'src/endpoints/stable-diffusion.js');
+    fs.writeFileSync(liveTarget, authenticStock);
+    fs.chmodSync(liveTarget, 0o644);
+
+    const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+    createJournal({
+      repoRoot: repo,
+      txId,
+      op: 'apply',
+      targetFile: 'src/endpoints/stable-diffusion.js',
+      expectedInitialSha256: stockSha,
+      expectedResultSha256: patchedSha,
+      lease,
+    });
+
+    const prepRes = await prepareIsolatedPatch({ repoRoot: repo, txId, op: 'apply', lease });
+    assert.equal(prepRes.ok, true);
+
+    const origRenameSync = fs.renameSync;
+    try {
+      fs.renameSync = (src, dst) => {
+        if (typeof src === 'string' && src.includes(`.journal.${txId}.tmp`)) {
+          const err = new Error('Simulated rename interruption during backup journal advancement');
+          err.code = 'EIO';
+          throw err;
+        }
+        return origRenameSync(src, dst);
+      };
+
+      const res = await createVerifiedBackup({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+      });
+
+      assert.equal(res.ok, false);
+      assert.equal(res.uncertain, true);
+      assert.equal(res.publicationAttempted, true);
+      assert.equal(res.publicationConfirmed, null);
+      assert.equal(res.directoryFsyncConfirmed, false);
+      assert.equal(res.stage, 'rename-attempted');
+      assert.equal(res.code, 'EIO');
+      assert.match(res.error, /Failed to advance journal to BACKUP_CREATED/);
+
+      // Verify backup was NOT deleted and is preserved for evidence
+      const backupFile = path.join(repo, '.ci-patch/backup', txId, 'stable-diffusion.js');
+      assert.equal(fs.existsSync(backupFile), true, 'Backup file must be preserved for evidence');
+
+      // Verify journal remains at previous phase
+      const jInspect = inspectJournal(repo);
+      assert.equal(jInspect.journal?.phase, 'ISOLATED_PREPARED');
+    } finally {
+      fs.renameSync = origRenameSync;
+    }
+  });
+});
