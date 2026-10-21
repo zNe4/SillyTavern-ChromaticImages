@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   getPathLstat,
   isPathContained,
+  TransactionLease,
 } from './lock.js';
 
 import {
@@ -15,6 +16,9 @@ import {
   isValidInodeIdentifier,
   TARGET_MODE_REGEX,
   JOURNAL_SCHEMA_VERSION,
+  getJournalPath,
+  validateJournalStructure,
+  advanceJournalPhase,
 } from './journal.js';
 
 import {
@@ -1622,12 +1626,894 @@ export async function authenticateSwapPrerequisites(options = {}) {
  */
 export const authenticatePreSwap = authenticateSwapPrerequisites;
 
+function buildArgumentError(msg) {
+  return {
+    ok: false,
+    verified: false,
+    error: msg,
+    code: 'invalid-arguments',
+    stage: 'arguments',
+    renameAttempted: false,
+    renameConfirmed: false,
+    targetDirectoryFsyncAttempted: false,
+    targetDirectoryFsyncConfirmed: false,
+    observedTargetState: 'uninspected',
+    candidateConsumed: null,
+    journalAdvanceAttempted: false,
+    publicationAttempted: false,
+    publicationConfirmed: false,
+    directoryFsyncAttempted: false,
+    directoryFsyncConfirmed: false,
+    observedJournalPhase: null,
+    durabilityUncertain: false,
+    uncertain: false,
+  };
+}
+
+function classifyReadbackError(err) {
+  if (err?.code === 'file-missing' || err?.code === 'ENOENT') {
+    return 'missing';
+  }
+  if (
+    err?.code === 'target-digest-mismatch' ||
+    err?.code === 'target-inode-mismatch' ||
+    err?.code === 'target-mode-mismatch' ||
+    err?.code === 'target-cross-device' ||
+    err?.code === 'target-continuity-error'
+  ) {
+    return 'unexpected';
+  }
+  return 'inaccessible';
+}
+
+function checkCandidateAbsence(parentFd, candidateBase, absCandidatePath) {
+  const procCandidatePath = path.join('/proc/self/fd', String(parentFd), candidateBase);
+
+  let candProcCheck;
+  try {
+    candProcCheck = getPathLstat(procCandidatePath);
+  } catch (err) {
+    candProcCheck = { error: err };
+  }
+
+  let candAbsCheck;
+  try {
+    candAbsCheck = getPathLstat(absCandidatePath);
+  } catch (err) {
+    candAbsCheck = { error: err };
+  }
+
+  if (candProcCheck.error && candProcCheck.error.code !== 'ENOENT') {
+    const err = new Error(`Failed to inspect destination candidate via descriptor: ${candProcCheck.error.message}`);
+    err.code = 'candidate-inspection-error';
+    err.stage = 'candidate-consumption-verification';
+    return { ok: false, consumed: null, error: err };
+  }
+
+  if (candAbsCheck.error && candAbsCheck.error.code !== 'ENOENT') {
+    const err = new Error(`Failed to inspect destination candidate pathname: ${candAbsCheck.error.message}`);
+    err.code = 'candidate-inspection-error';
+    err.stage = 'candidate-consumption-verification';
+    return { ok: false, consumed: null, error: err };
+  }
+
+  if (candProcCheck.exists || candAbsCheck.exists) {
+    const err = new Error(`Destination candidate "${candidateBase}" remains present after rename`);
+    err.code = 'candidate-not-consumed';
+    err.stage = 'candidate-consumption-verification';
+    return { ok: false, consumed: false, error: err };
+  }
+
+  return { ok: true, consumed: true };
+}
+
+function verifyParentPathnameContinuity(parentFd, absParentDir, expectedStat) {
+  let finalParentCheck;
+  try {
+    finalParentCheck = fs.lstatSync(absParentDir);
+  } catch (err) {
+    const e = new Error(`Destination parent directory disappeared after swap: ${err.message}`);
+    e.code = 'parent-dir-continuity-error';
+    e.stage = 'destination-parent-continuity';
+    throw e;
+  }
+
+  if (
+    !finalParentCheck.isDirectory() ||
+    finalParentCheck.isSymbolicLink() ||
+    finalParentCheck.dev !== expectedStat.dev ||
+    finalParentCheck.ino !== expectedStat.ino
+  ) {
+    const err = new Error('Destination parent directory identity modified concurrently after swap');
+    err.code = 'parent-dir-continuity-error';
+    err.stage = 'destination-parent-continuity';
+    throw err;
+  }
+}
+
 /**
- * Reserved placeholder for future Stage C live-target swap.
- * Intentionally unimplemented in Stage B and Stage C1; fails closed.
+ * Fresh pre-rename authorization gate.
+ * Re-authenticates destination parent, live target, destination candidate,
+ * journal inode/content continuity, and lock ownership immediately before renameSync().
+ *
+ * @private
  */
-export async function swapVerifiedTarget() {
-  const err = new Error('Live target swap is not implemented: reserved for Stage C (D01-P3B-2D-2-C)');
-  err.code = 'unimplemented-stage-c';
-  throw err;
+async function verifyFinalPreRenameGate({
+  parentFd,
+  auth,
+  normRepo,
+  txId,
+  op,
+  lease,
+  targetBase,
+  candidateBase,
+  absTargetPath,
+  absCandidatePath,
+  expectedInitialGitBlob,
+  expectedResultGitBlob,
+  authJournalDev,
+  authJournalIno,
+  authJournalSha,
+}) {
+  // 1. Verify destination parent descriptor continuity
+  const parentStat = fs.fstatSync(parentFd);
+  if (
+    !parentStat.isDirectory() ||
+    parentStat.isSymbolicLink() ||
+    parentStat.dev !== auth.parentDev ||
+    parentStat.ino !== auth.parentIno
+  ) {
+    return {
+      ok: false,
+      code: 'parent-dir-identity-mismatch',
+      stage: 'final-pre-rename-checks',
+      error: 'Destination parent descriptor identity mismatch during final pre-rename gate',
+    };
+  }
+
+  // 2. Verify destination parent pathname continuity
+  const absParentDir = path.resolve(normRepo, path.dirname(auth.targetFile));
+  let parentPathStat;
+  try {
+    parentPathStat = fs.lstatSync(absParentDir);
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'parent-dir-continuity-error',
+      stage: 'final-pre-rename-checks',
+      error: `Destination parent directory disappeared before rename: ${err.message}`,
+    };
+  }
+
+  if (
+    !parentPathStat.isDirectory() ||
+    parentPathStat.isSymbolicLink() ||
+    parentPathStat.dev !== auth.parentDev ||
+    parentPathStat.ino !== auth.parentIno
+  ) {
+    return {
+      ok: false,
+      code: 'parent-dir-continuity-error',
+      stage: 'final-pre-rename-checks',
+      error: 'Destination parent directory pathname identity changed before rename',
+    };
+  }
+
+  // 3. Re-verify live target through parentFd
+  const procTargetPath = path.join('/proc/self/fd', String(parentFd), targetBase);
+  let targetRes;
+  try {
+    targetRes = readBoundedNonblockingFile(procTargetPath, {
+      maxBytes: MAX_SWAP_FILE_BYTES,
+      requireSingleLink: true,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      code: err.code || 'target-verification-failed',
+      stage: 'final-pre-rename-checks',
+      error: `Live target verification failed during final gate: ${err.message}`,
+      observedTargetState: err.code === 'file-missing' ? 'missing' : 'inaccessible',
+    };
+  }
+
+  if (targetRes.dev !== auth.parentDev || targetRes.ino !== auth.targetIno) {
+    return {
+      ok: false,
+      code: 'target-identity-mismatch',
+      stage: 'final-pre-rename-checks',
+      error: 'Live target device or inode identity drifted before rename',
+      observedTargetState: 'unexpected',
+    };
+  }
+
+  if (targetRes.mode !== auth.targetMode) {
+    return {
+      ok: false,
+      code: 'target-mode-mismatch',
+      stage: 'final-pre-rename-checks',
+      error: `Live target mode drifted: expected "${auth.targetMode}", observed "${targetRes.mode}"`,
+      observedTargetState: 'unexpected',
+    };
+  }
+
+  if (targetRes.sha256 !== auth.initialSha256 || targetRes.gitBlobSha !== expectedInitialGitBlob) {
+    return {
+      ok: false,
+      code: 'target-digest-mismatch',
+      stage: 'final-pre-rename-checks',
+      error: `Live target content drifted before rename: observed SHA-256 "${targetRes.sha256}"`,
+      observedTargetState: 'unexpected',
+    };
+  }
+
+  let targetPathCheck;
+  try {
+    targetPathCheck = fs.lstatSync(absTargetPath);
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'target-continuity-error',
+      stage: 'final-pre-rename-checks',
+      error: `Live target pathname disappeared before rename: ${err.message}`,
+      observedTargetState: 'missing',
+    };
+  }
+
+  if (
+    !targetPathCheck.isFile() ||
+    targetPathCheck.isSymbolicLink() ||
+    targetPathCheck.nlink !== 1 ||
+    targetPathCheck.dev !== auth.parentDev ||
+    targetPathCheck.ino !== auth.targetIno
+  ) {
+    return {
+      ok: false,
+      code: 'target-continuity-error',
+      stage: 'final-pre-rename-checks',
+      error: 'Live target pathname does not match descriptor during final gate',
+      observedTargetState: 'unexpected',
+    };
+  }
+
+  // 4. Re-verify destination candidate through parentFd
+  const procCandidatePath = path.join('/proc/self/fd', String(parentFd), candidateBase);
+  let candRes;
+  try {
+    candRes = readBoundedNonblockingFile(procCandidatePath, {
+      maxBytes: MAX_SWAP_FILE_BYTES,
+      requireSingleLink: true,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      code: err.code || 'candidate-verification-failed',
+      stage: 'final-pre-rename-checks',
+      error: `Destination candidate verification failed during final gate: ${err.message}`,
+    };
+  }
+
+  if (candRes.dev !== auth.parentDev || candRes.ino !== auth.candidateIno) {
+    return {
+      ok: false,
+      code: 'candidate-identity-mismatch',
+      stage: 'final-pre-rename-checks',
+      error: 'Destination candidate device or inode identity drifted before rename',
+    };
+  }
+
+  if (candRes.mode !== auth.targetMode) {
+    return {
+      ok: false,
+      code: 'candidate-mode-mismatch',
+      stage: 'final-pre-rename-checks',
+      error: `Destination candidate mode drifted: expected "${auth.targetMode}", observed "${candRes.mode}"`,
+    };
+  }
+
+  if (candRes.sha256 !== auth.resultSha256 || candRes.gitBlobSha !== expectedResultGitBlob) {
+    return {
+      ok: false,
+      code: 'candidate-digest-mismatch',
+      stage: 'final-pre-rename-checks',
+      error: `Destination candidate content drifted before rename: observed SHA-256 "${candRes.sha256}"`,
+    };
+  }
+
+  let candPathCheck;
+  try {
+    candPathCheck = fs.lstatSync(absCandidatePath);
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'candidate-continuity-error',
+      stage: 'final-pre-rename-checks',
+      error: `Destination candidate pathname disappeared before rename: ${err.message}`,
+    };
+  }
+
+  if (
+    !candPathCheck.isFile() ||
+    candPathCheck.isSymbolicLink() ||
+    candPathCheck.nlink !== 1 ||
+    candPathCheck.dev !== auth.parentDev ||
+    candPathCheck.ino !== auth.candidateIno
+  ) {
+    return {
+      ok: false,
+      code: 'candidate-continuity-error',
+      stage: 'final-pre-rename-checks',
+      error: 'Destination candidate pathname does not match descriptor during final gate',
+    };
+  }
+
+  // 5. Inode distinctness check
+  if (auth.targetIno === auth.candidateIno) {
+    return {
+      ok: false,
+      code: 'candidate-inode-collision',
+      stage: 'final-pre-rename-checks',
+      error: 'Live target and destination candidate share the same inode identity',
+    };
+  }
+
+  // 6. Journal inode and content gate
+  const journalPath = getJournalPath(normRepo);
+  let postJStat;
+  try {
+    postJStat = fs.lstatSync(journalPath);
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'journal-identity-mismatch',
+      stage: 'journal-identity-verification',
+      error: `Journal file disappeared before rename: ${err.message}`,
+    };
+  }
+
+  if (
+    !postJStat.isFile() ||
+    postJStat.isSymbolicLink() ||
+    postJStat.nlink !== 1 ||
+    (postJStat.mode & SPECIAL_MODE_MASK) !== 0 ||
+    postJStat.dev !== authJournalDev ||
+    postJStat.ino !== authJournalIno
+  ) {
+    return {
+      ok: false,
+      code: 'journal-identity-mismatch',
+      stage: 'journal-identity-verification',
+      error: 'Journal device or inode identity modified concurrently before rename',
+    };
+  }
+
+  let postJRes;
+  try {
+    postJRes = readBoundedNonblockingFile(journalPath, {
+      maxBytes: 1024 * 1024,
+      requireSingleLink: true,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'journal-identity-mismatch',
+      stage: 'journal-identity-verification',
+      error: `Failed to re-read journal before rename: ${err.message}`,
+    };
+  }
+
+  if (postJRes.dev !== authJournalDev || postJRes.ino !== authJournalIno || postJRes.sha256 !== authJournalSha) {
+    return {
+      ok: false,
+      code: 'journal-identity-mismatch',
+      stage: 'journal-identity-verification',
+      error: 'Journal contents modified concurrently before rename',
+    };
+  }
+
+  let postJournal;
+  try {
+    postJournal = JSON.parse(postJRes.buffer.toString('utf8'));
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'journal-invalid',
+      stage: 'journal-identity-verification',
+      error: `Journal JSON invalid before rename: ${err.message}`,
+    };
+  }
+
+  const postVal = validateJournalStructure(postJournal);
+  if (!postVal.valid) {
+    return {
+      ok: false,
+      code: 'journal-invalid',
+      stage: 'journal-identity-verification',
+      error: `Journal schema invalid before rename: ${postVal.errors.join('; ')}`,
+    };
+  }
+
+  if (postJournal.txId !== txId || postJournal.op !== op || postJournal.phase !== 'READY_TO_SWAP') {
+    return {
+      ok: false,
+      code: 'journal-phase-mismatch',
+      stage: 'journal-identity-verification',
+      error: `Journal transaction or phase changed before rename: phase "${postJournal.phase}"`,
+    };
+  }
+
+  // 7. Lock ownership and lease re-check
+  const lockAuth = verifyLockOwnershipForMutation(normRepo, txId, op, lease);
+  if (!lockAuth.ok) {
+    return {
+      ok: false,
+      code: lockAuth.error || 'unauthorized-lock',
+      stage: 'lock-authentication',
+      error: lockAuth.reason || lockAuth.error,
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Atomically replaces the live target file with the verified destination candidate
+ * and durably advances the transaction journal to SWAPPED.
+ *
+ * Implements Stage C2+C3 with retained parent descriptor ownership, fresh pre-rename
+ * verification gate, candidate consumption verification, and robust descriptor cleanup.
+ *
+ * @param {object} options
+ * @param {string} options.repoRoot - Repository root directory
+ * @param {string} options.txId - Transaction identifier (ci-tx-...)
+ * @param {'apply' | 'remove'} options.op - Operation direction
+ * @param {TransactionLease} options.lease - Transaction lease capability
+ * @returns {Promise<object>} Structured SwapResult object
+ */
+export async function swapVerifiedTarget(options = {}) {
+  // 1. Sanitize caller inputs: accept only mandatory arguments
+  if (!options || typeof options !== 'object' || Array.isArray(options)) {
+    return buildArgumentError('Options must be a non-null plain object');
+  }
+
+  const { repoRoot, txId, op, lease } = options;
+
+  if (!repoRoot || typeof repoRoot !== 'string' || repoRoot.trim() === '') {
+    return buildArgumentError('Missing or invalid mandatory argument: repoRoot must be a non-empty string');
+  }
+
+  if (!txId || typeof txId !== 'string' || !TX_ID_REGEX.test(txId.trim())) {
+    return buildArgumentError(`Missing or invalid transaction ID format: "${txId}"`);
+  }
+
+  if (op !== 'apply' && op !== 'remove') {
+    return buildArgumentError(`Invalid operation "${op}": must be "apply" or "remove"`);
+  }
+
+  if (!lease || !(lease instanceof TransactionLease)) {
+    return buildArgumentError('A valid in-process TransactionLease capability is required for live swap');
+  }
+
+  const normRepo = path.resolve(repoRoot);
+
+  // 2. Initialize tracking state with strict unknown/uninspected defaults
+  let parentFd = null;
+  let renameAttempted = false;
+  let renameConfirmed = false; // true | false | null
+  let targetDirectoryFsyncAttempted = false;
+  let targetDirectoryFsyncConfirmed = false;
+  let observedTargetState = 'uninspected';
+  let candidateConsumed = null; // true | false | null
+
+  let journalAdvanceAttempted = false;
+  let publicationAttempted = false;
+  let publicationConfirmed = false; // true | false | null
+  let directoryFsyncAttempted = false;
+  let directoryFsyncConfirmed = false;
+  let observedJournalPhase = null;
+
+  let durabilityUncertain = false;
+  let uncertain = false;
+
+  let targetDev = undefined;
+  let targetIno = undefined;
+  let previousTargetIno = undefined;
+  let candidateIno = undefined;
+  let resultSha256 = undefined;
+  let authenticatedTargetMode = undefined;
+
+  let pendingOutcome = null; // { type: 'success' } | { type: 'failure', err: object }
+  let inFlightFault = null;
+  let parentCloseFailure = null;
+
+  try {
+    // --- STEP 1: Core authentication with descriptor retention ---
+    const auth = await authenticatePrerequisitesCore(
+      { repoRoot: normRepo, txId: txId.trim(), op, lease },
+      { retainParentDescriptor: true }
+    );
+
+    if (!auth.ok) {
+      pendingOutcome = { type: 'failure', err: auth };
+    } else {
+      parentFd = auth.parentFd;
+      targetDev = auth.targetDev;
+      previousTargetIno = auth.targetIno;
+      candidateIno = auth.candidateIno;
+      resultSha256 = auth.resultSha256;
+      authenticatedTargetMode = auth.targetMode;
+
+      // Strictly derive canonical names and paths from authenticated C1 result
+      const targetBase = path.basename(auth.targetFile);
+      const targetDir = path.dirname(auth.targetFile);
+      const absParentDir = path.resolve(normRepo, targetDir);
+
+      const candidateBase = path.basename(auth.destinationStagedPath);
+      const candidateDir = path.dirname(auth.destinationStagedPath);
+      const absCandidatePath = path.resolve(normRepo, auth.destinationStagedPath);
+      const absTargetPath = path.resolve(normRepo, auth.targetFile);
+
+      if (candidateDir !== targetDir) {
+        throw new Error(`Candidate directory "${candidateDir}" does not match target directory "${targetDir}"`);
+      }
+      if (auth.targetFile !== CERTIFIED_TARGET_FILE) {
+        throw new Error(`Uncertified target file: "${auth.targetFile}"`);
+      }
+      if (!TARGET_MODE_REGEX.test(auth.targetMode) || (parseInt(auth.targetMode, 8) & SPECIAL_MODE_MASK) !== 0) {
+        throw new Error(`Invalid or special-bit targetMode in authenticated journal: "${auth.targetMode}"`);
+      }
+
+      // Read bundled manifest to establish authoritative Git blob expectations
+      const pkgCheck = await verifyPatchManifest(BUNDLED_MANIFEST_PATH);
+      if (!pkgCheck.ok || !pkgCheck.manifest?.patches?.runtime) {
+        throw new Error('Bundled patch manifest verification failed');
+      }
+      const patchEntry = pkgCheck.manifest.patches.runtime;
+      const expectedInitialGitBlob = (op === 'apply' ? patchEntry.original.gitBlobSha : patchEntry.expected.gitBlobSha).toLowerCase();
+      const expectedResultGitBlob = (op === 'apply' ? patchEntry.expected.gitBlobSha : patchEntry.original.gitBlobSha).toLowerCase();
+
+      // Capture initial journal identity snapshot
+      const journalPath = getJournalPath(normRepo);
+      let jStat;
+      try {
+        jStat = fs.lstatSync(journalPath);
+      } catch (jStatErr) {
+        throw new Error(`Journal file inspection failed: ${jStatErr.message}`);
+      }
+
+      if (!jStat.isFile() || jStat.isSymbolicLink() || jStat.nlink !== 1 || (jStat.mode & SPECIAL_MODE_MASK) !== 0) {
+        throw new Error('Journal file is not a regular single-link file or has special bits');
+      }
+      const authJournalDev = jStat.dev;
+      const authJournalIno = jStat.ino;
+
+      let jRes;
+      try {
+        jRes = readBoundedNonblockingFile(journalPath, {
+          maxBytes: 1024 * 1024,
+          requireSingleLink: true,
+        });
+      } catch (jReadErr) {
+        throw new Error(`Failed to read initial journal snapshot: ${jReadErr.message}`);
+      }
+
+      if (jRes.dev !== authJournalDev || jRes.ino !== authJournalIno) {
+        throw new Error('Initial journal snapshot descriptor identity mismatch');
+      }
+      const authJournalSha = jRes.sha256;
+
+      let initJournal;
+      try {
+        initJournal = JSON.parse(jRes.buffer.toString('utf8'));
+      } catch (parseErr) {
+        throw new Error(`Initial journal snapshot JSON invalid: ${parseErr.message}`);
+      }
+
+      const initVal = validateJournalStructure(initJournal);
+      if (!initVal.valid) {
+        throw new Error(`Initial journal snapshot schema invalid: ${initVal.errors.join('; ')}`);
+      }
+
+      if (
+        initJournal.txId !== txId.trim() ||
+        initJournal.op !== op ||
+        initJournal.phase !== 'READY_TO_SWAP' ||
+        initJournal.targetFile !== CERTIFIED_TARGET_FILE ||
+        initJournal.targetMode !== authenticatedTargetMode ||
+        initJournal.expectedInitialSha256.toLowerCase() !== auth.initialSha256 ||
+        initJournal.expectedResultSha256.toLowerCase() !== auth.resultSha256
+      ) {
+        throw new Error('Initial journal snapshot contradicts authenticated prerequisites');
+      }
+
+      // --- STEP 2: Fresh pre-rename authorization gate ---
+      const gateRes = await verifyFinalPreRenameGate({
+        parentFd,
+        auth,
+        normRepo,
+        txId: txId.trim(),
+        op,
+        lease,
+        targetBase,
+        candidateBase,
+        absTargetPath,
+        absCandidatePath,
+        expectedInitialGitBlob,
+        expectedResultGitBlob,
+        authJournalDev,
+        authJournalIno,
+        authJournalSha,
+      });
+
+      if (!gateRes.ok) {
+        pendingOutcome = { type: 'failure', err: gateRes };
+        if (gateRes.observedTargetState) observedTargetState = gateRes.observedTargetState;
+      } else {
+        const procCandidatePath = path.join('/proc/self/fd', String(parentFd), candidateBase);
+        const procTargetPath = path.join('/proc/self/fd', String(parentFd), targetBase);
+
+        // --- STEP 3: Descriptor-anchored atomic replacement ---
+        renameAttempted = true;
+        try {
+          fs.renameSync(procCandidatePath, procTargetPath);
+          renameConfirmed = true;
+        } catch (renameErr) {
+          renameConfirmed = null; // Syscall threw: outcome uncertain
+          uncertain = true;
+          durabilityUncertain = true; // Target directory entry modification unconfirmed
+          throw renameErr;
+        }
+
+        // --- STEP 4: Destination parent directory fsync ---
+        targetDirectoryFsyncAttempted = true;
+        try {
+          fs.fsyncSync(parentFd);
+          targetDirectoryFsyncConfirmed = true;
+        } catch (fsyncErr) {
+          durabilityUncertain = true;
+          uncertain = true;
+          throw fsyncErr;
+        }
+
+        // --- STEP 5: Post-swap target readback through parentFd ---
+        let readbackRes;
+        try {
+          readbackRes = readBoundedNonblockingFile(procTargetPath, {
+            maxBytes: MAX_SWAP_FILE_BYTES,
+            requireSingleLink: true,
+          });
+        } catch (readErr) {
+          observedTargetState = classifyReadbackError(readErr);
+          uncertain = true;
+          throw readErr;
+        }
+
+        if (readbackRes.ino !== candidateIno) {
+          observedTargetState = 'unexpected';
+          uncertain = true;
+          const err = new Error(`Live target inode mismatch after rename: expected candidate inode ${candidateIno}, observed ${readbackRes.ino}`);
+          err.code = 'target-inode-mismatch';
+          err.stage = 'post-rename-readback';
+          throw err;
+        }
+
+        if (readbackRes.dev !== targetDev) {
+          observedTargetState = 'unexpected';
+          uncertain = true;
+          const err = new Error('Live target device mismatch after rename');
+          err.code = 'target-cross-device';
+          err.stage = 'post-rename-readback';
+          throw err;
+        }
+
+        if (readbackRes.mode !== authenticatedTargetMode) {
+          observedTargetState = 'unexpected';
+          uncertain = true;
+          const err = new Error(`Live target mode mismatch after rename: expected ${authenticatedTargetMode}, observed ${readbackRes.mode}`);
+          err.code = 'target-mode-mismatch';
+          err.stage = 'post-rename-readback';
+          throw err;
+        }
+
+        if (readbackRes.sha256 !== resultSha256 || readbackRes.gitBlobSha !== expectedResultGitBlob) {
+          observedTargetState = 'unexpected';
+          uncertain = true;
+          const err = new Error(`Live target content mismatch after rename: expected result SHA-256 "${resultSha256}", observed "${readbackRes.sha256}"`);
+          err.code = 'target-digest-mismatch';
+          err.stage = 'post-rename-readback';
+          throw err;
+        }
+
+        let postPathCheck;
+        try {
+          postPathCheck = fs.lstatSync(absTargetPath);
+        } catch (err) {
+          observedTargetState = 'missing';
+          uncertain = true;
+          const e = new Error(`Live target pathname disappeared after rename: ${err.message}`);
+          e.code = 'target-continuity-error';
+          e.stage = 'post-rename-readback';
+          throw e;
+        }
+
+        if (
+          !postPathCheck.isFile() ||
+          postPathCheck.isSymbolicLink() ||
+          postPathCheck.nlink !== 1 ||
+          postPathCheck.dev !== targetDev ||
+          postPathCheck.ino !== candidateIno
+        ) {
+          observedTargetState = 'unexpected';
+          uncertain = true;
+          const err = new Error('Live target pathname identity does not match descriptor after rename');
+          err.code = 'target-continuity-error';
+          err.stage = 'post-rename-readback';
+          throw err;
+        }
+
+        // Target inode populated only on verified post-swap readback
+        targetIno = readbackRes.ino;
+        observedTargetState = 'result';
+
+        // --- STEP 6: Candidate consumption check ---
+        const candCheck = checkCandidateAbsence(parentFd, candidateBase, absCandidatePath);
+        candidateConsumed = candCheck.consumed;
+        if (!candCheck.ok) {
+          uncertain = true;
+          throw candCheck.error;
+        }
+
+        // --- STEP 7: Re-verify destination parent pathname continuity ---
+        verifyParentPathnameContinuity(parentFd, absParentDir, auth.parentStat);
+
+        // --- STEP 8: Advance transaction journal to SWAPPED ---
+        journalAdvanceAttempted = true;
+        let journalRes;
+        try {
+          journalRes = advanceJournalPhase({
+            repoRoot: normRepo,
+            txId: txId.trim(),
+            nextPhase: 'SWAPPED',
+            lease,
+          });
+        } catch (jThrewErr) {
+          publicationAttempted = true;
+          publicationConfirmed = null;
+          directoryFsyncAttempted = false;
+          directoryFsyncConfirmed = false;
+          observedJournalPhase = null;
+          uncertain = true;
+          throw jThrewErr;
+        }
+
+        publicationAttempted = Boolean(journalRes.publicationAttempted);
+        publicationConfirmed = journalRes.publicationConfirmed !== undefined ? journalRes.publicationConfirmed : null;
+        directoryFsyncAttempted = Boolean(journalRes.directoryFsyncAttempted);
+        directoryFsyncConfirmed = Boolean(journalRes.directoryFsyncConfirmed);
+        observedJournalPhase = journalRes.observedJournalPhase !== undefined ? journalRes.observedJournalPhase : null;
+
+        if (!journalRes.ok) {
+          uncertain = true;
+          if (publicationConfirmed === true && !directoryFsyncConfirmed) {
+            durabilityUncertain = true;
+          }
+          pendingOutcome = { type: 'failure', err: journalRes };
+        } else {
+          pendingOutcome = { type: 'success' };
+        }
+      }
+    }
+  } catch (err) {
+    if (err?._isFault) {
+      inFlightFault = err;
+    } else if (!pendingOutcome) {
+      pendingOutcome = { type: 'failure', err };
+    }
+  } finally {
+    // --- STEP 9: Unconditional descriptor cleanup (exactly once) ---
+    if (parentFd !== null) {
+      const fdToClose = parentFd;
+      parentFd = null; // Relinquished immediately; NEVER retry closeSync
+      try {
+        fs.closeSync(fdToClose);
+      } catch (closeErr) {
+        if (closeErr?._isFault) {
+          if (!inFlightFault) inFlightFault = closeErr;
+        } else {
+          parentCloseFailure = closeErr;
+        }
+      }
+    }
+  }
+
+  // Attach secondary close diagnostic to propagating crash fault if cleanup also threw
+  if (inFlightFault) {
+    if (parentCloseFailure && !inFlightFault.closeError) {
+      inFlightFault.closeError = {
+        error: parentCloseFailure.message,
+        message: parentCloseFailure.message,
+        code: parentCloseFailure.code || 'parent-dir-close-error',
+        uncertain: true,
+        status: 'failed',
+      };
+    }
+    throw inFlightFault;
+  }
+
+  // --- STEP 10: Final result construction after cleanup ---
+  let combinedCloseDiag = undefined;
+  if (parentCloseFailure) {
+    combinedCloseDiag = {
+      error: parentCloseFailure.message,
+      message: parentCloseFailure.message,
+      code: parentCloseFailure.code || 'parent-dir-close-error',
+      uncertain: true,
+      status: 'failed',
+    };
+    if (pendingOutcome?.err?.closeError) {
+      combinedCloseDiag.secondaryJournalCloseError = pendingOutcome.err.closeError;
+    }
+  } else if (pendingOutcome?.err?.closeError) {
+    combinedCloseDiag = pendingOutcome.err.closeError;
+  }
+
+  const baseResult = {
+    txId: txId.trim(),
+    op,
+    repoRoot: normRepo,
+    targetFile: CERTIFIED_TARGET_FILE,
+    targetMode: authenticatedTargetMode,
+    renameAttempted,
+    renameConfirmed,
+    targetDirectoryFsyncAttempted,
+    targetDirectoryFsyncConfirmed,
+    observedTargetState,
+    candidateConsumed,
+    journalAdvanceAttempted,
+    publicationAttempted,
+    publicationConfirmed,
+    directoryFsyncAttempted,
+    directoryFsyncConfirmed,
+    observedJournalPhase,
+    durabilityUncertain,
+    uncertain: Boolean(uncertain || parentCloseFailure || pendingOutcome?.err?.uncertain),
+    targetDev,
+    targetIno,
+    previousTargetIno,
+    candidateIno,
+    resultSha256,
+    closeError: combinedCloseDiag,
+    descriptorCloseUncertain: Boolean(parentCloseFailure || pendingOutcome?.err?.descriptorCloseUncertain),
+  };
+
+  if (parentCloseFailure && pendingOutcome?.type === 'success') {
+    return {
+      ...baseResult,
+      ok: false,
+      verified: false,
+      error: `Failed to close destination parent descriptor after successful swap: ${parentCloseFailure.message}`,
+      code: parentCloseFailure.code || 'parent-dir-close-error',
+      stage: 'destination-parent-cleanup',
+      reason: parentCloseFailure.message,
+    };
+  }
+
+  if (pendingOutcome?.type === 'failure') {
+    const errObj = pendingOutcome.err;
+    return {
+      ...baseResult,
+      ok: false,
+      verified: false,
+      error: errObj.error || errObj.message || 'Swap operation failed',
+      code: errObj.code || 'swap-failed',
+      stage: errObj.stage || 'operation',
+      reason: errObj.reason || errObj.message,
+    };
+  }
+
+  return {
+    ...baseResult,
+    ok: true,
+    verified: true,
+  };
 }
