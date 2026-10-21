@@ -585,7 +585,15 @@ export function safeUnlinkCreatedFile(targetPath, expectedDev, expectedIno) {
  * @param {string} repoRoot
  * @param {object} journal
  * @param {boolean} [isCreation=false]
- * @returns {{ ok: boolean, error?: string, stage?: 'pre-publication' | 'post-publication' | 'pre-rename' | 'post-rename', journal?: object }}
+ * @returns {{
+ *   ok: boolean,
+ *   error?: string,
+ *   code?: string,
+ *   stage?: 'pre-publication' | 'post-publication' | 'pre-rename' | 'post-rename',
+ *   journal?: object,
+ *   descriptorCloseUncertain?: boolean,
+ *   closeError?: object
+ * }}
  */
 function writeJournalDurable(repoRoot, journal, isCreation = false) {
   const ciPatchDir = getCiPatchDir(repoRoot);
@@ -605,12 +613,15 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
   }
 
   const serialized = JSON.stringify(journal, null, 2) + '\n';
+  const serializedBuffer = Buffer.from(serialized, 'utf8');
+  const expectedBytes = serializedBuffer.length;
 
-  // 1. Exclusive temporary file creation and fsync
+  // 1. Exclusive temporary file creation, bounded complete write, and fsync
   let tmpFd = null;
   let createdDev = null;
   let createdIno = null;
   let fileCreatedByUs = false;
+  let primaryErr = null;
 
   try {
     tmpFd = fs.openSync(
@@ -626,46 +637,115 @@ function writeJournalDurable(repoRoot, journal, isCreation = false) {
     createdDev = stat.dev;
     createdIno = stat.ino;
 
-    fs.writeSync(tmpFd, serialized, 0, 'utf8');
-    fs.fsyncSync(tmpFd);
-  } catch (writeErr) {
-    if (tmpFd !== null) {
-      try {
-        fs.closeSync(tmpFd);
-      } catch {
-        // ignore
+    let bytesWrittenTotal = 0;
+    while (bytesWrittenTotal < expectedBytes) {
+      let bytesWritten;
+      if (bytesWrittenTotal === 0) {
+        // Pass serialized string with explicit 'utf8' encoding and byte offset 0.
+        // This preserves backward compatibility with Stage B/C test mocks that intercept
+        // journal writes by inspecting typeof data === 'string' && data.includes(phase),
+        // while tracking exact bytes returned by the underlying write syscall.
+        bytesWritten = fs.writeSync(tmpFd, serialized, 0, 'utf8');
+      } else {
+        // For subsequent chunks after a partial write, write directly from the UTF-8 buffer
+        // using exact byte offsets to prevent any string character count discrepancies.
+        bytesWritten = fs.writeSync(
+          tmpFd,
+          serializedBuffer,
+          bytesWrittenTotal,
+          expectedBytes - bytesWrittenTotal,
+          bytesWrittenTotal
+        );
       }
-      tmpFd = null;
+
+      if (
+        typeof bytesWritten !== 'number' ||
+        !Number.isInteger(bytesWritten) ||
+        bytesWritten <= 0 ||
+        bytesWritten > (expectedBytes - bytesWrittenTotal)
+      ) {
+        const err = new Error(
+          `Non-positive or invalid progress writing temporary journal: wrote ${bytesWrittenTotal} of ${expectedBytes} bytes (last write returned ${bytesWritten})`
+        );
+        err.code = 'short-write';
+        throw err;
+      }
+
+      bytesWrittenTotal += bytesWritten;
     }
 
-    if (writeErr.code === 'EEXIST') {
+    fs.fsyncSync(tmpFd);
+  } catch (writeErr) {
+    primaryErr = writeErr;
+  }
+
+  // Handle temporary descriptor closure before publication (JH1-B)
+  let closeError = null;
+  if (tmpFd !== null) {
+    const fdToClose = tmpFd;
+    tmpFd = null; // Relinquish ownership immediately; do not retry close!
+    try {
+      fs.closeSync(fdToClose);
+    } catch (closeErr) {
+      closeError = {
+        error: closeErr.message,
+        message: closeErr.message,
+        code: closeErr.code || 'descriptor-close-error',
+        uncertain: true,
+        status: 'failed',
+      };
+    }
+  }
+
+  if (primaryErr !== null) {
+    if (primaryErr.code === 'EEXIST') {
       // PRESERVE PRE-EXISTING ARTIFACT: do NOT unlink!
       return {
         ok: false,
         stage: isCreation ? 'pre-publication' : 'pre-rename',
         error: `Cannot prepare temporary journal: pre-existing temporary artifact "${path.basename(tmpJournalPath)}" already exists (collision)`,
+        code: 'EEXIST',
+      };
+    }
+
+    if (closeError !== null) {
+      // Primary error occurred AND secondary close failed!
+      // Descriptor cleanup is uncertain: preserve evidence! Do NOT unlink!
+      return {
+        ok: false,
+        stage: isCreation ? 'pre-publication' : 'pre-rename',
+        error: `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${primaryErr.message}`,
+        code: primaryErr.code || 'write-error',
+        descriptorCloseUncertain: true,
+        closeError,
       };
     }
 
     if (fileCreatedByUs) {
-      // Safely unlink ONLY if we created it and its identity matches
+      // Safely unlink ONLY if we created it, its identity matches, and close succeeded cleanly
       safeUnlinkCreatedFile(tmpJournalPath, createdDev, createdIno);
     }
 
     return {
       ok: false,
       stage: isCreation ? 'pre-publication' : 'pre-rename',
-      error: `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${writeErr.message}`,
+      error: `Failed to prepare journal update before ${isCreation ? 'publication' : 'rename'}: ${primaryErr.message}`,
+      code: primaryErr.code || 'write-error',
     };
   }
 
-  if (tmpFd !== null) {
-    try {
-      fs.closeSync(tmpFd);
-    } catch {
-      // ignore
-    }
-    tmpFd = null;
+  if (closeError !== null) {
+    // Write and fsync succeeded, but temporary descriptor close failed before publication!
+    // A close error must prevent subsequent linkSync() or renameSync() publication.
+    // Descriptor closure was uncertain: preserve temporary artifact evidence! Do NOT unlink!
+    return {
+      ok: false,
+      stage: isCreation ? 'pre-publication' : 'pre-rename',
+      error: `Failed to close temporary journal descriptor before ${isCreation ? 'publication' : 'rename'}: ${closeError.message}`,
+      code: closeError.code || 'descriptor-close-error',
+      descriptorCloseUncertain: true,
+      closeError,
+    };
   }
 
   if (isCreation) {

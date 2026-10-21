@@ -945,6 +945,1136 @@ describe('Installer Journal Primitives (journal.js)', () => {
       }
     });
   });
+
+  describe('D01-P3B-2D-2-C-JH1: Temporary Journal I/O Integrity', () => {
+    test('JH1-01: normal journal creation writes complete UTF-8 payload and advances to LOCKED', () => {
+      const repo = createTempDir('jh1-create-normal-');
+      const txId = generateTxId();
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+      const res = createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      assert.equal(res.ok, true);
+      assert.ok(res.journal);
+      assert.equal(res.journal.phase, 'LOCKED');
+
+      const journalPath = path.join(repo, '.ci-patch', 'journal.json');
+      const raw = fs.readFileSync(journalPath, 'utf8');
+      assert.ok(raw.endsWith('\n'));
+      assert.deepEqual(JSON.parse(raw), res.journal);
+
+      const tmpPath = path.join(repo, '.ci-patch', `.journal.${txId}.tmp`);
+      assert.equal(fs.existsSync(tmpPath), false);
+    });
+
+    test('JH1-02: normal phase advancement writes complete UTF-8 payload and advances phase', () => {
+      const repo = createTempDir('jh1-advance-normal-');
+      const txId = generateTxId();
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      const res = advanceJournalPhase({
+        repoRoot: repo,
+        txId,
+        lease,
+        nextPhase: 'ISOLATED_PREPARED',
+        metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+      });
+
+      assert.equal(res.ok, true);
+      assert.ok(res.journal);
+      assert.equal(res.journal.phase, 'ISOLATED_PREPARED');
+
+      const journalPath = path.join(repo, '.ci-patch', 'journal.json');
+      const raw = fs.readFileSync(journalPath, 'utf8');
+      assert.deepEqual(JSON.parse(raw), res.journal);
+
+      const tmpPath = path.join(repo, '.ci-patch', `.journal.${txId}.tmp`);
+      assert.equal(fs.existsSync(tmpPath), false);
+    });
+
+    test('JH1-03: recovers from positive partial writes during createJournal and advanceJournalPhase', () => {
+      // 1. In createJournal
+      const repo1 = createTempDir('jh1-partial-create-');
+      const txId1 = generateTxId();
+      const { lease: lease1 } = acquireLock({ repoRoot: repo1, txId: txId1, op: 'apply' });
+
+      const origWrite = fs.writeSync;
+      let partialCalls1 = 0;
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string') {
+          const buf = Buffer.from(data, 'utf8');
+          if (buf.length > 30) {
+            partialCalls1++;
+            const chunk = buf.subarray(0, 30);
+            return origWrite.call(fs, fd, chunk, 0, 30, 0);
+          }
+        } else if (Buffer.isBuffer(data) && args[1] > 30) {
+          partialCalls1++;
+          const chunk = Math.min(30, args[1]);
+          return origWrite.call(fs, fd, data, args[0], chunk, args[2]);
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      try {
+        const res1 = createJournal({
+          repoRoot: repo1,
+          txId: txId1,
+          op: 'apply',
+          targetFile: 'src/endpoints/stable-diffusion.js',
+          expectedInitialSha256: stockSha,
+          expectedResultSha256: patchedSha,
+          lease: lease1,
+        });
+
+        assert.equal(res1.ok, true);
+        assert.ok(partialCalls1 > 1, 'Expected multiple writeSync chunks');
+        const raw1 = fs.readFileSync(path.join(repo1, '.ci-patch', 'journal.json'), 'utf8');
+        assert.deepEqual(JSON.parse(raw1), res1.journal);
+      } finally {
+        fs.writeSync = origWrite;
+      }
+
+      // 2. In advanceJournalPhase
+      const repo2 = createTempDir('jh1-partial-advance-');
+      const txId2 = generateTxId();
+      const { lease: lease2 } = acquireLock({ repoRoot: repo2, txId: txId2, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo2,
+        txId: txId2,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease: lease2,
+      });
+
+      let partialCalls2 = 0;
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string') {
+          const buf = Buffer.from(data, 'utf8');
+          if (buf.length > 30) {
+            partialCalls2++;
+            const chunk = buf.subarray(0, 30);
+            return origWrite.call(fs, fd, chunk, 0, 30, 0);
+          }
+        } else if (Buffer.isBuffer(data) && args[1] > 30) {
+          partialCalls2++;
+          const chunk = Math.min(30, args[1]);
+          return origWrite.call(fs, fd, data, args[0], chunk, args[2]);
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      try {
+        const res2 = advanceJournalPhase({
+          repoRoot: repo2,
+          txId: txId2,
+          lease: lease2,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId2}/stable-diffusion.js` },
+        });
+
+        assert.equal(res2.ok, true);
+        assert.ok(partialCalls2 > 1, 'Expected multiple writeSync chunks');
+        const raw2 = fs.readFileSync(path.join(repo2, '.ci-patch', 'journal.json'), 'utf8');
+        assert.deepEqual(JSON.parse(raw2), res2.journal);
+      } finally {
+        fs.writeSync = origWrite;
+      }
+    });
+
+    test('JH1-04: rejects zero-byte progress writes during createJournal and advanceJournalPhase', () => {
+      const origWrite = fs.writeSync;
+
+      // 1. createJournal
+      const repo1 = createTempDir('jh1-zero-write-create-');
+      const txId1 = generateTxId();
+      const { lease: lease1 } = acquireLock({ repoRoot: repo1, txId: txId1, op: 'apply' });
+
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string' || Buffer.isBuffer(data)) {
+          return 0; // zero progress!
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      try {
+        const res1 = createJournal({
+          repoRoot: repo1,
+          txId: txId1,
+          op: 'apply',
+          targetFile: 'src/endpoints/stable-diffusion.js',
+          expectedInitialSha256: stockSha,
+          expectedResultSha256: patchedSha,
+          lease: lease1,
+        });
+
+        assert.equal(res1.ok, false);
+        assert.equal(res1.stage, 'pre-publication');
+        assert.equal(res1.code, 'short-write');
+        assert.match(res1.error, /Non-positive or invalid progress/);
+        assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', 'journal.json')), false);
+        assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', `.journal.${txId1}.tmp`)), false);
+      } finally {
+        fs.writeSync = origWrite;
+      }
+
+      // 2. advanceJournalPhase
+      const repo2 = createTempDir('jh1-zero-write-advance-');
+      const txId2 = generateTxId();
+      const { lease: lease2 } = acquireLock({ repoRoot: repo2, txId: txId2, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo2,
+        txId: txId2,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease: lease2,
+      });
+
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string' || Buffer.isBuffer(data)) {
+          return 0; // zero progress!
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      try {
+        const res2 = advanceJournalPhase({
+          repoRoot: repo2,
+          txId: txId2,
+          lease: lease2,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId2}/stable-diffusion.js` },
+        });
+
+        assert.equal(res2.ok, false);
+        assert.equal(res2.stage, 'pre-rename');
+        assert.equal(res2.code, 'short-write');
+        assert.match(res2.error, /Non-positive or invalid progress/);
+
+        // Original journal unchanged in LOCKED phase
+        const j = inspectJournal(repo2);
+        assert.equal(j.hasJournal, true);
+        assert.equal(j.journal.phase, 'LOCKED');
+        assert.equal(fs.existsSync(path.join(repo2, '.ci-patch', `.journal.${txId2}.tmp`)), false);
+      } finally {
+        fs.writeSync = origWrite;
+      }
+    });
+
+    test('JH1-05: write throws after partial progress during createJournal and advanceJournalPhase', () => {
+      const origWrite = fs.writeSync;
+
+      // 1. createJournal
+      const repo1 = createTempDir('jh1-write-throw-create-');
+      const txId1 = generateTxId();
+      const { lease: lease1 } = acquireLock({ repoRoot: repo1, txId: txId1, op: 'apply' });
+
+      let writeCount1 = 0;
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string' || Buffer.isBuffer(data)) {
+          writeCount1++;
+          if (writeCount1 === 1) {
+            const buf = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
+            const chunk = buf.subarray(0, Math.min(40, buf.length));
+            return origWrite.call(fs, fd, chunk, 0, chunk.length, 0);
+          }
+          const err = new Error('Simulated ENOSPC on write');
+          err.code = 'ENOSPC';
+          throw err;
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      try {
+        const res1 = createJournal({
+          repoRoot: repo1,
+          txId: txId1,
+          op: 'apply',
+          targetFile: 'src/endpoints/stable-diffusion.js',
+          expectedInitialSha256: stockSha,
+          expectedResultSha256: patchedSha,
+          lease: lease1,
+        });
+
+        assert.equal(res1.ok, false);
+        assert.equal(res1.stage, 'pre-publication');
+        assert.equal(res1.code, 'ENOSPC');
+        assert.match(res1.error, /Simulated ENOSPC on write/);
+        assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', 'journal.json')), false);
+        assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', `.journal.${txId1}.tmp`)), false);
+      } finally {
+        fs.writeSync = origWrite;
+      }
+
+      // 2. advanceJournalPhase
+      const repo2 = createTempDir('jh1-write-throw-advance-');
+      const txId2 = generateTxId();
+      const { lease: lease2 } = acquireLock({ repoRoot: repo2, txId: txId2, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo2,
+        txId: txId2,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease: lease2,
+      });
+
+      let writeCount2 = 0;
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string' || Buffer.isBuffer(data)) {
+          writeCount2++;
+          if (writeCount2 === 1) {
+            const buf = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
+            const chunk = buf.subarray(0, Math.min(40, buf.length));
+            return origWrite.call(fs, fd, chunk, 0, chunk.length, 0);
+          }
+          const err = new Error('Simulated ENOSPC on write');
+          err.code = 'ENOSPC';
+          throw err;
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      try {
+        const res2 = advanceJournalPhase({
+          repoRoot: repo2,
+          txId: txId2,
+          lease: lease2,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId2}/stable-diffusion.js` },
+        });
+
+        assert.equal(res2.ok, false);
+        assert.equal(res2.stage, 'pre-rename');
+        assert.equal(res2.code, 'ENOSPC');
+        assert.match(res2.error, /Simulated ENOSPC on write/);
+
+        const j = inspectJournal(repo2);
+        assert.equal(j.hasJournal, true);
+        assert.equal(j.journal.phase, 'LOCKED');
+        assert.equal(fs.existsSync(path.join(repo2, '.ci-patch', `.journal.${txId2}.tmp`)), false);
+      } finally {
+        fs.writeSync = origWrite;
+      }
+    });
+
+    test('JH1-06: file fsync failure aborts createJournal and advanceJournalPhase before publication', () => {
+      const origFsync = fs.fsyncSync;
+
+      // 1. createJournal
+      const repo1 = createTempDir('jh1-fsync-create-');
+      const txId1 = generateTxId();
+      const { lease: lease1 } = acquireLock({ repoRoot: repo1, txId: txId1, op: 'apply' });
+
+      fs.fsyncSync = (fd) => {
+        try {
+          const st = fs.fstatSync(fd);
+          if (st.isFile()) {
+            const err = new Error('Simulated EIO on tmpFd fsync');
+            err.code = 'EIO';
+            throw err;
+          }
+        } catch (err) {
+          if (err.code === 'EIO') throw err;
+        }
+        return origFsync(fd);
+      };
+
+      try {
+        const res1 = createJournal({
+          repoRoot: repo1,
+          txId: txId1,
+          op: 'apply',
+          targetFile: 'src/endpoints/stable-diffusion.js',
+          expectedInitialSha256: stockSha,
+          expectedResultSha256: patchedSha,
+          lease: lease1,
+        });
+
+        assert.equal(res1.ok, false);
+        assert.equal(res1.stage, 'pre-publication');
+        assert.equal(res1.code, 'EIO');
+        assert.match(res1.error, /Simulated EIO on tmpFd fsync/);
+        assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', 'journal.json')), false);
+        assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', `.journal.${txId1}.tmp`)), false);
+      } finally {
+        fs.fsyncSync = origFsync;
+      }
+
+      // 2. advanceJournalPhase
+      const repo2 = createTempDir('jh1-fsync-advance-');
+      const txId2 = generateTxId();
+      const { lease: lease2 } = acquireLock({ repoRoot: repo2, txId: txId2, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo2,
+        txId: txId2,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease: lease2,
+      });
+
+      fs.fsyncSync = (fd) => {
+        try {
+          const st = fs.fstatSync(fd);
+          if (st.isFile()) {
+            const err = new Error('Simulated EIO on tmpFd fsync');
+            err.code = 'EIO';
+            throw err;
+          }
+        } catch (err) {
+          if (err.code === 'EIO') throw err;
+        }
+        return origFsync(fd);
+      };
+
+      try {
+        const res2 = advanceJournalPhase({
+          repoRoot: repo2,
+          txId: txId2,
+          lease: lease2,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId2}/stable-diffusion.js` },
+        });
+
+        assert.equal(res2.ok, false);
+        assert.equal(res2.stage, 'pre-rename');
+        assert.equal(res2.code, 'EIO');
+
+        const j = inspectJournal(repo2);
+        assert.equal(j.hasJournal, true);
+        assert.equal(j.journal.phase, 'LOCKED');
+        assert.equal(fs.existsSync(path.join(repo2, '.ci-patch', `.journal.${txId2}.tmp`)), false);
+      } finally {
+        fs.fsyncSync = origFsync;
+      }
+    });
+
+    test('JH1-07: temporary descriptor close failure before publication fails closed and preserves temp artifact', () => {
+      const origClose = fs.closeSync;
+
+      // 1. createJournal
+      const repo1 = createTempDir('jh1-close-create-');
+      const txId1 = generateTxId();
+      const { lease: lease1 } = acquireLock({ repoRoot: repo1, txId: txId1, op: 'apply' });
+
+      let closeFailed1 = false;
+      fs.closeSync = (fd) => {
+        try {
+          const st = fs.fstatSync(fd);
+          if (st.isFile() && (st.mode & 0o777) === 0o600 && !closeFailed1) {
+            closeFailed1 = true;
+            origClose(fd); // Close in OS to prevent test process leak
+            const err = new Error('Simulated EIO on tmpFd closeSync');
+            err.code = 'EIO';
+            throw err;
+          }
+        } catch (err) {
+          if (err.code === 'EIO') throw err;
+        }
+        return origClose(fd);
+      };
+
+      try {
+        const res1 = createJournal({
+          repoRoot: repo1,
+          txId: txId1,
+          op: 'apply',
+          targetFile: 'src/endpoints/stable-diffusion.js',
+          expectedInitialSha256: stockSha,
+          expectedResultSha256: patchedSha,
+          lease: lease1,
+        });
+
+        assert.equal(res1.ok, false);
+        assert.equal(res1.stage, 'pre-publication');
+        assert.equal(res1.descriptorCloseUncertain, true);
+        assert.equal(res1.code, 'EIO');
+        assert.ok(res1.closeError);
+        assert.equal(res1.closeError.code, 'EIO');
+        assert.equal(res1.closeError.uncertain, true);
+        assert.match(res1.error, /Failed to close temporary journal descriptor before publication/);
+
+        // Publication did NOT occur
+        assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', 'journal.json')), false);
+        // Temporary artifact is PRESERVED on disk due to uncertainty
+        assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', `.journal.${txId1}.tmp`)), true);
+      } finally {
+        fs.closeSync = origClose;
+      }
+
+      // 2. advanceJournalPhase
+      const repo2 = createTempDir('jh1-close-advance-');
+      const txId2 = generateTxId();
+      const { lease: lease2 } = acquireLock({ repoRoot: repo2, txId: txId2, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo2,
+        txId: txId2,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease: lease2,
+      });
+
+      let closeFailed2 = false;
+      fs.closeSync = (fd) => {
+        try {
+          const st = fs.fstatSync(fd);
+          if (st.isFile() && (st.mode & 0o777) === 0o600 && !closeFailed2) {
+            closeFailed2 = true;
+            origClose(fd);
+            const err = new Error('Simulated EIO on tmpFd closeSync');
+            err.code = 'EIO';
+            throw err;
+          }
+        } catch (err) {
+          if (err.code === 'EIO') throw err;
+        }
+        return origClose(fd);
+      };
+
+      try {
+        const res2 = advanceJournalPhase({
+          repoRoot: repo2,
+          txId: txId2,
+          lease: lease2,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId2}/stable-diffusion.js` },
+        });
+
+        assert.equal(res2.ok, false);
+        assert.equal(res2.stage, 'pre-rename');
+        assert.equal(res2.descriptorCloseUncertain, true);
+        assert.ok(res2.closeError);
+        assert.equal(res2.code, 'EIO');
+        assert.match(res2.error, /Failed to close temporary journal descriptor before rename/);
+
+        // Original journal unchanged in LOCKED phase
+        const j = inspectJournal(repo2);
+        assert.equal(j.hasJournal, true);
+        assert.equal(j.journal.phase, 'LOCKED');
+        // Temporary artifact is PRESERVED on disk due to uncertainty
+        assert.equal(fs.existsSync(path.join(repo2, '.ci-patch', `.journal.${txId2}.tmp`)), true);
+      } finally {
+        fs.closeSync = origClose;
+      }
+    });
+
+    test('JH1-08: primary write error plus secondary close failure preserves primary error and preserves temp artifact', () => {
+      const origWrite = fs.writeSync;
+      const origClose = fs.closeSync;
+
+      // 1. createJournal
+      const repo1 = createTempDir('jh1-write-close-fail-create-');
+      const txId1 = generateTxId();
+      const { lease: lease1 } = acquireLock({ repoRoot: repo1, txId: txId1, op: 'apply' });
+
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string' || Buffer.isBuffer(data)) {
+          const err = new Error('Primary write fault');
+          err.code = 'EIO';
+          throw err;
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      let closeFailed1 = false;
+      fs.closeSync = (fd) => {
+        try {
+          const st = fs.fstatSync(fd);
+          if (st.isFile() && (st.mode & 0o777) === 0o600 && !closeFailed1) {
+            closeFailed1 = true;
+            origClose(fd);
+            const err = new Error('Secondary close cleanup fault');
+            err.code = 'EBADF';
+            throw err;
+          }
+        } catch (err) {
+          if (err.code === 'EBADF') throw err;
+        }
+        return origClose(fd);
+      };
+
+      try {
+        const res1 = createJournal({
+          repoRoot: repo1,
+          txId: txId1,
+          op: 'apply',
+          targetFile: 'src/endpoints/stable-diffusion.js',
+          expectedInitialSha256: stockSha,
+          expectedResultSha256: patchedSha,
+          lease: lease1,
+        });
+
+        assert.equal(res1.ok, false);
+        assert.equal(res1.stage, 'pre-publication');
+        assert.equal(res1.code, 'EIO', 'Primary error code must be preserved');
+        assert.match(res1.error, /Primary write fault/, 'Primary error message must be preserved');
+        assert.equal(res1.descriptorCloseUncertain, true);
+        assert.ok(res1.closeError);
+        assert.equal(res1.closeError.code, 'EBADF');
+        assert.match(res1.closeError.error, /Secondary close cleanup fault/);
+
+        // Destination journal not published
+        assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', 'journal.json')), false);
+        // Temp file preserved due to cleanup uncertainty
+        assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', `.journal.${txId1}.tmp`)), true);
+      } finally {
+        fs.writeSync = origWrite;
+        fs.closeSync = origClose;
+      }
+
+      // 2. advanceJournalPhase
+      const repo2 = createTempDir('jh1-write-close-fail-advance-');
+      const txId2 = generateTxId();
+      const { lease: lease2 } = acquireLock({ repoRoot: repo2, txId: txId2, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo2,
+        txId: txId2,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease: lease2,
+      });
+
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string' || Buffer.isBuffer(data)) {
+          const err = new Error('Primary write fault');
+          err.code = 'EIO';
+          throw err;
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      let closeFailed2 = false;
+      fs.closeSync = (fd) => {
+        try {
+          const st = fs.fstatSync(fd);
+          if (st.isFile() && (st.mode & 0o777) === 0o600 && !closeFailed2) {
+            closeFailed2 = true;
+            origClose(fd);
+            const err = new Error('Secondary close cleanup fault');
+            err.code = 'EBADF';
+            throw err;
+          }
+        } catch (err) {
+          if (err.code === 'EBADF') throw err;
+        }
+        return origClose(fd);
+      };
+
+      try {
+        const res2 = advanceJournalPhase({
+          repoRoot: repo2,
+          txId: txId2,
+          lease: lease2,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId2}/stable-diffusion.js` },
+        });
+
+        assert.equal(res2.ok, false);
+        assert.equal(res2.stage, 'pre-rename');
+        assert.equal(res2.code, 'EIO', 'Primary error code must be preserved');
+        assert.match(res2.error, /Primary write fault/);
+        assert.equal(res2.descriptorCloseUncertain, true);
+        assert.ok(res2.closeError);
+        assert.equal(res2.closeError.code, 'EBADF');
+
+        // Original journal intact in LOCKED phase
+        const j = inspectJournal(repo2);
+        assert.equal(j.hasJournal, true);
+        assert.equal(j.journal.phase, 'LOCKED');
+        // Temp file preserved due to cleanup uncertainty
+        assert.equal(fs.existsSync(path.join(repo2, '.ci-patch', `.journal.${txId2}.tmp`)), true);
+      } finally {
+        fs.writeSync = origWrite;
+        fs.closeSync = origClose;
+      }
+    });
+
+    test('JH1-09: pre-existing temporary artifact collision preserves pre-existing file in create and advance', () => {
+      // 1. createJournal
+      const repo1 = createTempDir('jh1-collision-create-');
+      const txId1 = generateTxId();
+      const { lease: lease1 } = acquireLock({ repoRoot: repo1, txId: txId1, op: 'apply' });
+
+      const tmpPath1 = path.join(repo1, '.ci-patch', `.journal.${txId1}.tmp`);
+      fs.writeFileSync(tmpPath1, 'colliding-create-data\n', { mode: 0o600 });
+
+      const res1 = createJournal({
+        repoRoot: repo1,
+        txId: txId1,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease: lease1,
+      });
+
+      assert.equal(res1.ok, false);
+      assert.equal(res1.stage, 'pre-publication');
+      assert.equal(res1.code, 'EEXIST');
+      assert.match(res1.error, /pre-existing temporary artifact.*already exists \(collision\)/);
+      assert.equal(fs.readFileSync(tmpPath1, 'utf8'), 'colliding-create-data\n');
+      assert.equal(fs.existsSync(path.join(repo1, '.ci-patch', 'journal.json')), false);
+
+      // 2. advanceJournalPhase
+      const repo2 = createTempDir('jh1-collision-advance-');
+      const txId2 = generateTxId();
+      const { lease: lease2 } = acquireLock({ repoRoot: repo2, txId: txId2, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo2,
+        txId: txId2,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease: lease2,
+      });
+
+      const tmpPath2 = path.join(repo2, '.ci-patch', `.journal.${txId2}.tmp`);
+      fs.writeFileSync(tmpPath2, 'colliding-advance-data\n', { mode: 0o600 });
+
+      const res2 = advanceJournalPhase({
+        repoRoot: repo2,
+        txId: txId2,
+        lease: lease2,
+        nextPhase: 'ISOLATED_PREPARED',
+        metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId2}/stable-diffusion.js` },
+      });
+
+      assert.equal(res2.ok, false);
+      assert.equal(res2.stage, 'pre-rename');
+      assert.equal(res2.code, 'EEXIST');
+      assert.match(res2.error, /pre-existing temporary artifact.*already exists \(collision\)/);
+      assert.equal(fs.readFileSync(tmpPath2, 'utf8'), 'colliding-advance-data\n');
+
+      const j = inspectJournal(repo2);
+      assert.equal(j.hasJournal, true);
+      assert.equal(j.journal.phase, 'LOCKED');
+    });
+
+    test('JH1-10: safeUnlinkCreatedFile enforces positive device/inode identity and rejects foreign or symlink files', () => {
+      const dir = createTempDir('jh1-safe-unlink-');
+      const filePath = path.join(dir, 'target.tmp');
+      fs.writeFileSync(filePath, 'safe-unlink-payload\n');
+      const st = fs.lstatSync(filePath);
+
+      // 1. Invalid dev / ino
+      assert.equal(safeUnlinkCreatedFile(filePath, null, st.ino), false);
+      assert.equal(safeUnlinkCreatedFile(filePath, st.dev, null), false);
+      assert.equal(safeUnlinkCreatedFile(filePath, -1, st.ino), false);
+      assert.equal(safeUnlinkCreatedFile(filePath, st.dev, 0), false);
+      assert.equal(safeUnlinkCreatedFile(filePath, st.dev, -5), false);
+      assert.equal(fs.existsSync(filePath), true);
+
+      // 2. Mismatched dev / ino
+      const fakeDev = typeof st.dev === 'bigint' ? st.dev + 999999n : st.dev + 999999;
+      const fakeIno = typeof st.ino === 'bigint' ? st.ino + 999999n : st.ino + 999999;
+      assert.equal(safeUnlinkCreatedFile(filePath, fakeDev, st.ino), false);
+      assert.equal(safeUnlinkCreatedFile(filePath, st.dev, fakeIno), false);
+      assert.equal(fs.existsSync(filePath), true);
+
+      // 3. Symlink target
+      const symPath = path.join(dir, 'target-sym.tmp');
+      fs.symlinkSync(filePath, symPath);
+      assert.equal(safeUnlinkCreatedFile(symPath, st.dev, st.ino), false);
+      assert.equal(fs.existsSync(symPath), true);
+      fs.unlinkSync(symPath);
+
+      // 4. Exact dev & ino match
+      assert.equal(safeUnlinkCreatedFile(filePath, st.dev, st.ino), true);
+      assert.equal(fs.existsSync(filePath), false);
+    });
+
+    test('JH1-11: no journal publication occurs after incomplete write or write failure', () => {
+      const origLink = fs.linkSync;
+      const origRename = fs.renameSync;
+      const origWrite = fs.writeSync;
+
+      let linkCalled = false;
+      let renameCalled = false;
+
+      fs.linkSync = (...args) => {
+        linkCalled = true;
+        return origLink.apply(fs, args);
+      };
+      fs.renameSync = (...args) => {
+        renameCalled = true;
+        return origRename.apply(fs, args);
+      };
+
+      // 1. Create with short write
+      const repo1 = createTempDir('jh1-no-pub-write-create-');
+      const txId1 = generateTxId();
+      const { lease: lease1 } = acquireLock({ repoRoot: repo1, txId: txId1, op: 'apply' });
+
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string' || Buffer.isBuffer(data)) {
+          return 0; // zero progress
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      try {
+        const res = createJournal({
+          repoRoot: repo1,
+          txId: txId1,
+          op: 'apply',
+          targetFile: 'src/endpoints/stable-diffusion.js',
+          expectedInitialSha256: stockSha,
+          expectedResultSha256: patchedSha,
+          lease: lease1,
+        });
+
+        assert.equal(res.ok, false);
+        assert.equal(linkCalled, false, 'linkSync must never be called after write failure');
+      } finally {
+        fs.writeSync = origWrite;
+        fs.linkSync = origLink;
+        fs.renameSync = origRename;
+      }
+
+      // 2. Advance with write throw
+      const repo2 = createTempDir('jh1-no-pub-write-advance-');
+      const txId2 = generateTxId();
+      const { lease: lease2 } = acquireLock({ repoRoot: repo2, txId: txId2, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo2,
+        txId: txId2,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease: lease2,
+      });
+
+      fs.linkSync = (...args) => {
+        linkCalled = true;
+        return origLink.apply(fs, args);
+      };
+      fs.renameSync = (...args) => {
+        renameCalled = true;
+        return origRename.apply(fs, args);
+      };
+
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string' || Buffer.isBuffer(data)) {
+          throw new Error('EIO on write');
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      try {
+        const res = advanceJournalPhase({
+          repoRoot: repo2,
+          txId: txId2,
+          lease: lease2,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId2}/stable-diffusion.js` },
+        });
+
+        assert.equal(res.ok, false);
+        assert.equal(renameCalled, false, 'renameSync must never be called after write failure');
+      } finally {
+        fs.writeSync = origWrite;
+        fs.linkSync = origLink;
+        fs.renameSync = origRename;
+      }
+    });
+
+    test('JH1-12: no journal publication occurs after uncertain temporary descriptor close', () => {
+      const origLink = fs.linkSync;
+      const origRename = fs.renameSync;
+      const origClose = fs.closeSync;
+
+      let linkCalled = false;
+      let renameCalled = false;
+
+      fs.linkSync = (...args) => {
+        linkCalled = true;
+        return origLink.apply(fs, args);
+      };
+      fs.renameSync = (...args) => {
+        renameCalled = true;
+        return origRename.apply(fs, args);
+      };
+
+      // 1. Create with close throw
+      const repo1 = createTempDir('jh1-no-pub-close-create-');
+      const txId1 = generateTxId();
+      const { lease: lease1 } = acquireLock({ repoRoot: repo1, txId: txId1, op: 'apply' });
+
+      let closeFailed1 = false;
+      fs.closeSync = (fd) => {
+        try {
+          const st = fs.fstatSync(fd);
+          if (st.isFile() && (st.mode & 0o777) === 0o600 && !closeFailed1) {
+            closeFailed1 = true;
+            origClose(fd);
+            const err = new Error('EIO on close');
+            err.code = 'EIO';
+            throw err;
+          }
+        } catch (err) {
+          if (err.code === 'EIO') throw err;
+        }
+        return origClose(fd);
+      };
+
+      try {
+        const res = createJournal({
+          repoRoot: repo1,
+          txId: txId1,
+          op: 'apply',
+          targetFile: 'src/endpoints/stable-diffusion.js',
+          expectedInitialSha256: stockSha,
+          expectedResultSha256: patchedSha,
+          lease: lease1,
+        });
+
+        assert.equal(res.ok, false);
+        assert.equal(linkCalled, false, 'linkSync must never be called after close failure');
+      } finally {
+        fs.closeSync = origClose;
+        fs.linkSync = origLink;
+        fs.renameSync = origRename;
+      }
+
+      // 2. Advance with close throw
+      const repo2 = createTempDir('jh1-no-pub-close-advance-');
+      const txId2 = generateTxId();
+      const { lease: lease2 } = acquireLock({ repoRoot: repo2, txId: txId2, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo2,
+        txId: txId2,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease: lease2,
+      });
+
+      let closeFailed2 = false;
+      fs.closeSync = (fd) => {
+        try {
+          const st = fs.fstatSync(fd);
+          if (st.isFile() && (st.mode & 0o777) === 0o600 && !closeFailed2) {
+            closeFailed2 = true;
+            origClose(fd);
+            const err = new Error('EIO on close');
+            err.code = 'EIO';
+            throw err;
+          }
+        } catch (err) {
+          if (err.code === 'EIO') throw err;
+        }
+        return origClose(fd);
+      };
+
+      try {
+        const res = advanceJournalPhase({
+          repoRoot: repo2,
+          txId: txId2,
+          lease: lease2,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId2}/stable-diffusion.js` },
+        });
+
+        assert.equal(res.ok, false);
+        assert.equal(renameCalled, false, 'renameSync must never be called after close failure');
+      } finally {
+        fs.closeSync = origClose;
+        fs.linkSync = origLink;
+        fs.renameSync = origRename;
+      }
+    });
+
+    test('JH1-13: original journal is preserved 100% identically when advancement preparation fails', () => {
+      const repo = createTempDir('jh1-preserve-orig-advance-');
+      const txId = generateTxId();
+      const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+      createJournal({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        targetFile: 'src/endpoints/stable-diffusion.js',
+        expectedInitialSha256: stockSha,
+        expectedResultSha256: patchedSha,
+        lease,
+      });
+
+      const journalPath = path.join(repo, '.ci-patch', 'journal.json');
+      const beforeContent = fs.readFileSync(journalPath, 'utf8');
+      const beforeStat = fs.lstatSync(journalPath);
+
+      // Trigger write failure
+      const origWrite = fs.writeSync;
+      fs.writeSync = (fd, data, ...args) => {
+        if (typeof data === 'string' || Buffer.isBuffer(data)) {
+          throw new Error('EIO on write');
+        }
+        return origWrite.call(fs, fd, data, ...args);
+      };
+
+      try {
+        advanceJournalPhase({
+          repoRoot: repo,
+          txId,
+          lease,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+        });
+      } finally {
+        fs.writeSync = origWrite;
+      }
+
+      const afterContent = fs.readFileSync(journalPath, 'utf8');
+      const afterStat = fs.lstatSync(journalPath);
+
+      assert.equal(afterContent, beforeContent);
+      assert.equal(afterStat.ino, beforeStat.ino);
+      assert.equal(afterStat.size, beforeStat.size);
+      assert.equal(afterStat.mode, beforeStat.mode);
+    });
+
+    test('JH1-14: zero descriptor leaks across normal execution, partial writes, and failures', () => {
+      const openedFds = new Set();
+      const closedFds = new Set();
+      const origOpen = fs.openSync;
+      const origClose = fs.closeSync;
+
+      fs.openSync = (...args) => {
+        const fd = origOpen.apply(fs, args);
+        openedFds.add(fd);
+        return fd;
+      };
+      fs.closeSync = (fd) => {
+        closedFds.add(fd);
+        return origClose.apply(fs, [fd]);
+      };
+
+      try {
+        const repo = createTempDir('jh1-fd-leaks-');
+        const txId = generateTxId();
+        const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+        // Normal create
+        createJournal({
+          repoRoot: repo,
+          txId,
+          op: 'apply',
+          targetFile: 'src/endpoints/stable-diffusion.js',
+          expectedInitialSha256: stockSha,
+          expectedResultSha256: patchedSha,
+          lease,
+        });
+
+        // Normal advance
+        advanceJournalPhase({
+          repoRoot: repo,
+          txId,
+          lease,
+          nextPhase: 'ISOLATED_PREPARED',
+          metadataUpdate: { isolatedStagedPath: `.ci-patch/staging/${txId}/stable-diffusion.js` },
+        });
+
+        const unclosed = Array.from(openedFds).filter((fd) => !closedFds.has(fd));
+        assert.equal(unclosed.length, 0, `All descriptors must be closed; leaked: ${unclosed.join(', ')}`);
+      } finally {
+        fs.openSync = origOpen;
+        fs.closeSync = origClose;
+      }
+    });
+
+    test('JH1-15: child process isolation for genuine uncertain kernel close failure', () => {
+      const repo = createTempDir('jh1-child-close-fail-');
+      const script = `
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import assert from 'node:assert/strict';
+        import { acquireLock, generateTxId } from './src/patch-installer/lock.js';
+        import { createJournal, advanceJournalPhase, inspectJournal } from './src/patch-installer/journal.js';
+
+        const repo = ${JSON.stringify(repo)};
+        const txId = generateTxId();
+        const { lease } = acquireLock({ repoRoot: repo, txId, op: 'apply' });
+
+        fs.closeSync = (fd) => {
+          // Strictly simulate kernel close failure: throw WITHOUT calling origClose
+          const err = new Error('simulated kernel close failure on tmpFd');
+          err.code = 'EIO';
+          throw err;
+        };
+
+        const res = createJournal({
+          repoRoot: repo,
+          txId,
+          op: 'apply',
+          targetFile: 'src/endpoints/stable-diffusion.js',
+          expectedInitialSha256: '15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43',
+          expectedResultSha256: '16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6',
+          lease,
+        });
+
+        assert.equal(res.ok, false);
+        assert.equal(res.stage, 'pre-publication');
+        assert.equal(res.descriptorCloseUncertain, true);
+        assert.ok(res.closeError);
+        assert.equal(res.closeError.code, 'EIO');
+
+        // Confirm publication did not occur
+        const journalPath = path.join(repo, '.ci-patch', 'journal.json');
+        assert.equal(fs.existsSync(journalPath), false);
+
+        // Confirm temporary artifact was preserved
+        const tmpPath = path.join(repo, '.ci-patch', '.journal.' + txId + '.tmp');
+        assert.equal(fs.existsSync(tmpPath), true);
+      `;
+
+      child_process.execFileSync(
+        process.execPath,
+        ['--input-type=module', '-e', script],
+        { stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+    });
+  });
 });
 
 describe('Transaction State Inspection (transaction-state.js)', () => {
