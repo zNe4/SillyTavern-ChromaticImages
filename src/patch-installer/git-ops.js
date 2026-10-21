@@ -17,9 +17,11 @@ const STAGE_LINE_REGEX = /^([0-7]+)\s+([0-9a-f]{40})\s+([0-3])\t(.*)$/i;
  * @param {string|null} repoDir - Working directory for Git (-C)
  * @param {string[]} args - Subcommand and arguments
  * @param {object} [options]
+ * @param {number} [options.maxBuffer=10*1024*1024]
+ * @param {number} [options.timeout]
  * @returns {{ status: number|null, stdout: string, stderr: string, error?: Error }}
  */
-export function runGit(repoDir, args, { maxBuffer = 10 * 1024 * 1024 } = {}) {
+export function runGit(repoDir, args, { maxBuffer = 10 * 1024 * 1024, timeout } = {}) {
   const fullArgs = [];
   if (typeof repoDir === 'string' && repoDir.trim() !== '') {
     fullArgs.push('-C', repoDir);
@@ -27,17 +29,117 @@ export function runGit(repoDir, args, { maxBuffer = 10 * 1024 * 1024 } = {}) {
   fullArgs.push(...DEFAULT_GIT_OPTIONS);
   fullArgs.push(...args);
 
-  const res = spawnSync('git', fullArgs, {
+  const spawnOptions = {
     encoding: 'utf-8',
     maxBuffer,
     shell: false,
-  });
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_ASKPASS: '',
+    },
+  };
+  if (typeof timeout === 'number' && timeout > 0) {
+    spawnOptions.timeout = timeout;
+  }
+
+  const res = spawnSync('git', fullArgs, spawnOptions);
 
   return {
     status: res.status,
     stdout: res.stdout || '',
     stderr: res.stderr || '',
     error: res.error,
+  };
+}
+
+/**
+ * Execute a Git command and return stdout as raw Buffer (binary-safe).
+ * @param {string|null} repoDir
+ * @param {string[]} args
+ * @param {object} [options]
+ * @param {number} [options.maxBuffer=10*1024*1024]
+ * @param {number} [options.timeout=20000]
+ * @returns {{ status: number|null, stdout: Buffer, stderr: string, error?: Error }}
+ */
+export function runGitBinary(repoDir, args, { maxBuffer = 10 * 1024 * 1024, timeout = 20000 } = {}) {
+  const fullArgs = [];
+  if (typeof repoDir === 'string' && repoDir.trim() !== '') {
+    fullArgs.push('-C', repoDir);
+  }
+  fullArgs.push(...DEFAULT_GIT_OPTIONS);
+  fullArgs.push(...args);
+
+  const spawnOptions = {
+    encoding: null,
+    maxBuffer,
+    timeout,
+    shell: false,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_ASKPASS: '',
+    },
+  };
+
+  const res = spawnSync('git', fullArgs, spawnOptions);
+
+  return {
+    status: res.status,
+    stdout: Buffer.isBuffer(res.stdout) ? res.stdout : Buffer.from(res.stdout || ''),
+    stderr: res.stderr ? res.stderr.toString('utf-8') : '',
+    error: res.error,
+  };
+}
+
+/**
+ * Read raw object bytes (Buffer) for a git object or revision path (e.g. "FETCH_HEAD:file.txt").
+ * @param {string} repoDir
+ * @param {string} objectRef
+ * @param {object} [options]
+ * @returns {{ ok: boolean, buffer: Buffer|null, notFound: boolean, isEnvError: boolean, error: string }}
+ */
+export function getGitObjectBytes(repoDir, objectRef, options = {}) {
+  const res = runGitBinary(repoDir, ['cat-file', '-p', objectRef], options);
+  if (res.status === 0 && res.stdout) {
+    return { ok: true, buffer: res.stdout, notFound: false, isEnvError: false, error: '' };
+  }
+
+  const stderr = res.stderr.trim();
+  const errMsg = stderr || res.error?.message || `Failed to read git object ${objectRef}`;
+
+  const isSpawnOrTimeout = Boolean(res.error || res.status === null);
+  // Authoritative absence: status 128 and message explicitly indicating object/path does not exist
+  const isNotFound = !isSpawnOrTimeout && res.status === 128 && (
+    /does not exist in|Not a valid object name|fatal: path/i.test(stderr)
+  );
+  const isEnvError = isSpawnOrTimeout || (!isNotFound && res.status !== 0);
+
+  return {
+    ok: false,
+    buffer: null,
+    notFound: isNotFound,
+    isEnvError,
+    error: errMsg,
+  };
+}
+
+/**
+ * Resolve a Git revision or object to its full 40-hex SHA.
+ * @param {string} repoDir
+ * @param {string} revRef
+ * @param {object} [options]
+ * @returns {{ ok: boolean, commit: string|null, error: string }}
+ */
+export function resolveGitRev(repoDir, revRef, options = {}) {
+  const res = runGit(repoDir, ['rev-parse', '--verify', revRef], options);
+  if (res.status === 0 && res.stdout.trim()) {
+    return { ok: true, commit: res.stdout.trim().toLowerCase(), error: '' };
+  }
+  return {
+    ok: false,
+    commit: null,
+    error: res.stderr.trim() || res.error?.message || `Failed to resolve revision ${revRef}`,
   };
 }
 
@@ -267,19 +369,30 @@ export function listLocalDeveloperBranches(repoRoot) {
  * @param {string} patchPath
  * @param {object} [options]
  * @param {boolean} [options.reverse=false]
- * @returns {{ ok: boolean, exitCode: number, error: string }}
+ * @param {number} [options.timeout=10000]
+ * @returns {{ ok: boolean, exitCode: number, error: string, isConflict: boolean, isEnvError: boolean }}
  */
-export function testPatchApplicability(repoRoot, patchPath, { reverse = false } = {}) {
+export function testPatchApplicability(repoRoot, patchPath, { reverse = false, timeout = 10000 } = {}) {
   const args = ['apply', '--check'];
   if (reverse) {
     args.push('--reverse');
   }
   args.push(patchPath);
 
-  const res = runGit(repoRoot, args);
+  const res = runGit(repoRoot, args, { timeout });
+  const stderr = (res.stderr || '').trim();
+  const isSpawnOrTimeout = Boolean(res.error || res.status === null);
+  // Established patch rejection: exit status 1 with explicit git apply rejection messages
+  const isConflict = !isSpawnOrTimeout && res.status === 1 && (
+    /patch does not apply|patch failed:/i.test(stderr)
+  );
+  const isEnvError = isSpawnOrTimeout || (!isConflict && res.status !== 0);
+
   return {
     ok: res.status === 0,
     exitCode: res.status ?? 1,
-    error: res.status === 0 ? '' : res.stderr.trim() || 'Patch dry-run failed',
+    error: res.status === 0 ? '' : stderr || res.error?.message || 'Patch dry-run failed',
+    isConflict,
+    isEnvError,
   };
 }

@@ -544,6 +544,7 @@ export async function inspectTargetInstallation(options = {}) {
     ok: classification.status !== 'invalid-installation' && classification.status !== 'invalid-package',
     status: classification.status,
     transaction,
+    transactionBlocking: Boolean(transaction && transaction.isPending),
     targetDir,
     repoRoot,
     headCommit,
@@ -563,6 +564,106 @@ export async function inspectTargetInstallation(options = {}) {
     runtimePatchPath,
     reasons: classification.reasons,
     manifest,
+  };
+}
+
+/**
+ * Resolve target SillyTavern directory according to strict precedence rules:
+ * 1. Explicit target (if provided): must exist and be a directory; fails immediately if invalid without fallback.
+ * 2. SILLYTAVERN_DIR environment variable (if set): must exist and be a directory; fails if invalid.
+ * 3. Package-relative sibling directory (Parent/SillyTavern).
+ *
+ * @param {object} [options]
+ * @param {string|null} [options.explicitTarget]
+ * @param {string} [options.baseDir]
+ * @param {string} [options.packageRoot]
+ * @returns {{
+ *   ok: boolean,
+ *   targetDir: string|null,
+ *   source: 'explicit' | 'env' | 'sibling' | 'none',
+ *   error: string|null
+ * }}
+ */
+export function resolveTargetDirectory(options = {}) {
+  const explicitTarget = options.explicitTarget ?? null;
+  const baseDir = options.baseDir || process.cwd();
+  const pkgRoot = options.packageRoot || REPO_ROOT;
+
+  // 1. Explicit target takes absolute precedence without fallback
+  if (explicitTarget !== null && typeof explicitTarget === 'string') {
+    if (explicitTarget.trim() === '') {
+      return {
+        ok: false,
+        targetDir: null,
+        source: 'explicit',
+        error: 'Target directory cannot be empty or whitespace-only',
+      };
+    }
+    const candidate = path.resolve(baseDir, explicitTarget.trim());
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+        return {
+          ok: true,
+          targetDir: fs.realpathSync(candidate),
+          source: 'explicit',
+          error: null,
+        };
+      }
+    } catch {
+      // fall through
+    }
+    return {
+      ok: false,
+      targetDir: null,
+      source: 'explicit',
+      error: `Explicitly specified target directory does not exist or is not a directory: "${explicitTarget}"`,
+    };
+  }
+
+  // 2. SILLYTAVERN_DIR environment variable
+  const envTarget = process.env.SILLYTAVERN_DIR;
+  if (envTarget && typeof envTarget === 'string' && envTarget.trim() !== '') {
+    const candidate = path.resolve(baseDir, envTarget.trim());
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+        return {
+          ok: true,
+          targetDir: candidate,
+          source: 'env',
+          error: null,
+        };
+      }
+    } catch {
+      // fall through
+    }
+    return {
+      ok: false,
+      targetDir: null,
+      source: 'env',
+      error: `Environment variable SILLYTAVERN_DIR points to non-existent or invalid directory: "${envTarget}"`,
+    };
+  }
+
+  // 3. Package-relative sibling directory (Parent/SillyTavern)
+  try {
+    const siblingCandidate = path.resolve(pkgRoot, '../SillyTavern');
+    if (fs.existsSync(siblingCandidate) && fs.statSync(siblingCandidate).isDirectory()) {
+      return {
+        ok: true,
+        targetDir: siblingCandidate,
+        source: 'sibling',
+        error: null,
+      };
+    }
+  } catch {
+    // ignore
+  }
+
+  return {
+    ok: true,
+    targetDir: null,
+    source: 'none',
+    error: null,
   };
 }
 
