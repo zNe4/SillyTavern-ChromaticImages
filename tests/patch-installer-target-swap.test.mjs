@@ -1951,18 +1951,22 @@ describe('D01-P3B-2D-2-B: Transaction Pre-Swap Authentication (authenticateSwapP
   });
 });
 
-async function loadIsolatedTestHarness() {
+async function loadIsolatedSwapHarness(transformFn = (src) => src) {
   const targetSwapPath = path.resolve(REPO_ROOT, 'src/patch-installer/target-swap.js');
   let src = fs.readFileSync(targetSwapPath, 'utf8');
   const targetDir = path.dirname(targetSwapPath);
   src = src.replace(/from '\.\/([^']+)'/g, (m, p) => `from '${pathToFileURL(path.join(targetDir, p)).href}'`);
   src = src.replace(/from '\.\.\/\.\.\/scripts\/([^']+)'/g, (m, p) => `from '${pathToFileURL(path.join(REPO_ROOT, 'scripts', p)).href}'`);
   src = src.replace(/const REPO_ROOT = path\.resolve\(__dirname, '\.\.\/\.\.'\);/, `const REPO_ROOT = ${JSON.stringify(REPO_ROOT)};`);
-  src += '\nexport { authenticatePrerequisitesCore };\n';
-  const tmpDir = createTempDir('target-swap-harness-');
-  const tmpFile = path.join(tmpDir, 'target-swap.instrumented.mjs');
+  src = transformFn(src);
+  const tmpDir = createTempDir('target-swap-isolated-');
+  const tmpFile = path.join(tmpDir, `target-swap.${crypto.randomBytes(6).toString('hex')}.mjs`);
   fs.writeFileSync(tmpFile, src);
   return import(pathToFileURL(tmpFile).href);
+}
+
+async function loadIsolatedTestHarness() {
+  return loadIsolatedSwapHarness((src) => src + '\nexport { authenticatePrerequisitesCore };\n');
 }
 
 const harness = await loadIsolatedTestHarness();
@@ -3508,16 +3512,14 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
 
       const candIno = fs.statSync(candidateFile).ino;
 
-      const res = await swapVerifiedTarget(
-        { repoRoot: repo, txId, op, lease },
-        {
-          advanceJournalPhaseFn: () => {
-            const err = new Error('Simulated process panic before journal publication');
-            err.code = 'ENOSPC';
-            throw err;
-          },
-        }
+      const harness = await loadIsolatedSwapHarness((src) =>
+        src.replace(
+          'journalRes = advanceJournalPhase({',
+          `journalRes = ((args) => { const err = new Error('Simulated process panic before journal publication'); err.code = 'ENOSPC'; throw err; })({`
+        )
       );
+
+      const res = await harness.swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
 
       assert.equal(res.ok, false);
       assert.equal(res.code, 'ENOSPC');
@@ -3555,20 +3557,20 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
 
       const candIno = fs.statSync(candidateFile).ino;
 
-      const res = await swapVerifiedTarget(
-        { repoRoot: repo, txId, op, lease },
-        {
-          advanceJournalPhaseFn: (args) => {
-            // Advance the journal on disk for real
+      const harness = await loadIsolatedSwapHarness((src) =>
+        src.replace(
+          'journalRes = advanceJournalPhase({',
+          `journalRes = ((args) => {
             const realRes = advanceJournalPhase(args);
-            assert.equal(realRes.ok, true, 'Real journal advancement must succeed');
-            // Then throw an unexpected runtime error without returning structured JH2 result
+            if (!realRes.ok) throw new Error('Real advance failed in test harness: ' + (realRes.error || realRes.reason));
             const err = new Error('Simulated runtime error after journal publication');
             err.code = 'EUNEXPECTED';
             throw err;
-          },
-        }
+          })({`
+        )
       );
+
+      const res = await harness.swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
 
       assert.equal(res.ok, false);
       assert.equal(res.code, 'EUNEXPECTED');
@@ -3766,21 +3768,17 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
       });
 
       const candIno = fs.statSync(candidateFile).ino;
-      let hookCalled = false;
+
+      const harness = await loadIsolatedSwapHarness((src) =>
+        src.replace(
+          '// --- STEP 8: Advance transaction journal to SWAPPED ---',
+          `const fault = new Error('Intentional crash panic after target swap before journal advance'); fault._isFault = true; throw fault;\n// --- STEP 8: Advance transaction journal to SWAPPED ---`
+        )
+      );
 
       await assert.rejects(
         async () => {
-          await swapVerifiedTarget(
-            { repoRoot: repo, txId, op, lease },
-            {
-              beforeJournalAdvanceHook: () => {
-                hookCalled = true;
-                const fault = new Error('Intentional crash panic after target swap before journal advance');
-                fault._isFault = true;
-                throw fault;
-              },
-            }
-          );
+          await harness.swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
         },
         (err) => {
           assert.equal(err._isFault, true, 'Intentional crash fault must propagate unchanged');
@@ -3788,8 +3786,6 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
           return true;
         }
       );
-
-      assert.equal(hookCalled, true, 'Hook must have been invoked');
 
       // 1. Verify descriptors were closed unconditionally
       const currentFds = fs.readdirSync('/proc/self/fd').length;
@@ -3843,6 +3839,295 @@ describe('D01-P3B-2D-2-C2C3: Descriptor-Anchored Atomic Replacement and Durable 
         fs.renameSync = origRename;
       }
       assert.equal(fs.readdirSync('/proc/self/fd').length, baselineFds, 'Syscall failure must not leak descriptors');
+    });
+  });
+
+  describe('Public API Isolation and Test Bypass Hardening (F2-A)', () => {
+    test('F2-A: exported swapVerifiedTarget ignores second-argument testing bypass and executes real journal advancement', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'public api isolation')) return;
+
+      const repo = setupDisposableRepo('tx-swap-f2a-api-iso-');
+      const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+      let hookExecuted = false;
+      let overrideExecuted = false;
+
+      // Caller attempts to supply second-argument bypass to suppress journal advancement or inject code
+      const res = await swapVerifiedTarget(
+        { repoRoot: repo, txId, op, lease },
+        {
+          beforeJournalAdvanceHook: () => { hookExecuted = true; },
+          advanceJournalPhaseFn: () => {
+            overrideExecuted = true;
+            return { ok: true, simulatedBypass: true };
+          },
+        }
+      );
+
+      assert.equal(res.ok, true, 'Swap should succeed via genuine path');
+      assert.equal(hookExecuted, false, 'Caller hook in second argument must NEVER execute');
+      assert.equal(overrideExecuted, false, 'Caller override in second argument must NEVER execute');
+
+      // Real journal advancement occurred
+      const journal = inspectJournal(repo);
+      assert.equal(journal.journal.phase, 'SWAPPED', 'Real journal must advance to SWAPPED');
+    });
+
+    test('F2-A: caller supplying options with advanceJournalPhaseFn cannot fake success without real journal change', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'fake callback in options')) return;
+
+      const repo = setupDisposableRepo('tx-swap-f2a-opts-fake-');
+      const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+      let fakeCalled = false;
+      const res = await swapVerifiedTarget({
+        repoRoot: repo,
+        txId,
+        op,
+        lease,
+        advanceJournalPhaseFn: () => {
+          fakeCalled = true;
+          return { ok: true, fabricated: true };
+        },
+      });
+
+      assert.equal(res.ok, true);
+      assert.equal(fakeCalled, false, 'Extraneous advanceJournalPhaseFn in options must be ignored');
+      const journal = inspectJournal(repo);
+      assert.equal(journal.journal.phase, 'SWAPPED', 'Real journal must advance to SWAPPED');
+    });
+
+    test('F2-A: Public Stage B authentication remains strictly read-only and ignores extraneous arguments', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'stage b read-only')) return;
+
+      const repo = setupDisposableRepo('tx-swap-f2a-stage-b-');
+      const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+      const beforeSnapshot = inspectJournal(repo);
+      const authRes = await authenticateSwapPrerequisites({ repoRoot: repo, txId, op, lease }, { extraBypass: true });
+      assert.equal(authRes.ok, true);
+
+      const afterSnapshot = inspectJournal(repo);
+      assert.deepEqual(beforeSnapshot, afterSnapshot, 'Stage B authentication must not mutate anything');
+    });
+
+    test('F2-A: C1 private authentication core remains inaccessible through public exports', () => {
+      assert.equal(targetSwapModule.authenticatePrerequisitesCore, undefined, 'authenticatePrerequisitesCore must not be exported');
+      assert.equal(targetSwapModule._internalTesting, undefined, '_internalTesting must not be exported');
+      assert.equal(targetSwapModule.validateJournalAdvancementResult, undefined, 'validateJournalAdvancementResult must not be exported');
+    });
+  });
+
+  describe('Journal Advancement Result Validation and Fail-Closed Verification (F2-B)', () => {
+    test('F2-B: 1. journal advancement returning undefined fails closed with journal-result-invalid', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'journal returns undefined')) return;
+      const repo = setupDisposableRepo('tx-swap-f2b-undef-');
+      const { txId, op, lease, candidateFile } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+      const candIno = fs.statSync(candidateFile).ino;
+
+      const harness = await loadIsolatedSwapHarness((src) =>
+        src.replace('journalRes = advanceJournalPhase({', 'journalRes = ((args) => undefined)({')
+      );
+
+      const res = await harness.swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'journal-result-invalid');
+      assert.equal(res.stage, 'journal-advancement');
+      assert.match(res.reason, /returned null or undefined/);
+      assert.equal(res.renameConfirmed, true);
+      assert.equal(res.targetDirectoryFsyncConfirmed, true);
+      assert.equal(res.observedTargetState, 'result');
+      assert.equal(res.candidateConsumed, true);
+      assert.equal(res.targetIno, candIno);
+      assert.equal(res.journalAdvanceAttempted, true);
+      assert.equal(res.publicationAttempted, null);
+      assert.equal(res.publicationConfirmed, null);
+      assert.equal(res.directoryFsyncAttempted, null);
+      assert.equal(res.directoryFsyncConfirmed, null);
+      assert.equal(res.observedJournalPhase, null);
+      assert.equal(res.uncertain, true);
+      assert.equal(res.durabilityUncertain, true);
+    });
+
+    test('F2-B: 2. journal advancement returning null fails closed with journal-result-invalid', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'journal returns null')) return;
+      const repo = setupDisposableRepo('tx-swap-f2b-null-');
+      const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+      const harness = await loadIsolatedSwapHarness((src) =>
+        src.replace('journalRes = advanceJournalPhase({', 'journalRes = ((args) => null)({')
+      );
+
+      const res = await harness.swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'journal-result-invalid');
+      assert.equal(res.stage, 'journal-advancement');
+      assert.match(res.reason, /returned null or undefined/);
+      assert.equal(res.renameConfirmed, true);
+      assert.equal(res.uncertain, true);
+      assert.equal(res.durabilityUncertain, true);
+    });
+
+    test('F2-B: 3. journal advancement returning a primitive fails closed with journal-result-invalid', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'journal returns primitive')) return;
+      const repo = setupDisposableRepo('tx-swap-f2b-prim-');
+      const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+      const harness = await loadIsolatedSwapHarness((src) =>
+        src.replace('journalRes = advanceJournalPhase({', 'journalRes = ((args) => "simulated-primitive-result")({')
+      );
+
+      const res = await harness.swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'journal-result-invalid');
+      assert.equal(res.stage, 'journal-advancement');
+      assert.match(res.reason, /returned non-object: string/);
+      assert.equal(res.uncertain, true);
+      assert.equal(res.durabilityUncertain, true);
+    });
+
+    test('F2-B: 4. journal advancement returning { ok: true } without evidence fails closed with journal-result-invalid', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'journal returns bare ok')) return;
+      const repo = setupDisposableRepo('tx-swap-f2b-bare-ok-');
+      const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+      const harness = await loadIsolatedSwapHarness((src) =>
+        src.replace('journalRes = advanceJournalPhase({', 'journalRes = ((args) => ({ ok: true }))({')
+      );
+
+      const res = await harness.swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'journal-result-invalid');
+      assert.equal(res.stage, 'journal-advancement');
+      assert.match(res.reason, /missing mandatory JH2 outcome fields/);
+      assert.equal(res.uncertain, true);
+      assert.equal(res.durabilityUncertain, true);
+    });
+
+    test('F2-B: 5. journal advancement claiming publication without fsync confirmation fails closed', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'claim pub without fsync')) return;
+      const repo = setupDisposableRepo('tx-swap-f2b-nofsync-');
+      const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+      // Simulated result claiming ok: true but directoryFsyncConfirmed: false
+      const harness = await loadIsolatedSwapHarness((src) =>
+        src.replace(
+          'journalRes = advanceJournalPhase({',
+          `journalRes = ((args) => ({
+            ok: true,
+            publicationAttempted: true,
+            publicationConfirmed: true,
+            directoryFsyncAttempted: true,
+            directoryFsyncConfirmed: false,
+            uncertain: false,
+            observedJournalPhase: 'SWAPPED',
+          }))({`
+        )
+      );
+
+      const res = await harness.swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'journal-result-invalid');
+      assert.equal(res.stage, 'journal-advancement');
+      assert.match(res.reason, /requires confirmed directory fsync/);
+      assert.equal(res.uncertain, true);
+      assert.equal(res.durabilityUncertain, true);
+    });
+
+    test('F2-B: 6. journal advancement claiming success but reporting non-SWAPPED phase fails closed', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'claim success wrong phase')) return;
+      const repo = setupDisposableRepo('tx-swap-f2b-wrongphase-');
+      const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+      // Simulated result claiming ok: true but phase is READY_TO_SWAP
+      const harness = await loadIsolatedSwapHarness((src) =>
+        src.replace(
+          'journalRes = advanceJournalPhase({',
+          `journalRes = ((args) => ({
+            ok: true,
+            publicationAttempted: true,
+            publicationConfirmed: true,
+            directoryFsyncAttempted: true,
+            directoryFsyncConfirmed: true,
+            uncertain: false,
+            observedJournalPhase: 'READY_TO_SWAP',
+          }))({`
+        )
+      );
+
+      const res = await harness.swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'journal-result-invalid');
+      assert.equal(res.stage, 'journal-advancement');
+      assert.match(res.reason, /requires observedJournalPhase "SWAPPED"/);
+      assert.equal(res.uncertain, true);
+      assert.equal(res.durabilityUncertain, true);
+    });
+
+    test('F2-B: 7. journal advancement returning a legitimate structured refusal is preserved', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'structured refusal')) return;
+      const repo = setupDisposableRepo('tx-swap-f2b-refusal-');
+      const { txId, op, lease } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+
+      // Simulated legitimate structured failure from advanceJournalPhase
+      const harness = await loadIsolatedSwapHarness((src) =>
+        src.replace(
+          'journalRes = advanceJournalPhase({',
+          `journalRes = ((args) => ({
+            ok: false,
+            error: 'Simulated journal phase advance refusal',
+            code: 'refusal-code',
+            stage: 'pre-rename',
+            reason: 'Simulated lock or lease expiry',
+            publicationAttempted: false,
+            publicationConfirmed: false,
+            directoryFsyncAttempted: false,
+            directoryFsyncConfirmed: false,
+            uncertain: false,
+            observedJournalPhase: 'READY_TO_SWAP',
+          }))({`
+        )
+      );
+
+      const res = await harness.swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'refusal-code');
+      assert.equal(res.stage, 'pre-rename');
+      assert.equal(res.reason, 'Simulated lock or lease expiry');
+      assert.equal(res.publicationAttempted, false);
+      assert.equal(res.publicationConfirmed, false);
+      assert.equal(res.directoryFsyncAttempted, false);
+      assert.equal(res.directoryFsyncConfirmed, false);
+      assert.equal(res.observedJournalPhase, 'READY_TO_SWAP');
+      assert.equal(res.uncertain, true);
+      assert.equal(res.durabilityUncertain, false);
+    });
+
+    test('F2-B: 8. journal advancement returning a legitimate fully confirmed success succeeds end-to-end', async (t) => {
+      if (skipIfNoAuthenticFixture(t, 'legitimate full success')) return;
+      const repo = setupDisposableRepo('tx-swap-f2b-success-');
+      const { txId, op, lease, candidateFile, liveTarget } = setupTxAtReadyToSwap({ repo, op: 'apply' });
+      const candIno = fs.statSync(candidateFile).ino;
+
+      // Production swapVerifiedTarget without any instrumentation
+      const res = await swapVerifiedTarget({ repoRoot: repo, txId, op, lease });
+      assert.equal(res.ok, true);
+      assert.equal(res.renameConfirmed, true);
+      assert.equal(res.targetDirectoryFsyncConfirmed, true);
+      assert.equal(res.observedTargetState, 'result');
+      assert.equal(res.candidateConsumed, true);
+      assert.equal(res.targetIno, candIno);
+      assert.equal(res.journalAdvanceAttempted, true);
+      assert.equal(res.publicationAttempted, true);
+      assert.equal(res.publicationConfirmed, true);
+      assert.equal(res.directoryFsyncAttempted, true);
+      assert.equal(res.directoryFsyncConfirmed, true);
+      assert.equal(res.observedJournalPhase, 'SWAPPED');
+      assert.equal(res.uncertain, false);
+      assert.equal(res.durabilityUncertain, false);
+
+      const journal = inspectJournal(repo);
+      assert.equal(journal.journal.phase, 'SWAPPED');
     });
   });
 });

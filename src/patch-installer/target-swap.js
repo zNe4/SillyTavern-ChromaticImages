@@ -2111,6 +2111,77 @@ async function verifyFinalPreRenameGate({
 }
 
 /**
+ * Strictly validate the result object returned by advanceJournalPhase().
+ * Enforces the JH2 outcome contract and prevents false successes or unverified publications.
+ *
+ * @param {any} res
+ * @returns {{ valid: boolean, isSuccess: boolean, reason?: string }}
+ * @private
+ */
+function validateJournalAdvancementResult(res) {
+  if (res === null || res === undefined) {
+    return { valid: false, isSuccess: false, reason: 'Journal advancement returned null or undefined' };
+  }
+
+  if (typeof res !== 'object' || Array.isArray(res)) {
+    return { valid: false, isSuccess: false, reason: `Journal advancement returned non-object: ${typeof res}` };
+  }
+
+  if (typeof res.ok !== 'boolean') {
+    return { valid: false, isSuccess: false, reason: 'Missing or non-boolean "ok" field' };
+  }
+
+  // Mandatory JH2 outcome fields
+  const hasPubAtt = typeof res.publicationAttempted === 'boolean';
+  const hasPubConf = typeof res.publicationConfirmed === 'boolean' || res.publicationConfirmed === null;
+  const hasDirAtt = typeof res.directoryFsyncAttempted === 'boolean';
+  const hasDirConf = typeof res.directoryFsyncConfirmed === 'boolean';
+  const hasUncertain = typeof res.uncertain === 'boolean';
+  const hasPhase = typeof res.observedJournalPhase === 'string' || res.observedJournalPhase === null;
+
+  if (!hasPubAtt || !hasPubConf || !hasDirAtt || !hasDirConf || !hasUncertain || !hasPhase) {
+    return {
+      valid: false,
+      isSuccess: false,
+      reason: 'Result is missing mandatory JH2 outcome fields (publicationAttempted, publicationConfirmed, directoryFsyncAttempted, directoryFsyncConfirmed, uncertain, observedJournalPhase)',
+    };
+  }
+
+  // Contradiction checks across publication and directory synchronization evidence
+  if (!res.publicationAttempted && res.publicationConfirmed === true) {
+    return { valid: false, isSuccess: false, reason: 'Contradictory result: publicationConfirmed true when publicationAttempted false' };
+  }
+
+  if (res.publicationConfirmed !== true && res.directoryFsyncConfirmed === true) {
+    return { valid: false, isSuccess: false, reason: 'Contradictory result: directoryFsyncConfirmed true without confirmed publication' };
+  }
+
+  if (!res.directoryFsyncAttempted && res.directoryFsyncConfirmed === true) {
+    return { valid: false, isSuccess: false, reason: 'Contradictory result: directoryFsyncConfirmed true when directoryFsyncAttempted false' };
+  }
+
+  // Success path validation
+  if (res.ok === true) {
+    if (res.uncertain !== false) {
+      return { valid: false, isSuccess: false, reason: 'Success result cannot have uncertain true' };
+    }
+    if (res.publicationAttempted !== true || res.publicationConfirmed !== true) {
+      return { valid: false, isSuccess: false, reason: 'Success result requires confirmed publication' };
+    }
+    if (res.directoryFsyncAttempted !== true || res.directoryFsyncConfirmed !== true) {
+      return { valid: false, isSuccess: false, reason: 'Success result requires confirmed directory fsync' };
+    }
+    if (res.observedJournalPhase !== 'SWAPPED') {
+      return { valid: false, isSuccess: false, reason: `Success result requires observedJournalPhase "SWAPPED", observed "${res.observedJournalPhase}"` };
+    }
+    return { valid: true, isSuccess: true };
+  }
+
+  // Failure path validation (res.ok === false)
+  return { valid: true, isSuccess: false };
+}
+
+/**
  * Atomically replaces the live target file with the verified destination candidate
  * and durably advances the transaction journal to SWAPPED.
  *
@@ -2122,10 +2193,9 @@ async function verifyFinalPreRenameGate({
  * @param {string} options.txId - Transaction identifier (ci-tx-...)
  * @param {'apply' | 'remove'} options.op - Operation direction
  * @param {TransactionLease} options.lease - Transaction lease capability
- * @param {object} [_internalTesting={}] - Private testing harness for fault injection
  * @returns {Promise<object>} Structured SwapResult object
  */
-export async function swapVerifiedTarget(options = {}, _internalTesting = {}) {
+export async function swapVerifiedTarget(options = {}) {
   // 1. Sanitize caller inputs: accept only mandatory arguments
   if (!options || typeof options !== 'object' || Array.isArray(options)) {
     return buildArgumentError('Options must be a non-null plain object');
@@ -2423,19 +2493,11 @@ export async function swapVerifiedTarget(options = {}, _internalTesting = {}) {
         // --- STEP 7: Re-verify destination parent pathname continuity ---
         verifyParentPathnameContinuity(parentFd, absParentDir, auth.parentStat);
 
-        if (typeof _internalTesting?.beforeJournalAdvanceHook === 'function') {
-          _internalTesting.beforeJournalAdvanceHook();
-        }
-
         // --- STEP 8: Advance transaction journal to SWAPPED ---
         journalAdvanceAttempted = true;
         let journalRes;
         try {
-          const advanceFn = typeof _internalTesting?.advanceJournalPhaseFn === 'function'
-            ? _internalTesting.advanceJournalPhaseFn
-            : advanceJournalPhase;
-
-          journalRes = advanceFn({
+          journalRes = advanceJournalPhase({
             repoRoot: normRepo,
             txId: txId.trim(),
             nextPhase: 'SWAPPED',
@@ -2468,22 +2530,61 @@ export async function swapVerifiedTarget(options = {}, _internalTesting = {}) {
           durabilityUncertain = true;
         }
 
-        if (journalRes) {
-          publicationAttempted = Boolean(journalRes.publicationAttempted);
-          publicationConfirmed = journalRes.publicationConfirmed !== undefined ? journalRes.publicationConfirmed : null;
-          directoryFsyncAttempted = Boolean(journalRes.directoryFsyncAttempted);
-          directoryFsyncConfirmed = Boolean(journalRes.directoryFsyncConfirmed);
-          observedJournalPhase = journalRes.observedJournalPhase !== undefined ? journalRes.observedJournalPhase : null;
+        if (!inFlightFault && !pendingOutcome) {
+          const val = validateJournalAdvancementResult(journalRes);
+          if (!val.valid) {
+            publicationAttempted = typeof journalRes?.publicationAttempted === 'boolean' ? journalRes.publicationAttempted : null;
+            publicationConfirmed = typeof journalRes?.publicationConfirmed === 'boolean' || journalRes?.publicationConfirmed === null ? journalRes.publicationConfirmed : null;
+            directoryFsyncAttempted = typeof journalRes?.directoryFsyncAttempted === 'boolean' ? journalRes.directoryFsyncAttempted : null;
+            directoryFsyncConfirmed = typeof journalRes?.directoryFsyncConfirmed === 'boolean' ? journalRes.directoryFsyncConfirmed : null;
+            observedJournalPhase = typeof journalRes?.observedJournalPhase === 'string' ? journalRes.observedJournalPhase : null;
+            uncertain = true;
+            durabilityUncertain = true;
 
-          if (!journalRes.ok) {
+            pendingOutcome = {
+              type: 'failure',
+              err: {
+                error: `Invalid journal advancement result: ${val.reason}`,
+                code: 'journal-result-invalid',
+                stage: 'journal-advancement',
+                reason: val.reason,
+                uncertain: true,
+                rawResult: journalRes,
+              },
+            };
+          } else if (val.isSuccess) {
+            publicationAttempted = true;
+            publicationConfirmed = true;
+            directoryFsyncAttempted = true;
+            directoryFsyncConfirmed = true;
+            observedJournalPhase = 'SWAPPED';
+            pendingOutcome = { type: 'success' };
+          } else {
+            publicationAttempted = Boolean(journalRes.publicationAttempted);
+            publicationConfirmed = journalRes.publicationConfirmed !== undefined ? journalRes.publicationConfirmed : null;
+            directoryFsyncAttempted = Boolean(journalRes.directoryFsyncAttempted);
+            directoryFsyncConfirmed = Boolean(journalRes.directoryFsyncConfirmed);
+            observedJournalPhase = journalRes.observedJournalPhase !== undefined ? journalRes.observedJournalPhase : null;
             uncertain = true;
             if (publicationConfirmed === true && !directoryFsyncConfirmed) {
               durabilityUncertain = true;
             }
             pendingOutcome = { type: 'failure', err: journalRes };
-          } else {
-            pendingOutcome = { type: 'success' };
           }
+        }
+
+        if (!inFlightFault && !pendingOutcome) {
+          pendingOutcome = {
+            type: 'failure',
+            err: {
+              error: 'Internal error: pending outcome was not initialized',
+              code: 'uninitialized-outcome',
+              stage: 'journal-advancement',
+              uncertain: true,
+            },
+          };
+          uncertain = true;
+          durabilityUncertain = true;
         }
       }
     }
