@@ -396,3 +396,38 @@ export function testPatchApplicability(repoRoot, patchPath, { reverse = false, t
     isEnvError,
   };
 }
+
+/**
+ * Apply a patch file to the Git working tree only (without touching index or commit history).
+ * @param {string} repoRoot - Working directory / repository root
+ * @param {string} patchPath - Path to patch file
+ * @param {object} [options]
+ * @param {number} [options.timeout=10000]
+ * @returns {{ ok: boolean, exitCode: number, stdout: string, stderr: string, error: string, isTimeout: boolean }}
+ */
+export function applyPatchWorktree(repoRoot, patchPath, { timeout = 10000 } = {}) {
+  const args = ['apply', patchPath];
+  const res = runGit(repoRoot, args, { timeout });
+  const stderr = (res.stderr || '').trim();
+  const isTimeout = Boolean(res.error?.code === 'ETIMEDOUT' || res.status === null);
+
+  if (res.status === 0) {
+    return {
+      ok: true,
+      exitCode: 0,
+      stdout: res.stdout || '',
+      stderr,
+      error: '',
+      isTimeout: false,
+    };
+  }
+
+  return {
+    ok: false,
+    exitCode: res.status ?? 1,
+    stdout: res.stdout || '',
+    stderr,
+    error: stderr || res.error?.message || 'git apply failed',
+    isTimeout,
+  };
+}
