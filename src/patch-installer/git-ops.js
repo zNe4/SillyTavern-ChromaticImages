@@ -402,11 +402,16 @@ export function testPatchApplicability(repoRoot, patchPath, { reverse = false, t
  * @param {string} repoRoot - Working directory / repository root
  * @param {string} patchPath - Path to patch file
  * @param {object} [options]
+ * @param {boolean} [options.reverse=false] - Whether to apply patch in reverse
  * @param {number} [options.timeout=10000]
  * @returns {{ ok: boolean, exitCode: number, stdout: string, stderr: string, error: string, isTimeout: boolean }}
  */
-export function applyPatchWorktree(repoRoot, patchPath, { timeout = 10000 } = {}) {
-  const args = ['apply', patchPath];
+export function applyPatchWorktree(repoRoot, patchPath, { reverse = false, timeout = 10000 } = {}) {
+  const args = ['apply'];
+  if (reverse) {
+    args.push('--reverse');
+  }
+  args.push(patchPath);
   const res = runGit(repoRoot, args, { timeout });
   const stderr = (res.stderr || '').trim();
   const isTimeout = Boolean(res.error?.code === 'ETIMEDOUT' || res.status === null);

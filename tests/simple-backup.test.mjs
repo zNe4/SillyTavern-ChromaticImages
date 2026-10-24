@@ -28,7 +28,16 @@ function createTempDir(prefix = 'ci-test-storage-') {
   return dir;
 }
 
+const suiteIsolatedXdg = createTempDir('ci-test-suite-xdg-');
+const originalSuiteXdg = process.env.XDG_DATA_HOME;
+process.env.XDG_DATA_HOME = suiteIsolatedXdg;
+
 after(() => {
+  if (originalSuiteXdg === undefined) {
+    delete process.env.XDG_DATA_HOME;
+  } else {
+    process.env.XDG_DATA_HOME = originalSuiteXdg;
+  }
   for (const dir of tempDirsToClean) {
     try {
       if (fs.existsSync(dir)) {
@@ -47,7 +56,8 @@ describe('Simple Backup & Storage Management (simple-backup.js)', () => {
 
     const res = resolveStorageDirectory({
       repoRoot: fakeRepo,
-      customOverride: customBase,
+      backupOverride: customBase,
+      lockOverride: customBase,
     });
 
     assert.equal(res.ok, true);
@@ -229,6 +239,99 @@ describe('Simple Backup & Storage Management (simple-backup.js)', () => {
         process.env.CI_BACKUP_DIR = oldEnv;
       }
     }
+
+    // Check lockOverride empty or whitespace string
+    const emptyLockRes = resolveStorageDirectory({
+      repoRoot: fakeRepo,
+      lockOverride: '   ',
+    });
+    assert.equal(emptyLockRes.ok, false);
+    assert.match(emptyLockRes.error, /Lock directory override cannot be empty/);
+
+    // Check CI_LOCK_DIR env variable empty or whitespace string
+    const oldLockEnv = process.env.CI_LOCK_DIR;
+    try {
+      process.env.CI_LOCK_DIR = '   ';
+      const envLockRes = resolveStorageDirectory({ repoRoot: fakeRepo });
+      assert.equal(envLockRes.ok, false);
+      assert.match(envLockRes.error, /Environment variable CI_LOCK_DIR cannot be empty/);
+    } finally {
+      if (oldLockEnv === undefined) {
+        delete process.env.CI_LOCK_DIR;
+      } else {
+        process.env.CI_LOCK_DIR = oldLockEnv;
+      }
+    }
+  });
+
+  test('resolveStorageDirectory keeps locksDir in user-local namespace independent of backupOverride', () => {
+    const fakeRepo = createTempDir('fake-repo-');
+    const customBackup = path.join(createTempDir('custom-backup-'), 'backups');
+    const isolatedXdg = createTempDir('isolated-xdg-');
+    const oldXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = isolatedXdg;
+    try {
+      const res = resolveStorageDirectory({
+        repoRoot: fakeRepo,
+        backupOverride: customBackup,
+      });
+      assert.equal(res.ok, true);
+      assert.equal(res.backupsDir, path.join(customBackup, BACKUPS_SUBDIR_NAME));
+      assert.equal(res.locksDir, path.join(isolatedXdg, 'chromatic-images', LOCKS_SUBDIR_NAME));
+    } finally {
+      if (oldXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = oldXdg;
+    }
+  });
+
+  test('resolveStorageDirectory keeps locksDir in user-local namespace independent of CI_BACKUP_DIR', () => {
+    const fakeRepo = createTempDir('fake-repo-');
+    const customBackup = path.join(createTempDir('env-backup-'), 'backups');
+    const isolatedXdg = createTempDir('isolated-xdg-');
+    const oldXdg = process.env.XDG_DATA_HOME;
+    const oldEnvBackup = process.env.CI_BACKUP_DIR;
+    process.env.XDG_DATA_HOME = isolatedXdg;
+    process.env.CI_BACKUP_DIR = customBackup;
+    try {
+      const res = resolveStorageDirectory({ repoRoot: fakeRepo });
+      assert.equal(res.ok, true);
+      assert.equal(res.backupsDir, path.join(customBackup, BACKUPS_SUBDIR_NAME));
+      assert.equal(res.locksDir, path.join(isolatedXdg, 'chromatic-images', LOCKS_SUBDIR_NAME));
+    } finally {
+      if (oldXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = oldXdg;
+      if (oldEnvBackup === undefined) delete process.env.CI_BACKUP_DIR;
+      else process.env.CI_BACKUP_DIR = oldEnvBackup;
+    }
+  });
+
+  test('resolveStorageDirectory rejects lock location inside SillyTavern repository', () => {
+    const fakeRepo = createTempDir('fake-st-repo-');
+    const insideLocks = path.join(fakeRepo, 'chromatic-locks');
+
+    const res = resolveStorageDirectory({
+      repoRoot: fakeRepo,
+      lockOverride: insideLocks,
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error, /resides inside the target SillyTavern repository/);
+    assert.equal(fs.existsSync(insideLocks), false, 'Must not create lock directory inside SillyTavern');
+  });
+
+  test('resolveStorageDirectory rejects lock directory that is a symbolic link', () => {
+    const fakeRepo = createTempDir('fake-repo-');
+    const targetDir = createTempDir('real-lock-target-');
+    const symlinkLock = path.join(createTempDir('symlink-parent-'), 'sym-lock');
+    fs.symlinkSync(targetDir, symlinkLock);
+
+    const res = resolveStorageDirectory({
+      repoRoot: fakeRepo,
+      lockOverride: symlinkLock,
+    });
+
+    assert.equal(res.ok, false);
+    assert.match(res.error, /symbolic link/);
   });
 
   test('createPreMutationBackup creates mode 0600 backup file and metadata descriptor', () => {

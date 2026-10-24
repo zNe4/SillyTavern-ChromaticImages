@@ -32,7 +32,16 @@ function createTempDir(prefix = 'ci-apply-test-') {
   return dir;
 }
 
+const suiteIsolatedXdg = createTempDir('ci-apply-suite-xdg-');
+const originalSuiteXdg = process.env.XDG_DATA_HOME;
+process.env.XDG_DATA_HOME = suiteIsolatedXdg;
+
 after(() => {
+  if (originalSuiteXdg === undefined) {
+    delete process.env.XDG_DATA_HOME;
+  } else {
+    process.env.XDG_DATA_HOME = originalSuiteXdg;
+  }
   for (const dir of tempDirsToClean) {
     try {
       if (fs.existsSync(dir)) {

@@ -137,220 +137,406 @@ function validateAncestorConfinement(targetPath, canonicalRepoRoot, isOverride) 
 }
 
 /**
- * Resolve and validate the user-local storage directory outside SillyTavern.
+ * Validate and safely initialize a private directory with mode 0700 outside SillyTavern.
  *
  * Enforces:
- * - Rejects explicitly empty backup-directory overrides without falling back.
- * - Every existing ancestor relevant to storage destination is inspected for symlinks before creation.
- * - Storage location is strictly outside the target SillyTavern repository (before and after creation).
- * - Resolves ${XDG_DATA_HOME:-$HOME/.local/share}/chromatic-images/ by default.
- * - Validates CI_BACKUP_DIR override if provided.
- * - Rejects symbolic links in directory paths.
- * - Rejects unsafe existing permissions (must have no group or world access).
- * - Creates private directories with mode 0700 without altering unrelated pre-existing directories.
+ * - Direct textual containment check against repository root.
+ * - Ancestor confinement and symlink inspection.
+ * - Existing directory must be a regular directory (not a symlink) and mode 0700 (no group/world access).
+ * - Creates private directory with mode 0700 if non-existent.
+ * - Post-creation realpath verification outside SillyTavern.
  *
- * @param {object} options
- * @param {string} options.repoRoot - SillyTavern repository root
- * @param {string|null} [options.customOverride] - Optional explicit storage directory override
- * @returns {{
- *   ok: boolean,
- *   baseDir: string|null,
- *   backupsDir: string|null,
- *   locksDir: string|null,
- *   error: string|null
- * }}
+ * @param {string} rawDir - Candidate directory path
+ * @param {string} canonicalRepoRoot - Resolved realpath of repository root
+ * @param {boolean} isOverride - Whether path was explicitly overridden
+ * @param {string} [name='storage'] - Directory label for error reporting ('backups' | 'locks' | 'storage')
+ * @returns {{ ok: boolean, resolvedPath: string|null, error: string|null }}
  */
-export function resolveStorageDirectory({ repoRoot, customOverride = null }) {
-  if (!repoRoot || typeof repoRoot !== 'string' || repoRoot.trim() === '') {
-    return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: 'Invalid repository root path' };
-  }
-
-  let canonicalRepoRoot;
-  try {
-    if (!fs.existsSync(repoRoot)) {
-      return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: `Repository root does not exist: "${repoRoot}"` };
-    }
-    const stat = fs.statSync(repoRoot);
-    if (!stat.isDirectory()) {
-      return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: `Repository root is not a directory: "${repoRoot}"` };
-    }
-    canonicalRepoRoot = fs.realpathSync(repoRoot);
-  } catch (err) {
-    return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: `Failed to resolve repository root: ${err.message}` };
-  }
-
-  // 1. Determine candidate base storage directory and validate overrides strictly
-  let rawBaseDir = null;
-  let isOverride = false;
-
-  if (customOverride !== null) {
-    if (typeof customOverride !== 'string' || customOverride.trim() === '') {
-      return {
-        ok: false,
-        baseDir: null,
-        backupsDir: null,
-        locksDir: null,
-        error: 'Storage directory override cannot be empty or whitespace-only',
-      };
-    }
-    rawBaseDir = customOverride.trim();
-    isOverride = true;
-  } else if (process.env.CI_BACKUP_DIR !== undefined) {
-    if (typeof process.env.CI_BACKUP_DIR !== 'string' || process.env.CI_BACKUP_DIR.trim() === '') {
-      return {
-        ok: false,
-        baseDir: null,
-        backupsDir: null,
-        locksDir: null,
-        error: 'Environment variable CI_BACKUP_DIR cannot be empty or whitespace-only',
-      };
-    }
-    rawBaseDir = process.env.CI_BACKUP_DIR.trim();
-    isOverride = true;
-  } else {
-    const xdgDataHome = process.env.XDG_DATA_HOME && process.env.XDG_DATA_HOME.trim() !== ''
-      ? process.env.XDG_DATA_HOME.trim()
-      : path.join(os.homedir(), '.local/share');
-    rawBaseDir = path.join(xdgDataHome, 'chromatic-images');
-  }
-
-  if (/[\x00-\x1f\x7f]/.test(rawBaseDir)) {
+function initSafePrivateDirectory(rawDir, canonicalRepoRoot, isOverride, name = 'storage') {
+  if (typeof rawDir !== 'string' || rawDir.trim() === '') {
     return {
       ok: false,
-      baseDir: null,
-      backupsDir: null,
-      locksDir: null,
-      error: 'Storage directory path contains control characters',
+      resolvedPath: null,
+      error: name === 'storage'
+        ? (isOverride ? 'Storage directory override cannot be empty or whitespace-only' : 'Storage directory path cannot be empty or whitespace-only')
+        : `Storage ${name} directory path cannot be empty or whitespace-only`,
     };
   }
 
-  const candidateBase = path.resolve(rawBaseDir);
-
-  // 2. Direct textual containment check
-  if (candidateBase === canonicalRepoRoot || candidateBase.startsWith(canonicalRepoRoot + path.sep)) {
+  const trimmed = rawDir.trim();
+  if (/[\x00-\x1f\x7f]/.test(trimmed)) {
     return {
       ok: false,
-      baseDir: null,
-      backupsDir: null,
-      locksDir: null,
-      error: `Storage directory resides inside the target SillyTavern repository: "${candidateBase}"`,
+      resolvedPath: null,
+      error: name === 'storage'
+        ? 'Storage directory path contains control characters'
+        : `Storage ${name} directory path contains control characters`,
     };
   }
 
-  // 3. Pre-creation ancestor confinement and symlink inspection
-  const ancestorCheck = validateAncestorConfinement(candidateBase, canonicalRepoRoot, isOverride);
+  const candidate = path.resolve(trimmed);
+
+  // 1. Direct textual containment check
+  if (candidate === canonicalRepoRoot || candidate.startsWith(canonicalRepoRoot + path.sep)) {
+    return {
+      ok: false,
+      resolvedPath: null,
+      error: name === 'storage'
+        ? `Storage directory resides inside the target SillyTavern repository: "${candidate}"`
+        : `Storage ${name} directory resides inside the target SillyTavern repository: "${candidate}"`,
+    };
+  }
+
+  // 2. Pre-creation ancestor confinement and symlink inspection
+  const ancestorCheck = validateAncestorConfinement(candidate, canonicalRepoRoot, isOverride);
   if (!ancestorCheck.ok) {
     return {
       ok: false,
-      baseDir: null,
-      backupsDir: null,
-      locksDir: null,
+      resolvedPath: null,
       error: ancestorCheck.error,
     };
   }
 
-  // 4. Initialize and validate base directory
+  // 3. Initialize and validate directory permissions
   try {
-    if (fs.existsSync(candidateBase)) {
-      const lstat = fs.lstatSync(candidateBase);
+    if (fs.existsSync(candidate)) {
+      const lstat = fs.lstatSync(candidate);
       if (lstat.isSymbolicLink()) {
-        return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: `Storage directory is a symbolic link: "${candidateBase}"` };
+        return {
+          ok: false,
+          resolvedPath: null,
+          error: name === 'storage'
+            ? `Storage directory is a symbolic link: "${candidate}"`
+            : `Storage ${name} directory is a symbolic link: "${candidate}"`,
+        };
       }
       if (!lstat.isDirectory()) {
-        return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: `Storage directory path exists but is not a directory: "${candidateBase}"` };
+        return {
+          ok: false,
+          resolvedPath: null,
+          error: name === 'storage'
+            ? `Storage directory path exists but is not a directory: "${candidate}"`
+            : `Storage ${name} directory is not a directory: "${candidate}"`,
+        };
       }
-      // Check existing permissions: reject if group or world has read, write, or execute access
       const mode = lstat.mode & 0o777;
       if ((mode & 0o077) !== 0) {
         return {
           ok: false,
-          baseDir: null,
-          backupsDir: null,
-          locksDir: null,
-          error: `Storage directory has unsafe existing permissions 0o${mode.toString(8)} (group/world accessible); expected 0700`,
+          resolvedPath: null,
+          error: name === 'storage'
+            ? `Storage directory has unsafe existing permissions 0o${mode.toString(8)} (group/world accessible); expected 0700`
+            : `Storage ${name} directory has unsafe existing permissions 0o${mode.toString(8)} (group/world accessible); expected 0700`,
         };
       }
     } else {
-      // Create private directory with mode 0700
-      fs.mkdirSync(candidateBase, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(candidate, { recursive: true, mode: 0o700 });
       try {
-        fs.chmodSync(candidateBase, 0o700);
+        fs.chmodSync(candidate, 0o700);
       } catch {
         // ignore if filesystem does not support chmod
       }
     }
   } catch (err) {
-    return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: `Failed to initialize storage directory: ${err.message}` };
+    return {
+      ok: false,
+      resolvedPath: null,
+      error: name === 'storage'
+        ? `Failed to initialize storage directory: ${err.message}`
+        : `Failed to initialize ${name} directory: ${err.message}`,
+    };
   }
 
-  // Post-creation realpath containment verification for base directory
+  // 4. Post-creation realpath verification
   try {
-    const postRealBase = fs.realpathSync(candidateBase);
-    if (postRealBase === canonicalRepoRoot || postRealBase.startsWith(canonicalRepoRoot + path.sep)) {
+    const postReal = fs.realpathSync(candidate);
+    if (postReal === canonicalRepoRoot || postReal.startsWith(canonicalRepoRoot + path.sep)) {
       return {
         ok: false,
-        baseDir: null,
-        backupsDir: null,
-        locksDir: null,
-        error: `Storage directory resolves inside the target SillyTavern repository after creation: "${postRealBase}"`,
+        resolvedPath: null,
+        error: name === 'storage'
+          ? `Storage directory resolves inside the target SillyTavern repository after creation: "${postReal}"`
+          : `Storage ${name} directory resolves inside the target SillyTavern repository: "${postReal}"`,
       };
     }
   } catch (err) {
-    return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: `Failed to verify storage directory realpath: ${err.message}` };
-  }
-
-  // 5. Initialize and validate subdirectories: backups and locks
-  const backupsDir = path.join(candidateBase, BACKUPS_SUBDIR_NAME);
-  const locksDir = path.join(candidateBase, LOCKS_SUBDIR_NAME);
-
-  for (const [name, dirPath] of [['backups', backupsDir], ['locks', locksDir]]) {
-    try {
-      if (fs.existsSync(dirPath)) {
-        const subStat = fs.lstatSync(dirPath);
-        if (subStat.isSymbolicLink()) {
-          return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: `Storage ${name} directory is a symbolic link: "${dirPath}"` };
-        }
-        if (!subStat.isDirectory()) {
-          return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: `Storage ${name} directory is not a directory: "${dirPath}"` };
-        }
-        const subMode = subStat.mode & 0o777;
-        if ((subMode & 0o077) !== 0) {
-          return {
-            ok: false,
-            baseDir: null,
-            backupsDir: null,
-            locksDir: null,
-            error: `Storage ${name} directory has unsafe existing permissions 0o${subMode.toString(8)} (group/world accessible); expected 0700`,
-          };
-        }
-      } else {
-        fs.mkdirSync(dirPath, { mode: 0o700 });
-        try {
-          fs.chmodSync(dirPath, 0o700);
-        } catch {
-          // ignore
-        }
-      }
-
-      // Verify realpath of subdirectories after creation
-      const postRealSub = fs.realpathSync(dirPath);
-      if (postRealSub === canonicalRepoRoot || postRealSub.startsWith(canonicalRepoRoot + path.sep)) {
-        return {
-          ok: false,
-          baseDir: null,
-          backupsDir: null,
-          locksDir: null,
-          error: `Storage ${name} directory resolves inside the target SillyTavern repository: "${postRealSub}"`,
-        };
-      }
-    } catch (err) {
-      return { ok: false, baseDir: null, backupsDir: null, locksDir: null, error: `Failed to initialize ${name} directory: ${err.message}` };
-    }
+    return {
+      ok: false,
+      resolvedPath: null,
+      error: name === 'storage'
+        ? `Failed to verify storage directory realpath: ${err.message}`
+        : `Failed to verify ${name} directory realpath: ${err.message}`,
+    };
   }
 
   return {
     ok: true,
-    baseDir: candidateBase,
+    resolvedPath: candidate,
+    error: null,
+  };
+}
+
+/**
+ * Resolve and validate the user-local storage directory outside SillyTavern.
+ *
+ * Separates backup storage from the exclusive operation-lock namespace (D01-SP-2-R-F1):
+ * - Backup storage resolves from options.backupOverride, options.customOverride,
+ *   CI_BACKUP_DIR, or ${XDG_DATA_HOME:-$HOME/.local/share}/chromatic-images/.
+ * - Operation locks resolve through a consistent user-local namespace independent of
+ *   CI_BACKUP_DIR or backup-directory overrides: ${XDG_DATA_HOME:-$HOME/.local/share}/chromatic-images/locks.
+ *   Test isolation is supported via options.lockOverride or CI_LOCK_DIR.
+ *
+ * Enforces:
+ * - Rejects explicitly empty backup or lock directory overrides without falling back.
+ * - Every existing ancestor relevant to storage destination is inspected for symlinks before creation.
+ * - Storage locations are strictly outside the target SillyTavern repository (before and after creation).
+ * - Rejects symbolic links in directory paths.
+ * - Rejects unsafe existing permissions (must have no group or world access).
+ * - Creates private directories with mode 0700 without altering unrelated pre-existing directories.
+ *
+ * Residual limitation:
+ * Operation locks are scoped by user-local environment root (${XDG_DATA_HOME:-$HOME/.local/share}).
+ * If cooperating processes run under different user accounts or with different XDG_DATA_HOME / CI_LOCK_DIR
+ * environment roots, each will resolve a distinct locks namespace and mutual exclusion cannot be guaranteed.
+ *
+ * @param {object} options
+ * @param {string} options.repoRoot - SillyTavern repository root
+ * @param {string|null} [options.backupOverride] - Optional explicit backup storage directory override
+ * @param {string|null} [options.customOverride] - Alias for backupOverride
+ * @param {string|null} [options.lockOverride] - Optional explicit operation lock directory override
+ * @returns {{
+ *   ok: boolean,
+ *   baseDir: string|null,
+ *   backupBaseDir: string|null,
+ *   lockBaseDir: string|null,
+ *   backupsDir: string|null,
+ *   locksDir: string|null,
+ *   error: string|null
+ * }}
+ */
+export function resolveStorageDirectory({
+  repoRoot,
+  backupOverride = null,
+  customOverride = null,
+  lockOverride = null,
+} = {}) {
+  if (!repoRoot || typeof repoRoot !== 'string' || repoRoot.trim() === '') {
+    return {
+      ok: false,
+      baseDir: null,
+      backupBaseDir: null,
+      lockBaseDir: null,
+      backupsDir: null,
+      locksDir: null,
+      error: 'Invalid repository root path',
+    };
+  }
+
+  let canonicalRepoRoot;
+  try {
+    if (!fs.existsSync(repoRoot)) {
+      return {
+        ok: false,
+        baseDir: null,
+        backupBaseDir: null,
+        lockBaseDir: null,
+        backupsDir: null,
+        locksDir: null,
+        error: `Repository root does not exist: "${repoRoot}"`,
+      };
+    }
+    const stat = fs.statSync(repoRoot);
+    if (!stat.isDirectory()) {
+      return {
+        ok: false,
+        baseDir: null,
+        backupBaseDir: null,
+        lockBaseDir: null,
+        backupsDir: null,
+        locksDir: null,
+        error: `Repository root is not a directory: "${repoRoot}"`,
+      };
+    }
+    canonicalRepoRoot = fs.realpathSync(repoRoot);
+  } catch (err) {
+    return {
+      ok: false,
+      baseDir: null,
+      backupBaseDir: null,
+      lockBaseDir: null,
+      backupsDir: null,
+      locksDir: null,
+      error: `Failed to resolve repository root: ${err.message}`,
+    };
+  }
+
+  // 1. Default user-local base directory
+  const xdgDataHome = process.env.XDG_DATA_HOME && process.env.XDG_DATA_HOME.trim() !== ''
+    ? process.env.XDG_DATA_HOME.trim()
+    : path.join(os.homedir(), '.local/share');
+  const defaultUserLocalBase = path.join(xdgDataHome, 'chromatic-images');
+
+  // 2. Determine candidate backup storage base directory and validate override strictly
+  let rawBackupBase = null;
+  let isBackupOverride = false;
+
+  const effectiveBackupOverride = backupOverride !== null ? backupOverride : customOverride;
+
+  if (effectiveBackupOverride !== null) {
+    if (typeof effectiveBackupOverride !== 'string' || effectiveBackupOverride.trim() === '') {
+      return {
+        ok: false,
+        baseDir: null,
+        backupBaseDir: null,
+        lockBaseDir: null,
+        backupsDir: null,
+        locksDir: null,
+        error: 'Storage directory override cannot be empty or whitespace-only',
+      };
+    }
+    rawBackupBase = effectiveBackupOverride.trim();
+    isBackupOverride = true;
+  } else if (process.env.CI_BACKUP_DIR !== undefined) {
+    if (typeof process.env.CI_BACKUP_DIR !== 'string' || process.env.CI_BACKUP_DIR.trim() === '') {
+      return {
+        ok: false,
+        baseDir: null,
+        backupBaseDir: null,
+        lockBaseDir: null,
+        backupsDir: null,
+        locksDir: null,
+        error: 'Environment variable CI_BACKUP_DIR cannot be empty or whitespace-only',
+      };
+    }
+    rawBackupBase = process.env.CI_BACKUP_DIR.trim();
+    isBackupOverride = true;
+  } else {
+    rawBackupBase = defaultUserLocalBase;
+    isBackupOverride = false;
+  }
+
+  // 3. Determine candidate lock storage base directory (independent of backup location)
+  let rawLockBase = null;
+  let isLockOverride = false;
+
+  if (lockOverride !== null) {
+    if (typeof lockOverride !== 'string' || lockOverride.trim() === '') {
+      return {
+        ok: false,
+        baseDir: null,
+        backupBaseDir: null,
+        lockBaseDir: null,
+        backupsDir: null,
+        locksDir: null,
+        error: 'Lock directory override cannot be empty or whitespace-only',
+      };
+    }
+    rawLockBase = lockOverride.trim();
+    isLockOverride = true;
+  } else if (process.env.CI_LOCK_DIR !== undefined) {
+    if (typeof process.env.CI_LOCK_DIR !== 'string' || process.env.CI_LOCK_DIR.trim() === '') {
+      return {
+        ok: false,
+        baseDir: null,
+        backupBaseDir: null,
+        lockBaseDir: null,
+        backupsDir: null,
+        locksDir: null,
+        error: 'Environment variable CI_LOCK_DIR cannot be empty or whitespace-only',
+      };
+    }
+    rawLockBase = process.env.CI_LOCK_DIR.trim();
+    isLockOverride = true;
+  } else {
+    rawLockBase = defaultUserLocalBase;
+    isLockOverride = false;
+  }
+
+  // 4. Initialize and validate backup storage base directory
+  const backupBaseRes = initSafePrivateDirectory(
+    rawBackupBase,
+    canonicalRepoRoot,
+    isBackupOverride,
+    'storage'
+  );
+  if (!backupBaseRes.ok) {
+    return {
+      ok: false,
+      baseDir: null,
+      backupBaseDir: null,
+      lockBaseDir: null,
+      backupsDir: null,
+      locksDir: null,
+      error: backupBaseRes.error,
+    };
+  }
+  const candidateBackupBase = backupBaseRes.resolvedPath;
+
+  // 5. Initialize and validate backups subdirectory
+  const backupsDirRes = initSafePrivateDirectory(
+    path.join(candidateBackupBase, BACKUPS_SUBDIR_NAME),
+    canonicalRepoRoot,
+    isBackupOverride,
+    'backups'
+  );
+  if (!backupsDirRes.ok) {
+    return {
+      ok: false,
+      baseDir: null,
+      backupBaseDir: null,
+      lockBaseDir: null,
+      backupsDir: null,
+      locksDir: null,
+      error: backupsDirRes.error,
+    };
+  }
+  const backupsDir = backupsDirRes.resolvedPath;
+
+  // 6. Initialize and validate operation-lock storage base directory
+  const lockBaseRes = initSafePrivateDirectory(
+    rawLockBase,
+    canonicalRepoRoot,
+    isLockOverride,
+    'storage'
+  );
+  if (!lockBaseRes.ok) {
+    return {
+      ok: false,
+      baseDir: null,
+      backupBaseDir: null,
+      lockBaseDir: null,
+      backupsDir: null,
+      locksDir: null,
+      error: lockBaseRes.error,
+    };
+  }
+  const candidateLockBase = lockBaseRes.resolvedPath;
+
+  // 7. Initialize and validate locks subdirectory
+  const locksDirRes = initSafePrivateDirectory(
+    path.join(candidateLockBase, LOCKS_SUBDIR_NAME),
+    canonicalRepoRoot,
+    isLockOverride,
+    'locks'
+  );
+  if (!locksDirRes.ok) {
+    return {
+      ok: false,
+      baseDir: null,
+      backupBaseDir: null,
+      lockBaseDir: null,
+      backupsDir: null,
+      locksDir: null,
+      error: locksDirRes.error,
+    };
+  }
+  const locksDir = locksDirRes.resolvedPath;
+
+  return {
+    ok: true,
+    baseDir: candidateBackupBase,
+    backupBaseDir: candidateBackupBase,
+    lockBaseDir: candidateLockBase,
     backupsDir,
     locksDir,
     error: null,
