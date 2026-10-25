@@ -339,22 +339,26 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       assert.equal(res.command, 'check');
     });
 
-    test('rejects disabled apply and remove subcommands with explicit code and message', () => {
+    test('parses active apply and remove subcommands and aliases', () => {
       const resApply = parseCliArgs(['apply', '/path/to/st']);
       assert.equal(resApply.command, 'apply');
-      assert.match(resApply.error, /disabled in D01-SP-1/);
+      assert.equal(resApply.explicitTarget, '/path/to/st');
+      assert.equal(resApply.error, null);
 
       const resRemove = parseCliArgs(['remove', '/path/to/st']);
       assert.equal(resRemove.command, 'remove');
-      assert.match(resRemove.error, /disabled in D01-SP-1/);
+      assert.equal(resRemove.explicitTarget, '/path/to/st');
+      assert.equal(resRemove.error, null);
 
       const resApplyFlag = parseCliArgs(['--apply', '/path/to/st']);
       assert.equal(resApplyFlag.command, 'apply');
-      assert.match(resApplyFlag.error, /disabled in D01-SP-1/);
+      assert.equal(resApplyFlag.explicitTarget, '/path/to/st');
+      assert.equal(resApplyFlag.error, null);
 
       const resRemoveFlag = parseCliArgs(['--remove', '/path/to/st']);
       assert.equal(resRemoveFlag.command, 'remove');
-      assert.match(resRemoveFlag.error, /disabled in D01-SP-1/);
+      assert.equal(resRemoveFlag.explicitTarget, '/path/to/st');
+      assert.equal(resRemoveFlag.error, null);
     });
 
     test('rejects conflicting commands', () => {
@@ -705,18 +709,19 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       }
     });
 
-    test('disabled apply and remove commands exit with code 2 via CLI main()', async () => {
-      const exitApply = await main(['apply']);
+    test('apply and remove commands reject invalid explicit targets with exit code 2 via CLI main()', async () => {
+      const nonExistent = path.join(os.tmpdir(), `nonexistent-st-explicit-${Date.now()}`);
+      const exitApply = await main(['apply', '--target', nonExistent]);
       assert.equal(exitApply, 2);
 
-      const exitRemove = await main(['remove']);
+      const exitRemove = await main(['remove', '--target', nonExistent]);
       assert.equal(exitRemove, 2);
 
-      const exitApplyFlag = await main(['--apply']);
-      assert.equal(exitApplyFlag, 2);
+      const exitApplyEmpty = await main(['apply', '--target', '']);
+      assert.equal(exitApplyEmpty, 2);
 
-      const exitRemoveFlag = await main(['--remove']);
-      assert.equal(exitRemoveFlag, 2);
+      const exitRemoveEmpty = await main(['remove', '--target', '']);
+      assert.equal(exitRemoveEmpty, 2);
     });
   });
 

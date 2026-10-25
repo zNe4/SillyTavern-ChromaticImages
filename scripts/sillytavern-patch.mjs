@@ -9,9 +9,13 @@ import {
 import {
   checkReleaseCompatibility,
 } from '../src/patch-installer/check-release.js';
+import {
+  applyPatchToInstallation,
+  removePatchFromInstallation,
+} from '../src/patch-installer/apply-remove.js';
 
 const HELP_TEXT = `
-Chromatic Images — SillyTavern Patch Manager (SP-1 Read-Only)
+Chromatic Images — SillyTavern Patch Manager (SP-2)
 
 USAGE:
   ./ci-patch.sh [COMMAND] [TARGET_DIR] [OPTIONS]
@@ -20,6 +24,8 @@ USAGE:
 COMMANDS:
   status              (Default) Inspect SillyTavern repository and patch status
   check               Run preflight check to determine if patch can be applied
+  apply               Safely apply hardened proxy patch to SillyTavern working tree
+  remove              Safely remove hardened proxy patch from SillyTavern working tree
   check-release       Check upstream SillyTavern release compatibility (read-only)
   help                Show this help text
 
@@ -31,11 +37,9 @@ OPTIONS:
 BACKWARD COMPATIBILITY:
   --status            Same as 'status' command
   --check             Same as 'check' command
+  --apply             Same as 'apply' command
+  --remove            Same as 'remove' command
   --check-release     Same as 'check-release' command
-
-DISABLED COMMANDS:
-  apply, --apply      Disabled in SP-1 (exits with code 2)
-  remove, --remove    Disabled in SP-1 (exits with code 2)
 
 EXIT CODES:
   status:
@@ -47,6 +51,16 @@ EXIT CODES:
     1                 Patch cannot be applied (refused)
     2                 Usage or argument error
     3                 Patch is already applied (already-applied)
+  apply:
+    0                 Patch applied and verified successfully (applied)
+    1                 Refused, lock held, or verification failed
+    2                 Usage, argument, or target resolution error
+    3                 Patch is already applied (already-applied)
+  remove:
+    0                 Patch reversed and verified successfully (removed)
+    1                 Refused, lock held, or verification failed
+    2                 Usage, argument, or target resolution error
+    3                 Patch is already removed (already-removed)
   check-release:
     0                 Certified upstream release (certified)
     1                 Incompatible upstream release (incompatible)
@@ -78,9 +92,15 @@ const KNOWN_COMMANDS = new Set([
  * }}
  */
 export function parseCliArgs(args) {
+  const hasJsonFlag = args.some(
+    (arg, idx) =>
+      arg === '--json' &&
+      (idx === 0 || !['--target', '--test-upstream-url', '--test-upstream-branch'].includes(args[idx - 1]))
+  );
+
   let command = null;
   let explicitTarget = null;
-  let json = false;
+  let json = hasJsonFlag;
   let help = false;
   let testUpstreamUrl = null;
   let testUpstreamBranch = null;
@@ -132,25 +152,31 @@ export function parseCliArgs(args) {
       }
       command = 'check-release';
     } else if (arg === '--apply' || arg === 'apply') {
-      return {
-        command: 'apply',
-        explicitTarget,
-        targetDir: explicitTarget || process.env.SILLYTAVERN_DIR || null,
-        json,
-        help,
-        testUpstream: null,
-        error: 'Patch application (apply) is disabled in D01-SP-1.',
-      };
+      if (command && command !== 'apply') {
+        return {
+          command,
+          explicitTarget,
+          targetDir: explicitTarget || process.env.SILLYTAVERN_DIR || null,
+          json,
+          help,
+          testUpstream: null,
+          error: `Conflicting commands: ${command} and apply`,
+        };
+      }
+      command = 'apply';
     } else if (arg === '--remove' || arg === 'remove') {
-      return {
-        command: 'remove',
-        explicitTarget,
-        targetDir: explicitTarget || process.env.SILLYTAVERN_DIR || null,
-        json,
-        help,
-        testUpstream: null,
-        error: 'Patch removal (remove) is disabled in D01-SP-1.',
-      };
+      if (command && command !== 'remove') {
+        return {
+          command,
+          explicitTarget,
+          targetDir: explicitTarget || process.env.SILLYTAVERN_DIR || null,
+          json,
+          help,
+          testUpstream: null,
+          error: `Conflicting commands: ${command} and remove`,
+        };
+      }
+      command = 'remove';
     } else if (arg === '--target') {
       if (i + 1 >= args.length) {
         return {
@@ -312,9 +338,24 @@ export function parseCliArgs(args) {
     };
   }
 
+  const effectiveCommand = command || 'status';
+
+  const hasUpstreamTestArgs = testUpstreamUrl !== null || testUpstreamBranch !== null;
+  if (effectiveCommand !== 'check-release' && hasUpstreamTestArgs) {
+    return {
+      command: effectiveCommand,
+      explicitTarget,
+      targetDir: explicitTarget || process.env.SILLYTAVERN_DIR || null,
+      json,
+      help,
+      testUpstream: null,
+      error: `Option --test-upstream-url/--test-upstream-branch is not permitted for command: ${effectiveCommand}`,
+    };
+  }
+
   if (!testUpstreamUrl && testUpstreamBranch) {
     return {
-      command,
+      command: effectiveCommand,
       explicitTarget,
       targetDir: explicitTarget || process.env.SILLYTAVERN_DIR || null,
       json,
@@ -330,7 +371,7 @@ export function parseCliArgs(args) {
   }
 
   return {
-    command: command || 'status',
+    command: effectiveCommand,
     explicitTarget,
     targetDir: explicitTarget || process.env.SILLYTAVERN_DIR || null,
     json,
@@ -466,6 +507,163 @@ export function formatCheckReleaseOutput(result) {
 }
 
 /**
+ * Format human-readable output for apply
+ * @param {object} result
+ * @param {string} [targetSource]
+ * @returns {string}
+ */
+export function formatApplyOutput(result, targetSource = null) {
+  const lines = [];
+  lines.push(`[Chromatic Images] SillyTavern Patch Application`);
+  const srcNote = targetSource === 'sibling' ? ' (auto-discovered sibling)' : '';
+  lines.push(`  Target Directory:    ${result.targetDir || '(not specified)'}${srcNote}`);
+  lines.push(`  Repository Root:     ${result.repoRoot || '(not resolved)'}`);
+  lines.push(`  Status:              ${(result.status || 'unknown').toUpperCase()}`);
+  lines.push(`  Exit Code:           ${result.exitCode ?? 1}`);
+  lines.push(`  Target File:         ${result.targetFile || '(none)'}`);
+  lines.push(`  Worktree SHA-256:    ${result.worktreeSha256 || '(none)'}`);
+  lines.push(`  Expected SHA-256:    ${result.expectedSha256 || '(none)'}`);
+
+  if (result.backup?.backupFilePath) {
+    lines.push(`  Backup File:         ${result.backup.backupFilePath}`);
+    if (result.backup.metaFilePath) {
+      lines.push(`  Backup Metadata:     ${result.backup.metaFilePath}`);
+    }
+    if (result.backup.sha256) {
+      lines.push(`  Backup SHA-256:      ${result.backup.sha256}`);
+    }
+  }
+
+  if (result.mutationOutcome) {
+    lines.push(`  Mutation Outcome:    ${result.mutationOutcome}`);
+  }
+
+  if (result.lockPath) {
+    lines.push(`  Lock File:           ${result.lockPath}`);
+  }
+
+  if (result.existingLock) {
+    const o = result.existingLock;
+    lines.push(`  Existing Lock:       pid=${o.pid ?? 'unknown'}, host=${o.hostname || 'unknown'}, op=${o.operation || 'unknown'}`);
+  }
+
+  if (result.lockCleanupError) {
+    lines.push(`  Lock Cleanup Error:  ${result.lockCleanupError}`);
+  }
+
+  if (result.observedFingerprints) {
+    lines.push(`  Observed Fingerprints:`);
+    if (result.observedFingerprints.worktreeSha256 !== undefined) {
+      lines.push(`    - Worktree SHA:    ${result.observedFingerprints.worktreeSha256 || '(unreadable/absent)'}`);
+    }
+    if (result.observedFingerprints.expectedSha256 !== undefined) {
+      lines.push(`    - Expected SHA:    ${result.observedFingerprints.expectedSha256}`);
+    }
+    if (result.observedFingerprints.stockSha256 !== undefined) {
+      lines.push(`    - Stock SHA:       ${result.observedFingerprints.stockSha256}`);
+    }
+  }
+
+  if (result.humanInspectionRequired) {
+    lines.push(`  ========================================================================`);
+    lines.push(`  [WARNING] Human inspection required! An unexpected condition occurred.`);
+    if (result.backup?.backupFilePath) {
+      lines.push(`    Verified Pre-Mutation Backup: ${result.backup.backupFilePath}`);
+    }
+    if (result.backup?.metaFilePath) {
+      lines.push(`    Backup Descriptor:           ${result.backup.metaFilePath}`);
+    }
+    lines.push(`    DO NOT run git checkout, git reset, or git clean.`);
+    lines.push(`    Inspect repository state and verify target file manually.`);
+    lines.push(`  ========================================================================`);
+  }
+
+  lines.push(`  Reason:              ${result.reason || '(none)'}`);
+
+  return lines.join('\n');
+}
+
+/**
+ * Format human-readable output for remove
+ * @param {object} result
+ * @param {string} [targetSource]
+ * @returns {string}
+ */
+export function formatRemoveOutput(result, targetSource = null) {
+  const lines = [];
+  lines.push(`[Chromatic Images] SillyTavern Patch Removal`);
+  const srcNote = targetSource === 'sibling' ? ' (auto-discovered sibling)' : '';
+  lines.push(`  Target Directory:    ${result.targetDir || '(not specified)'}${srcNote}`);
+  lines.push(`  Repository Root:     ${result.repoRoot || '(not resolved)'}`);
+  lines.push(`  Status:              ${(result.status || 'unknown').toUpperCase()}`);
+  lines.push(`  Exit Code:           ${result.exitCode ?? 1}`);
+  lines.push(`  Target File:         ${result.targetFile || '(none)'}`);
+  lines.push(`  Worktree SHA-256:    ${result.worktreeSha256 || '(none)'}`);
+  lines.push(`  Expected SHA-256:    ${result.expectedSha256 || '(none)'}`);
+
+  if (result.backup?.backupFilePath) {
+    lines.push(`  Backup File:         ${result.backup.backupFilePath}`);
+    if (result.backup.metaFilePath) {
+      lines.push(`  Backup Metadata:     ${result.backup.metaFilePath}`);
+    }
+    if (result.backup.sha256) {
+      lines.push(`  Backup SHA-256:      ${result.backup.sha256}`);
+    }
+  }
+
+  if (result.mutationOutcome) {
+    lines.push(`  Mutation Outcome:    ${result.mutationOutcome}`);
+  }
+
+  if (result.lockPath) {
+    lines.push(`  Lock File:           ${result.lockPath}`);
+  }
+
+  if (result.existingLock) {
+    const o = result.existingLock;
+    lines.push(`  Existing Lock:       pid=${o.pid ?? 'unknown'}, host=${o.hostname || 'unknown'}, op=${o.operation || 'unknown'}`);
+  }
+
+  if (result.lockCleanupError) {
+    lines.push(`  Lock Cleanup Error:  ${result.lockCleanupError}`);
+  }
+
+  if (result.observedFingerprints) {
+    lines.push(`  Observed Fingerprints:`);
+    if (result.observedFingerprints.worktreeSha256 !== undefined) {
+      lines.push(`    - Worktree SHA:    ${result.observedFingerprints.worktreeSha256 || '(unreadable/absent)'}`);
+    }
+    if (result.observedFingerprints.expectedSha256 !== undefined) {
+      lines.push(`    - Expected SHA:    ${result.observedFingerprints.expectedSha256}`);
+    }
+    if (result.observedFingerprints.stockSha256 !== undefined) {
+      lines.push(`    - Stock SHA:       ${result.observedFingerprints.stockSha256}`);
+    }
+    if (result.observedFingerprints.patchedSha256 !== undefined) {
+      lines.push(`    - Patched SHA:     ${result.observedFingerprints.patchedSha256}`);
+    }
+  }
+
+  if (result.humanInspectionRequired) {
+    lines.push(`  ========================================================================`);
+    lines.push(`  [WARNING] Human inspection required! An unexpected condition occurred.`);
+    if (result.backup?.backupFilePath) {
+      lines.push(`    Verified Pre-Mutation Backup: ${result.backup.backupFilePath}`);
+    }
+    if (result.backup?.metaFilePath) {
+      lines.push(`    Backup Descriptor:           ${result.backup.metaFilePath}`);
+    }
+    lines.push(`    DO NOT run git checkout, git reset, or git clean.`);
+    lines.push(`    Inspect repository state and verify target file manually.`);
+    lines.push(`  ========================================================================`);
+  }
+
+  lines.push(`  Reason:              ${result.reason || '(none)'}`);
+
+  return lines.join('\n');
+}
+
+/**
  * Main CLI entrypoint
  */
 export async function main(argv = process.argv.slice(2)) {
@@ -476,14 +674,19 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
 
-  if (parsed.command === 'apply' || parsed.command === 'remove') {
-    console.error(`[ERROR] ${parsed.error}\n`);
-    return 2;
-  }
-
   if (parsed.error) {
-    console.error(`[ERROR] ${parsed.error}\n`);
-    console.error(HELP_TEXT);
+    if (parsed.json) {
+      console.log(JSON.stringify({
+        command: parsed.command || 'status',
+        ok: false,
+        status: 'refused',
+        exitCode: 2,
+        reason: parsed.error,
+      }, null, 2));
+    } else {
+      console.error(`[ERROR] ${parsed.error}\n`);
+      console.error(HELP_TEXT);
+    }
     return 2;
   }
 
@@ -508,18 +711,94 @@ export async function main(argv = process.argv.slice(2)) {
     return result.exitCode;
   }
 
-  // For status and check: resolve target directory with strict precedence
+  // Reject public CI_LOCK_DIR overrides for mutation commands before target resolution
+  if ((parsed.command === 'apply' || parsed.command === 'remove') && process.env.CI_LOCK_DIR !== undefined) {
+    const err = 'Environment variable CI_LOCK_DIR is not permitted for public mutation commands. Unset CI_LOCK_DIR or configure storage root via XDG_DATA_HOME.';
+    if (parsed.json) {
+      console.log(JSON.stringify({
+        command: parsed.command,
+        ok: false,
+        status: 'refused',
+        exitCode: 2,
+        reason: err,
+      }, null, 2));
+    } else {
+      console.error(`[ERROR] ${err}\n`);
+    }
+    return 2;
+  }
+
+  // For status, check, apply, and remove: resolve target directory with strict precedence
   const targetResolution = resolveTargetDirectory({ explicitTarget: parsed.explicitTarget });
   if (!targetResolution.ok || targetResolution.error) {
-    console.error(`[ERROR] ${targetResolution.error}\n`);
+    if (parsed.json) {
+      console.log(JSON.stringify({
+        command: parsed.command || 'status',
+        ok: false,
+        status: 'refused',
+        exitCode: 2,
+        reason: targetResolution.error,
+      }, null, 2));
+    } else {
+      console.error(`[ERROR] ${targetResolution.error}\n`);
+    }
     return 2;
   }
 
   const targetDir = targetResolution.targetDir;
   if (!targetDir) {
-    console.error(`[ERROR] Target SillyTavern directory is required. Specify --target <dir>, provide a path argument, set SILLYTAVERN_DIR, or place SillyTavern in a sibling directory.\n`);
-    console.error(HELP_TEXT);
+    const err = 'Target SillyTavern directory is required. Specify --target <dir>, provide a path argument, set SILLYTAVERN_DIR, or place SillyTavern in a sibling directory.';
+    if (parsed.json) {
+      console.log(JSON.stringify({
+        command: parsed.command || 'status',
+        ok: false,
+        status: 'refused',
+        exitCode: 2,
+        reason: err,
+      }, null, 2));
+    } else {
+      console.error(`[ERROR] ${err}\n`);
+      console.error(HELP_TEXT);
+    }
     return 2;
+  }
+
+  // Dispatch public apply and remove commands
+  if (parsed.command === 'apply' || parsed.command === 'remove') {
+    const result = parsed.command === 'apply'
+      ? await applyPatchToInstallation({ targetDir })
+      : await removePatchFromInstallation({ targetDir });
+
+    if (parsed.json) {
+      const output = {
+        command: parsed.command,
+        ok: result.ok,
+        status: result.status,
+        exitCode: result.exitCode,
+        reason: result.reason,
+        targetDir: result.targetDir || targetDir,
+        targetDiscoverySource: targetResolution.source,
+        repoRoot: result.repoRoot || null,
+        targetFile: result.targetFile || null,
+        worktreeSha256: result.worktreeSha256 || null,
+        expectedSha256: result.expectedSha256 || null,
+        backup: result.backup || null,
+        mutationOutcome: result.mutationOutcome || null,
+        observedFingerprints: result.observedFingerprints || null,
+        humanInspectionRequired: Boolean(result.humanInspectionRequired),
+        lockPath: result.lockPath || null,
+        existingLock: result.existingLock || null,
+        lockCleanupError: result.lockCleanupError || null,
+      };
+      console.log(JSON.stringify(output, null, 2));
+    } else {
+      const formatted = parsed.command === 'apply'
+        ? formatApplyOutput(result, targetResolution.source)
+        : formatRemoveOutput(result, targetResolution.source);
+      console.log(formatted);
+    }
+
+    return result.exitCode;
   }
 
   if (parsed.command === 'check') {
