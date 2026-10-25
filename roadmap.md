@@ -6,13 +6,13 @@
 
 **Phase:** Phase M03 complete (accepted); Distribution track D01 active.
 
-**Current milestone:** D01-P3B-2D-2-B (read-only pre-swap authentication) **accepted and closed 2026-10-20** after authentic pinned-release executable verification; Stage A's Termux capability probe is also accepted. **Next:** D01-P3B-2D-2-C **read-only architecture/security planning**, not live-target swap implementation.
+**Current milestone:** D01-SP-2-V3-Q2 public CLI Android acceptance **closed 2026-10-25** after an owner-operated device test and independent evidence-archive audit. **Next:** D01 documentation reconciliation, release-readiness review and separately authorized real-installation decision; no further mutation test is authorized. The older P3B swap track remains deferred.
 
-**Completed:** M01, M02, and M03-A through M03-H3; D01-P1, D01-P2A, D01-P2B, D01-P3A, D01-P3B transaction/locking foundation, and D01-P3B-2A/2B/2C (all accepted). Public patch application, removal, and recovery remain disabled.
+**Completed:** M01, M02, M03-A through M03-H3; D01-P1/P2A/P2B and the historical P3B stages documented below; D01-SP-1 read-only CLI and D01-SP-2 internal apply/remove, public V3 CLI activation, Linux suite, and physical Android/Termux V3-Q2 acceptance. Public `recover` and P3B atomic swap are not implemented.
 
 **Runtime code:** proposal parsing and validation, durable result parsing, message inspection/runtime reconstruction, inline proposal/review shells, managed prompt-hygiene Regex UI, request building (normalized and compatibility), response normalization, pure mocked transport core, production dispatch adapters with capability guards (normalized and compatibility), local image I/O primitives, provider settings schema, credential readiness reader, connection diagnostics UI, and explicit settings-only diagnostic image generator with local upload are implemented and verified. Automatic roleplay image generation remains disabled; proposal-card Generate wiring remains deferred to M05, and character identity and trusted reference library management are planned for M04.
 
-**Distribution track (D01):** The installer can authenticate the pinned release, prepare an isolated patch, create a verified backup, and stage a durable replacement candidate in the destination directory without changing the live target. The internal journal can advance through `READY_TO_SWAP`; `SWAPPED`/`COMPLETED` and public `--apply`/`--remove` remain deferred. See [D01 installer status and handoff](docs/d01-installer-progress.md).
+**Distribution track (D01):** The active SP-2 manager now exposes verified worktree-only public `apply`/`remove` for the exact certified SillyTavern revision, retaining pre-mutation backups and exclusive user-local locks. V3-Q2 accepted the Android disposable-fixture lifecycle and 11 refusals. The distinct P3B journal/candidate-swap path has not advanced beyond its accepted historical stages. See [D01 installer status](docs/d01-installer-progress.md) and [Android acceptance](docs/d01-sp2-v3-q2-android-acceptance.md).
 
 **Canonical repository:** `zNe4/SillyTavern-ChromaticImages`
 
@@ -726,7 +726,19 @@ Prepare public stable development release.
 
 ## D01 — SillyTavern patch distribution and safe installer
 
-**Status:** D01-P1, P2A, P2B, P3A, internal P3B transaction stages through P3B-2C, and **P3B-2D-1 read-only post-swap inspection** are accepted. This does **not** mean an end-user installer is operational.
+**Status (2026-10-25):** The SP-2 public `apply`/`remove` CLI is implemented and accepted in Linux and owner-executed physical Android/Termux testing **for the single certified SillyTavern revision only**. Publication and device acceptance are not a general-user release decision. The separately developed P3B atomic-swap/recovery track remains deferred.
+
+### Active SP-2 public worktree patch manager
+
+| Stage | Status | Boundary |
+| --- | --- | --- |
+| D01-SP-1 | Accepted | Read-only `status`, `check`, `check-release` and strict target/manifest validation. |
+| D01-SP-2-A/R | Accepted | Internal verified worktree apply/remove, independent backups and locks. |
+| D01-SP-2-V3-I1 | Published 2026-10-25 | Public `apply`/`remove` CLI wired at `10ca7d502d9b26803c16d3493f442b706276cd78`. |
+| D01-SP-2-V3-Q2 | Android PASS 2026-10-25 | 2 successful mutations, 2 idempotent results, 11 safety refusals; independent 46-file evidence-archive audit. |
+| General release / live installation | **Not authorized** | Separate release and deployment review, new-version certification, and installation-specific preflight required. |
+
+### Historical P3B transactional staging path (not the active public CLI)
 
 | Stage | Status | Boundary |
 | --- | --- | --- |
@@ -741,8 +753,8 @@ Prepare public stable development release.
 | **D01-P3B-2D-1** | **Accepted 2026-10-20** | Read-only classification of live result, missing candidate, possible unrecorded swap and inconsistent later phases; no mutations. |
 | **D01-P3B-2D-2-A** | **Source and device gate accepted 2026-10-20** | Termux-private `$HOME` probe: 13/13 filesystem capabilities, no errors, cleanup succeeded. |
 | **D01-P3B-2D-2-B** | **Accepted / closed 2026-10-20** | Internal authenticated `READY_TO_SWAP` preconditions; 75/75 focused, 1,171/1,171 full suite reported passed; no live mutation. |
-| D01-P3B-2D-2-C | **Read-only planning next; coding not authorized** | Actual candidate-to-live atomic rename, directory fsync and `SWAPPED` journal transition. |
-| D01-P3B-3 and later | Deferred | Completion/recovery/public CLI subject to separately reviewed contracts. |
+| D01-P3B-2D-2-C | **Deferred historical proposal; coding not authorized** | Separate candidate-to-live atomic rename, directory fsync and `SWAPPED` journal transition; not the SP-2 public path. |
+| D01-P3B-3 and later | Deferred | Journal completion and recovery; distinct from now-enabled SP-2 public apply/remove. |
 
 **Accepted P3B-2C code baseline:** `38043acd5a35e4087c2c7d214ee95f3a5f280323`. Gemini's read-only executable acceptance report recorded **1,043/1,043** full-suite tests, **63/63** focused destination-staging tests, zero failures/skips, `npm run verify:patches` PASS, and `node --check` passing for 64 tracked JavaScript files. The linked SillyTavern checkout was reported unchanged before and after. These are submitted execution results, not claims of independent local execution by the reviewer.
 
@@ -754,7 +766,7 @@ Prepare public stable development release.
 
 **Accepted Stage B baseline:** `00bcee97a1e0dca71efbc9cab2dbc00a96881d8c` (B-F2). Codex's executable acceptance report of 2026-10-20 records **75/75 focused** tests (8 suites), **1,171/1,171 full-suite** tests (70 suites), zero failures/skips, authentic pinned apply/remove cases, FIFO and hard-link races, descriptor-close fault regressions, patch verification PASS and clean worktree. The installed SillyTavern checkout and ignored symlink were reported preserved. This is Codex-run evidence reviewed by ChatGPT; no independent local re-execution or GitHub CI results were available. These totals are not code-coverage measurements.
 
-**Stop boundary:** P3B-2D-1 and Stages A/B never rename the installer candidate onto `src/endpoints/stable-diffusion.js` or advance its journal to `SWAPPED`, implement rollback, or enable public `--apply`/`--remove`/`--recover`. Stage C requires separate **read-only planning and explicit future implementation authorization**; passing Stage A on-device checks and Stage B authentic tests does **not** permit real-installation replacement.
+**Stop boundary:** P3B-2D-1 and Stages A/B do not rename journaled candidates onto the target or advance `SWAPPED`. The P3B Stage C design remains deferred. SP-2 `apply`/`remove` use ordinary worktree Git patching instead, were accepted only in independent disposable fixtures, and never imply approval to mutate a real SillyTavern installation. Automatic rollback/public recovery and support for uncertified revisions remain unavailable.
 
 **Handoff reference:** [docs/d01-installer-progress.md](docs/d01-installer-progress.md) records source files, journal lifecycle, certified fingerprints, accepted security invariants, testing evidence, and P3B-2D questions.
 

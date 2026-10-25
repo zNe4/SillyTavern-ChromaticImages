@@ -1,9 +1,10 @@
 # Mission D01-SP-2: Simplified Apply/Remove Architecture Plan (v1.1)
 
 > Technical Design & Architecture Specification for Chromatic Images Git Patch Manager (SP-2)
-> Document Version: 1.1.0 (Planning-Only — D01-SP-2-P0)
-> Date: 2026-10-22
-> Status: PROPOSED (v1.1 Revision) — Pending ChatGPT / Human Approval
+> Document Version: 1.1.0 (historical design text — D01-SP-2-P0)
+> Original date: 2026-10-22
+> Disposition (2026-10-25): **Implemented / reviewed / published through V3-I1; owner-run Android V3-Q2 acceptance PASS**. This design document is preserved as a historical proposal, not an exact description of every final implementation detail.
+> Published public CLI: [`10ca7d502d9b26803c16d3493f442b706276cd78`](https://github.com/zNe4/SillyTavern-ChromaticImages/commit/10ca7d502d9b26803c16d3493f442b706276cd78). See [current SP-2 implementation and P3B distinction](d01-installer-progress.md) and [device acceptance record](d01-sp2-v3-q2-android-acceptance.md).
 
 ---
 

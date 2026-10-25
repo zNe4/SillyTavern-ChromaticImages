@@ -1,8 +1,25 @@
 # D01 installer status and implementation handoff
 
-> Stage acceptance records updated **2026-10-20** for `zNe4/SillyTavern-ChromaticImages`. Acceptance of the disposable Android capability probe does **not** authorize live installer mutation.
+> Current active SP-2 status updated **2026-10-25**; historical P3B acceptance detail is preserved below. Physical Android acceptance used only independent disposable SillyTavern fixtures and does **not** authorize live-installation mutation or general release.
 
-## Stage ledger and current stop boundary
+## Active public patch manager: D01-SP-2
+
+The shipped public `./ci-patch.sh apply` and `remove` commands belong to the **SP-2 worktree-only Git patch architecture**, not the journaled P3B candidate-swap implementation. They were published at [`10ca7d502d9b26803c16d3493f442b706276cd78`](https://github.com/zNe4/SillyTavern-ChromaticImages/commit/10ca7d502d9b26803c16d3493f442b706276cd78) (parent `289837bdd31a58f1f665850611ca0586e29cde83`). Their strict certification is SillyTavern commit `06bde939fb1e9c4c8d8641d810f0a916b5bce127` only.
+
+| SP-2 gate | Result / scope |
+| --- | --- |
+| D01-SP-1 / SP-2-A/R | Accepted; read-only status/preflight and verified internal worktree-only apply/remove. |
+| V3-I1 Linux source/executable gate | Accepted; 19/19 focused tests and 1,392/1,392 sequential full-suite tests reported passing; manifest/syntax checks passed. |
+| V3-I1 publication | Verified exact expected parent and three approved files at `10ca7d502d9b26803c16d3493f442b706276cd78`. |
+| V3-Q2 Android/Termux | **PASS 2026-10-25** on certified, independent disposable targets: first apply, idempotent apply, first remove, idempotent remove, and 11/11 refusal cases. |
+| V3-Q2-E evidence | 46-member private archive SHA-256 `036e2a7de8b4ce00d79585f782a1a923ee222c0d6ca0710bb11c39ef9ebc1046`; 74/74 independent archive consistency checks passed. Original Q2-D and R1 harness HOLDs retained. |
+| Real installation / general distribution | **Not authorized** by fixture acceptance; no real target mutated in Q2. Future SillyTavern commits require separate certification. |
+
+Apply/remove use ordinary `git apply` / reverse against the **working tree only** (not the index). They require exact certified HEAD, stock index identity, recognized pre-state SHA-256, safe target paths, private user-local storage and a verified pre-mutation recovery snapshot. Successful mutations return exit `0`; already-satisfied results return `3`; operational refusals return `1`; invalid usage/target or public `CI_LOCK_DIR` override returns `2`. There is no automatic rollback, no stale-lock breaking, and **no public `recover`**.
+
+**Evidence/provenance:** [V3-Q2 Android acceptance and independent archive findings](d01-sp2-v3-q2-android-acceptance.md) distinguishes owner-executed device observations from checks independently performed on the uploaded archive. Never commit device-private fixtures, temporary local paths, backups, lock payloads or the archive to this repository.
+
+## Historical P3B stage ledger (not the active public mutation mechanism)
 
 | Stage | Review status | Owned boundary |
 | --- | --- | --- |
@@ -16,7 +33,7 @@
 | **D01-P3B-2D-2-A** | **Source reviewed; Android device gate accepted 2026-10-20** | Non-destructive Termux filesystem capability probe; disposable `$HOME` files only. |
 | **D01-P3B-2D-2-B** | **Accepted / closed 2026-10-20** | Lease-authorized read-only pre-swap authentication, certified bytes, directory/descriptor continuity, fail-closed refusals; no live rename. |
 | D01-P3B-2D-2-C | **Planning only; not authorized for coding** | First live-target atomic replacement, durability and journal advancement; requires reviewed design and explicit authorization. |
-| D01-P3B-3 and subsequent | Deferred | Completion, recovery/rollback and public mutation CLI gates. |
+| D01-P3B-3 and subsequent | Deferred | Historical journal completion and recovery; SP-2 separately enables public worktree apply/remove. |
 
 The accepted code baseline is [`38043acd5a35e4087c2c7d214ee95f3a5f280323`](https://github.com/zNe4/SillyTavern-ChromaticImages/commit/38043acd5a35e4087c2c7d214ee95f3a5f280323) (P3B-2C-F2). The initial P3B-2C implementation and corrective commits F1/F2 were independently source-reviewed before executable acceptance.
 
@@ -41,7 +58,7 @@ Current journal schema recognizes `LOCKED → ISOLATED_PREPARED → BACKUP_CREAT
 - `src/patch-installer/staging.js`: isolated authenticated result preparation.
 - `src/patch-installer/backup.js`: verified original-target backup; persists `backupPath` and `targetMode`.
 - `src/patch-installer/destination-staging.js`: internal `stageDestinationCandidate()`, creating the canonical candidate and registering `destinationStagedPath`.
-- `src/patch-installer/inspect.js` and `scripts/sillytavern-patch.mjs`: read-only inspection/preflight and disabled public mutation CLI.
+- `src/patch-installer/inspect.js`: inspection/preflight shared with SP-2. The later `scripts/sillytavern-patch.mjs` activates public SP-2 worktree `apply`/`remove`; it does not activate P3B candidate swapping.
 
 At `BACKUP_CREATED`, the journal already contains `isolatedStagedPath`, `backupPath`, and `targetMode`, but **not** `destinationStagedPath`. On accepted P3B-2C success it contains `destinationStagedPath = src/endpoints/.stable-diffusion.js.ci-staged-<txId>.tmp` and phase `READY_TO_SWAP`. The candidate remains on disk, independently verified. The original target and backup remain intact.
 
@@ -130,9 +147,9 @@ Codex's **D01-P3B-2D-2-B-V executable acceptance report**, dated **2026-10-20**,
 
 **Stage B is formally accepted and closed.** No Stage C implementation is authorized yet. The next checkpoint is a read-only Stage C design/contract review, followed by separately bounded coding and authentic disposable-fixture acceptance.
 
-## Next planning checkpoint: D01-P3B-2D-2-C
+## Historical/deferred planning checkpoint: D01-P3B-2D-2-C
 
-**Planning only: do not rename live files or advance the journal.** Stage C will require a new reviewed contract for candidate-to-live rename and crash/identity handling. The plan must settle:
+**Deferred, historical P3B-only design discussion: do not rename live files or advance the journal.** If Stage C is ever restarted, it will require a new reviewed contract for candidate-to-live rename and crash/identity handling. That design must settle:
 
 - Lease and journal authorization immediately before swapping; full authentication of live initial bytes/mode/inode, backup, isolated result, and same-directory candidate (including identity/permissions/durability).
 - Atomic rename semantics and directory fsync ordering; what happens if rename succeeds but subsequent directory synchronization or journal advance fails.
@@ -141,7 +158,7 @@ Codex's **D01-P3B-2D-2-B-V executable acceptance report**, dated **2026-10-20**,
 - Read-only status/inspection for the post-rename state without pretending P3B-3 recovery is implemented.
 - Deterministic forward and reverse fixture tests for every failure boundary, with **no changes** to the actual linked SillyTavern installation.
 
-The on-device Termux capability gate has now passed for the tested environment. This does **not** certify the future production rename implementation. Before Stage C is authorized, review Stage B's accepted authentication contract, descriptor lifetime, rename/error provenance, fsync ordering and journal crash-boundary semantics against the actual accepted code. If any required operation is unsupported in the deployment environment, fail closed without fallback. Keep public `--apply`, `--remove`, and `--recover` unavailable until their own later authorization.
+The P3B Termux capability gate does **not** certify the unimplemented P3B rename path. Restarting Stage C would require a new architecture and authorization review. Separately, the active SP-2 CLI now exposes public `apply`/`remove` for the certified release through its worktree-only Git mechanism; that acceptance does **not** enable P3B `swapVerifiedTarget()`, P3B recovery, or a public `recover` command. Any future unsupported platform or SillyTavern revision must fail closed.
 
 ## Workflow
 

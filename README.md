@@ -4,7 +4,7 @@
 
 It belongs to the planned **Chromatic** family of SillyTavern extensions alongside Chromatic Dialogue.
 
-> **Project status (2026-10-20):** M01–M03 are accepted; explicit settings-only diagnostic image generation is verified. Distribution installer D01 has accepted preflight, transaction foundation, isolated preparation, verified backup, destination staging (**P3B-2C**), read-only post-swap inspection (**P3B-2D-1**), the Android/Termux capability probe (**P3B-2D-2-A**), and **read-only pre-swap authentication (P3B-2D-2-B)** with authentic pinned-release test acceptance. Public patch application/removal remains **disabled**; the next stage is **planning only** for atomic live-target replacement (**P3B-2D-2-C**). Automatic roleplay generation remains disabled; M04 character identity/reference management and M05 proposal-card Generate wiring remain future work.
+> **Project status (2026-10-25):** M01–M03 are accepted, including explicit settings-only diagnostic generation. D01-SP-2 public `apply`/`remove` was published at `10ca7d502d9b26803c16d3493f442b706276cd78` and accepted on an owner-operated Android/Termux device using only independent disposable fixtures for the exact certified SillyTavern commit `06bde939fb1e9c4c8d8641d810f0a916b5bce127`. General release and mutation of any real installation are **not** authorized by this acceptance. The older P3B atomic-swap/recovery path remains deferred; automatic roleplay generation and M04/M05 character-reference/proposal Generate work remain future milestones.
 
 ## Product goal
 
@@ -296,7 +296,7 @@ M03 implemented two distinct same-origin SillyTavern server proxy routes:
 - **Upstream destination:** `POST https://api.nano-gpt.com/api/v1/images/generations` with `response_format: 'b64_json'`
 - **Reference input:** mutually exclusive `imageDataUrl` (exactly 1 reference) vs `imageDataUrls` (2 to 3 references)
 - **Status:** Powers the active diagnostic image generator in the extension settings drawer. Real end-to-end generation is verified across 0, 1, 2, and 3 reference images, with local upload to `/user/images/...`.
-- **Prerequisite:** Currently requires SillyTavern with the local compatibility proxy patch (`m03-d2b1-nanogpt-proxy` branch). This route is not yet merged upstream into stock SillyTavern.
+- **Prerequisite:** SillyTavern must contain the compatibility proxy patch. The SP-2 CLI can install that patch only on its certified release commit; the historical `m03-d2b1-nanogpt-proxy` development branch is a separate development setup. The route is not merged into stock SillyTavern.
 
 ### 2. Normalized Image API (Standardized target)
 
@@ -362,7 +362,7 @@ Chromatic Images follows Chromatic Dialogue's engineering style:
 - safe chat-switch and stale-state handling;
 - responsive/mobile-first UI.
 
-The target minimum SillyTavern version is **1.18.0**. Live diagnostic generation currently requires SillyTavern running with the local compatibility proxy patch (`m03-d2b1-nanogpt-proxy` branch), as the `v1-compat` route is not yet merged upstream into stock SillyTavern.
+The extension's target minimum SillyTavern version is **1.18.0**, but the distributed proxy patch is **not** certified for all 1.18.0+ revisions. Live diagnostic generation requires the compatibility proxy route, provided either by a separately maintained development setup or by the SP-2 patch manager on its exact certified commit; `v1-compat` is not merged into stock SillyTavern.
 
 ### Pinned Chromatic Dialogue donor
 
@@ -442,11 +442,26 @@ This is a responsibility map, not an instruction to create every module immediat
 
 ## Distribution installer status (D01)
 
-The packaged SillyTavern NanoGPT proxy patches target **only** the certified release `06bde939fb1e9c4c8d8641d810f0a916b5bce127`. The installer currently supports read-only inspection and internal, lease-authorized transaction primitives through the `READY_TO_SWAP` journal phase. These primitives prepare authenticated resulting bytes, preserve a verified original backup, and create a durable same-directory replacement candidate **without touching the live endpoint**. Accepted P3B-2D-1 read-only inspection detects consistent `SWAPPED`/`COMPLETED` states and potential unrecorded swaps without performing a rename or journal transition.
+**Implemented and device-accepted for one certified target; not a general-release approval.** D01-SP-2 publishes a worktree-only Git patch manager (`./ci-patch.sh`) with read-only `status`, `check`, and `check-release`, plus public `apply` and `remove`. The implementation commit is [`10ca7d502d9b26803c16d3493f442b706276cd78`](https://github.com/zNe4/SillyTavern-ChromaticImages/commit/10ca7d502d9b26803c16d3493f442b706276cd78). Real-device Android/Termux acceptance on **independent disposable checkouts** passed on 2026-10-25. **No real SillyTavern installation was patched as part of that acceptance.**
 
-**Not yet supported:** publicly callable `--apply`, `--remove`, `--recover`, atomic candidate-to-live-target replacement, or automatic rollback/recovery. The standalone P3B-2D-2-A probe passed all 13 required checks on the tested Android/Termux private-storage filesystem; this does not establish compatibility for every Android device. P3B-2D-2-B pre-swap authentication is now accepted: an authenticated pinned-release fixture yielded 75/75 focused and 1,171/1,171 full-suite passing tests in Codex's report, with zero skips. `swapVerifiedTarget()` still fails closed; Stage C's actual live-target rename remains unauthorized and must first undergo separate read-only security planning.
+The patch is certified **only** for SillyTavern commit `06bde939fb1e9c4c8d8641d810f0a916b5bce127`, endpoint `src/endpoints/stable-diffusion.js` (stock SHA-256 `15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43`; patched SHA-256 `16c01a8833a4dbaa547981acdf969e4dc8cb53d018135cb5976a0759d4d87da6`). An unsupported commit, unknown endpoint bytes, modified target index, ambiguous transaction or unsafe symlink must fail closed. The extension's minimum-version goal **does not** imply that the patch works on every SillyTavern 1.18.0+ revision.
 
-See [D01 installer status and handoff](docs/d01-installer-progress.md) for accepted evidence, safety invariants, and the next bounded stage.
+For an independently verified compatible installation, the explicit-target CLI shape is:
+
+```sh
+./ci-patch.sh status --target /absolute/path/to/SillyTavern --json
+./ci-patch.sh check --target /absolute/path/to/SillyTavern --json
+# Mutating operations: use only when the installation is deliberately approved for patching.
+./ci-patch.sh apply --target /absolute/path/to/SillyTavern --json
+./ci-patch.sh remove --target /absolute/path/to/SillyTavern --json
+```
+
+`apply` and `remove` modify only the target file in the **working tree**, not the Git index or HEAD. Before each successful mutation they verify a separate recovery backup (mode `0600`) in user-local `${XDG_DATA_HOME:-$HOME/.local/share}/chromatic-images/backups/`; operation locks use `chromatic-images/locks/`. Normal success exits `0`; already-satisfied operations exit `3`; operational refusals exit `1`; usage/invalid-target refusals exit `2`. Public mutation commands reject `CI_LOCK_DIR` overrides, including empty-but-defined values. Backups are retained and there is **no automatic rollback** if a mutation becomes ambiguous; inspect before any manual recovery. Public `recover` is **not supported**.
+
+The older D01-P3B journaled atomic-swap design and its accepted read-only/staging stages remain **historical/deferred**; `swapVerifiedTarget()` and P3B completion/recovery have **not** been enabled by SP-2. General release, future-version certification, and real-installation deployment need separate review and approval.
+
+See [D01 status and history](docs/d01-installer-progress.md), [SP-2 historical design](docs/d01-sp2-plan.md), and [V3-Q2 Android acceptance](docs/d01-sp2-v3-q2-android-acceptance.md).
+
 ## Development model
 
 Development now uses the canonical repository directly:
