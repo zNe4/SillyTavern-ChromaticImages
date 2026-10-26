@@ -33,5 +33,75 @@ jobs:
               node --check "$file"
             done
 
+      - name: Verify patch distribution manifests
+        run: npm run verify:patches
+
+      - name: Acquire authentic SillyTavern pinned release fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          FIXTURE_DIR="${{ runner.temp }}/sillytavern-authentic-fixture"
+          TARGET_COMMIT="06bde939fb1e9c4c8d8641d810f0a916b5bce127"
+
+          mkdir -p "$FIXTURE_DIR"
+          git -C "$FIXTURE_DIR" init -q
+          git -C "$FIXTURE_DIR" remote add origin https://github.com/SillyTavern/SillyTavern.git
+          git -C "$FIXTURE_DIR" fetch --depth 1 --no-tags --no-recurse-submodules origin "$TARGET_COMMIT"
+          git -C "$FIXTURE_DIR" checkout -q -b fixture-baseline FETCH_HEAD
+          git -C "$FIXTURE_DIR" config user.name "CI Fixture"
+          git -C "$FIXTURE_DIR" config user.email "ci-fixture@example.internal"
+          git -C "$FIXTURE_DIR" commit --allow-empty -q -m "Synthetic uncertified descendant for active user simulation"
+
+      - name: Verify authentic fixture integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          FIXTURE_DIR="${{ runner.temp }}/sillytavern-authentic-fixture"
+          TARGET_COMMIT="06bde939fb1e9c4c8d8641d810f0a916b5bce127"
+
+          # 1. Genuine, self-contained Git repository
+          test "$(git -C "$FIXTURE_DIR" rev-parse --is-inside-work-tree)" = "true"
+          test "$(git -C "$FIXTURE_DIR" rev-parse --show-toplevel)" = "$(cd "$FIXTURE_DIR" && pwd -P)"
+
+          # 2. Exact certified commit resolution
+          test "$(git -C "$FIXTURE_DIR" rev-parse --verify "$TARGET_COMMIT")" = "$TARGET_COMMIT"
+
+          # 3. Synthetic HEAD differs from certified SHA
+          test "$(git -C "$FIXTURE_DIR" rev-parse HEAD)" != "$TARGET_COMMIT"
+
+          # 4. Synthetic HEAD direct parent is certified commit and an ancestor
+          test "$(git -C "$FIXTURE_DIR" rev-parse HEAD^1)" = "$TARGET_COMMIT"
+          git -C "$FIXTURE_DIR" merge-base --is-ancestor "$TARGET_COMMIT" HEAD
+
+          # 5. Synthetic and certified tree IDs are identical
+          test "$(git -C "$FIXTURE_DIR" rev-parse HEAD^{tree})" = "$(git -C "$FIXTURE_DIR" rev-parse "$TARGET_COMMIT^{tree}")"
+
+          # 6. Certified files Git blob and SHA-256 identities
+          git -C "$FIXTURE_DIR" cat-file -e "$TARGET_COMMIT:src/endpoints/stable-diffusion.js"
+          test "$(git -C "$FIXTURE_DIR" rev-parse "$TARGET_COMMIT:src/endpoints/stable-diffusion.js")" = "077c2f961b528afa10376a7cc20a62132cf9fcd8"
+          test "$(git -C "$FIXTURE_DIR" show "$TARGET_COMMIT:src/endpoints/stable-diffusion.js" | sha256sum | awk '{print $1}')" = "15439fdffd839815ef7adcaa39806738c4e4503db8bbb697b337e905dfb4ed43"
+
+          git -C "$FIXTURE_DIR" cat-file -e "$TARGET_COMMIT:tests/stable-diffusion.test.js"
+          test "$(git -C "$FIXTURE_DIR" rev-parse "$TARGET_COMMIT:tests/stable-diffusion.test.js")" = "6a33571d8fbb1a71e56aec51f6c3db30d18eb2d8"
+          test "$(git -C "$FIXTURE_DIR" show "$TARGET_COMMIT:tests/stable-diffusion.test.js" | sha256sum | awk '{print $1}')" = "c185b4559be6e5aa9487cbd42f351ba2bd2ee8158b11c8f67ad4b4dabc4cba93"
+
+          # 7. Target index entry has expected mode, blob SHA and stage 0
+          INDEX_ENTRY=$(git -C "$FIXTURE_DIR" ls-files -s "src/endpoints/stable-diffusion.js")
+          EXPECTED_ENTRY=$'100644 077c2f961b528afa10376a7cc20a62132cf9fcd8 0\tsrc/endpoints/stable-diffusion.js'
+          test "$INDEX_ENTRY" = "$EXPECTED_ENTRY"
+
+          # 8. Working tree and index are clean
+          test -z "$(git -C "$FIXTURE_DIR" status --porcelain=v1)"
+
+          # 9. Absence of Git object alternates
+          if [ -f "$FIXTURE_DIR/.git/objects/info/alternates" ] && [ -s "$FIXTURE_DIR/.git/objects/info/alternates" ]; then
+            echo "ERROR: Git object alternates detected in fixture" >&2
+            exit 1
+          fi
+
+          echo "Authentic SillyTavern fixture verified successfully."
+
       - name: Run tests
+        env:
+          SILLYTAVERN_TEST_REPO: ${{ runner.temp }}/sillytavern-authentic-fixture
         run: npm test
