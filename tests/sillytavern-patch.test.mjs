@@ -1,4 +1,4 @@
-import { describe, test, after } from 'node:test';
+import { describe, test, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -42,21 +42,295 @@ const PRODUCTION_MANIFEST_PATH = path.join(
 );
 
 const tempDirsToClean = [];
-after(() => {
-  for (const d of tempDirsToClean) {
+let currentTestContext = null;
+const failedTestContexts = new Set();
+let anyTestFailedInSuite = false;
+
+beforeEach((t) => {
+  currentTestContext = t;
+});
+
+afterEach((t) => {
+  if (t.error || t.passed === false) {
+    failedTestContexts.add(t);
+    anyTestFailedInSuite = true;
+  }
+  currentTestContext = null;
+});
+
+function findTempDirEntry(filePath) {
+  for (const entry of tempDirsToClean) {
+    if (filePath === entry.path || filePath.startsWith(entry.path + path.sep)) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function registerFixtureArtifact(targetPath, explicitEntry = null) {
+  const entry = explicitEntry || findTempDirEntry(targetPath);
+  if (!entry) return;
+  try {
+    const stat = fs.lstatSync(targetPath);
+    entry.trackedArtifacts.set(targetPath, {
+      dev: stat.dev,
+      ino: stat.ino,
+      uid: stat.uid,
+      isDirectory: stat.isDirectory(),
+      isSymbolicLink: stat.isSymbolicLink(),
+    });
+  } catch {
+    // ignore
+  }
+}
+
+function registerFixtureArtifactTree(targetPath, explicitEntry = null) {
+  const entry = explicitEntry || findTempDirEntry(targetPath);
+  if (!entry) return;
+  function walk(current) {
+    let stat;
     try {
-      if (fs.existsSync(d)) {
-        fs.rmSync(d, { recursive: true, force: true });
-      }
+      stat = fs.lstatSync(current);
     } catch {
-      // ignore cleanup errors on exit
+      return;
+    }
+    entry.trackedArtifacts.set(current, {
+      dev: stat.dev,
+      ino: stat.ino,
+      uid: stat.uid,
+      isDirectory: stat.isDirectory(),
+      isSymbolicLink: stat.isSymbolicLink(),
+    });
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      let names = [];
+      try {
+        names = fs.readdirSync(current);
+      } catch {
+        return;
+      }
+      for (const name of names) {
+        walk(path.join(current, name));
+      }
+    }
+  }
+  walk(targetPath);
+}
+
+function failClosedCleanupDir(entry) {
+  const {
+    path: dirPath,
+    dev: expectedDev,
+    ino: expectedIno,
+    uid: expectedUid,
+    testContext,
+    testName,
+    trackedArtifacts,
+  } = entry;
+
+  const testFailed = testContext
+    ? (failedTestContexts.has(testContext) || Boolean(testContext.error))
+    : anyTestFailedInSuite;
+
+  if (testFailed) {
+    if (fs.existsSync(dirPath)) {
+      console.error(`[evidence-preservation] Retaining artifact from failed test "${testName}": ${dirPath}`);
+    }
+    return false;
+  }
+
+  if (
+    typeof expectedDev !== 'number' ||
+    typeof expectedIno !== 'number' ||
+    typeof expectedUid !== 'number'
+  ) {
+    if (fs.existsSync(dirPath)) {
+      console.error(
+        `[evidence-preservation] Refusing cleanup: incomplete recorded identity/ownership for artifact "${dirPath}" (dev: ${expectedDev}, ino: ${expectedIno}, uid: ${expectedUid})`
+      );
+    }
+    return false;
+  }
+
+  let stat;
+  try {
+    stat = fs.lstatSync(dirPath);
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      return true;
+    }
+    console.error(`[evidence-preservation] Unable to stat artifact "${dirPath}": ${err.message}`);
+    return false;
+  }
+
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    console.error(`[evidence-preservation] Refusing cleanup: artifact "${dirPath}" is a symbolic link or not a directory`);
+    return false;
+  }
+
+  if (stat.dev !== expectedDev || stat.ino !== expectedIno) {
+    console.error(
+      `[evidence-preservation] Refusing cleanup: artifact "${dirPath}" identity mismatch (dev: ${stat.dev} vs ${expectedDev}, ino: ${stat.ino} vs ${expectedIno})`
+    );
+    return false;
+  }
+
+  if (stat.uid !== expectedUid) {
+    console.error(
+      `[evidence-preservation] Refusing cleanup: artifact "${dirPath}" ownership mismatch (uid: ${stat.uid} vs ${expectedUid})`
+    );
+    return false;
+  }
+
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    console.error(
+      `[evidence-preservation] Refusing cleanup: artifact "${dirPath}" process uid mismatch (uid: ${stat.uid} vs ${process.getuid()})`
+    );
+    return false;
+  }
+
+  const itemsToClean = [];
+  function scanTree(currentDir) {
+    let names;
+    try {
+      names = fs.readdirSync(currentDir);
+    } catch (readErr) {
+      return { reason: `cannot readdir (${readErr.message})`, path: currentDir };
+    }
+
+    for (const name of names) {
+      const itemPath = path.join(currentDir, name);
+      let itemStat;
+      try {
+        itemStat = fs.lstatSync(itemPath);
+      } catch (statErr) {
+        return { reason: `cannot lstat (${statErr.message})`, path: itemPath };
+      }
+
+      const tracked = trackedArtifacts?.get(itemPath);
+      if (!tracked) {
+        return { reason: 'unrecognized or untracked artifact', path: itemPath };
+      }
+
+      if (itemStat.dev !== tracked.dev || itemStat.ino !== tracked.ino) {
+        return { reason: `identity mismatch (dev: ${itemStat.dev} vs ${tracked.dev}, ino: ${itemStat.ino} vs ${tracked.ino})`, path: itemPath };
+      }
+      if (typeof tracked.uid === 'number' && itemStat.uid !== tracked.uid) {
+        return { reason: `ownership mismatch (uid: ${itemStat.uid} vs ${tracked.uid})`, path: itemPath };
+      }
+      if (typeof process.getuid === 'function' && itemStat.uid !== process.getuid()) {
+        return { reason: `process uid mismatch (uid: ${itemStat.uid} vs ${process.getuid()})`, path: itemPath };
+      }
+      if (itemStat.isSymbolicLink() !== Boolean(tracked.isSymbolicLink)) {
+        return { reason: 'symbolic link type mismatch', path: itemPath };
+      }
+
+      if (itemStat.isDirectory()) {
+        const nestedErr = scanTree(itemPath);
+        if (nestedErr) return nestedErr;
+      }
+
+      itemsToClean.push({
+        path: itemPath,
+        isDirectory: itemStat.isDirectory(),
+        isSymbolicLink: itemStat.isSymbolicLink(),
+        expectedDev: tracked.dev,
+        expectedIno: tracked.ino,
+      });
+    }
+    return null;
+  }
+
+  const problem = scanTree(dirPath);
+  if (problem) {
+    console.error(
+      `[evidence-preservation] Refusing cleanup: unexpected or unverified artifact (${problem.reason}) at "${problem.path}"`
+    );
+    return false;
+  }
+
+  // Fail-closed leaf-to-root deletion:
+  for (const item of itemsToClean) {
+    if (item.isDirectory) continue;
+    let currentItemStat;
+    try {
+      currentItemStat = fs.lstatSync(item.path);
+    } catch (err) {
+      if (err?.code === 'ENOENT') continue;
+      console.error(`[evidence-preservation] Unable to stat item before deletion "${item.path}": ${err.message}`);
+      return false;
+    }
+    if (currentItemStat.dev !== item.expectedDev || currentItemStat.ino !== item.expectedIno) {
+      console.error(`[evidence-preservation] Identity changed immediately before unlinking "${item.path}"`);
+      return false;
+    }
+    fs.unlinkSync(item.path);
+  }
+
+  for (const item of itemsToClean) {
+    if (!item.isDirectory) continue;
+    let currentDirStat;
+    try {
+      currentDirStat = fs.lstatSync(item.path);
+    } catch (err) {
+      if (err?.code === 'ENOENT') continue;
+      console.error(`[evidence-preservation] Unable to stat dir before deletion "${item.path}": ${err.message}`);
+      return false;
+    }
+    if (currentDirStat.dev !== item.expectedDev || currentDirStat.ino !== item.expectedIno) {
+      console.error(`[evidence-preservation] Identity changed immediately before rmdir "${item.path}"`);
+      return false;
+    }
+    fs.rmdirSync(item.path);
+  }
+
+  let finalStat;
+  try {
+    finalStat = fs.lstatSync(dirPath);
+  } catch (err) {
+    if (err?.code === 'ENOENT') return true;
+    console.error(`[evidence-preservation] Unable to stat root dir before final rmdir "${dirPath}": ${err.message}`);
+    return false;
+  }
+  if (finalStat.dev !== expectedDev || finalStat.ino !== expectedIno) {
+    console.error(`[evidence-preservation] Identity changed immediately before final rmdir "${dirPath}"`);
+    return false;
+  }
+  fs.rmdirSync(dirPath);
+  return true;
+}
+
+after(() => {
+  for (const entry of tempDirsToClean) {
+    try {
+      failClosedCleanupDir(entry);
+    } catch (cleanupErr) {
+      console.error(`[evidence-preservation] Controlled cleanup error for "${entry.path}": ${cleanupErr.message}`);
     }
   }
 });
 
 function createTempDir(prefix = 'ci-patch-test-') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  tempDirsToClean.push(dir);
+  let dev = null;
+  let ino = null;
+  let uid = null;
+  try {
+    const stat = fs.lstatSync(dir);
+    dev = stat.dev;
+    ino = stat.ino;
+    uid = typeof stat.uid === 'number' ? stat.uid : null;
+  } catch {
+    // If initial stat fails, record nulls
+  }
+  tempDirsToClean.push({
+    path: dir,
+    dev,
+    ino,
+    uid,
+    testContext: currentTestContext,
+    testName: currentTestContext?.name || '(unknown test)',
+    trackedArtifacts: new Map(),
+  });
   return dir;
 }
 
@@ -111,6 +385,7 @@ function setupDisposableRepo(dirName = 'st-fixture-') {
   execFileSync('git', ['add', '.'], { cwd: repoDir });
   execFileSync('git', ['commit', '-q', '-m', 'Initial commit'], { cwd: repoDir });
 
+  registerFixtureArtifactTree(repoDir);
   return repoDir;
 }
 
@@ -133,6 +408,7 @@ function setupMockUpstreamReleaseRepo({
   execFileSync('git', ['commit', '-q', '-m', commitMessage], { cwd: repoDir });
 
   const headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf-8' }).trim();
+  registerFixtureArtifactTree(repoDir);
   return { repoDir, headSha };
 }
 
@@ -403,6 +679,8 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       const mockSiblingSt = path.join(parentDir, 'SillyTavern');
       fs.mkdirSync(mockPkgRoot);
       fs.mkdirSync(mockSiblingSt);
+      registerFixtureArtifact(mockPkgRoot);
+      registerFixtureArtifact(mockSiblingSt);
 
       const oldEnv = process.env.SILLYTAVERN_DIR;
       process.env.SILLYTAVERN_DIR = mockSiblingSt; // Even with valid env and sibling present
@@ -430,6 +708,8 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       const mockSiblingSt = path.join(parentDir, 'SillyTavern');
       fs.mkdirSync(mockPkgRoot);
       fs.mkdirSync(mockSiblingSt);
+      registerFixtureArtifact(mockPkgRoot);
+      registerFixtureArtifact(mockSiblingSt);
 
       // Verify --target "" and positional ""
       assert.equal(await main(['status', '--target', '']), 2);
@@ -447,6 +727,8 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       const mockSiblingSt = path.join(parentDir, 'SillyTavern');
       fs.mkdirSync(mockPkgRoot);
       fs.mkdirSync(mockSiblingSt);
+      registerFixtureArtifact(mockPkgRoot);
+      registerFixtureArtifact(mockSiblingSt);
 
       const oldEnv = process.env.SILLYTAVERN_DIR;
       process.env.SILLYTAVERN_DIR = nonExistent;
@@ -482,6 +764,8 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       const mockSiblingSt = path.join(parentDir, 'SillyTavern');
       fs.mkdirSync(mockPkgRoot);
       fs.mkdirSync(mockSiblingSt);
+      registerFixtureArtifact(mockPkgRoot);
+      registerFixtureArtifact(mockSiblingSt);
 
       const oldEnv = process.env.SILLYTAVERN_DIR;
       delete process.env.SILLYTAVERN_DIR;
@@ -530,6 +814,7 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       fs.writeFileSync(path.join(repoDir, 'other.txt'), 'hello');
       execFileSync('git', ['add', '.'], { cwd: repoDir });
       execFileSync('git', ['commit', '-q', '-m', 'Init'], { cwd: repoDir });
+      registerFixtureArtifactTree(repoDir);
 
       const res = await inspectTargetInstallation({ targetDir: repoDir });
       assert.equal(res.status, 'invalid-installation');
@@ -561,6 +846,8 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       fs.writeFileSync(path.join(realEndpoints, 'stable-diffusion.js'), '');
       fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
       fs.symlinkSync(realEndpoints, path.join(repoDir, 'src/endpoints'));
+      registerFixtureArtifactTree(repoDir);
+      registerFixtureArtifactTree(realEndpoints);
 
       const res = await inspectTargetInstallation({ targetDir: repoDir });
       assert.equal(res.status, 'invalid-installation');
@@ -593,6 +880,7 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       const repoDir = setupDisposableRepo();
       const targetWithSpaces = path.join(spaceDir, 'SillyTavern Copy');
       fs.cpSync(repoDir, targetWithSpaces, { recursive: true });
+      registerFixtureArtifactTree(spaceDir);
 
       const res = await inspectTargetInstallation({ targetDir: targetWithSpaces });
       assert.equal(res.status, 'unsupported-revision');
@@ -789,6 +1077,7 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       const tamperedManifest = path.join(tamperedDir, 'manifest.json');
       // Tampered JSON missing required fields
       fs.writeFileSync(tamperedManifest, JSON.stringify({ schemaVersion: '0.0.1' }));
+      registerFixtureArtifactTree(tamperedDir);
 
       const res = await checkReleaseCompatibility({
         manifestPath: tamperedManifest,
@@ -878,6 +1167,7 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({ name: 'sillytavern' }));
       execFileSync('git', ['add', '.'], { cwd: repoDir });
       execFileSync('git', ['commit', '-q', '-m', 'Commit without target file'], { cwd: repoDir });
+      registerFixtureArtifactTree(repoDir);
 
       const res = await checkReleaseCompatibility({
         _testUpstream: { url: repoDir, branch: 'release' },
@@ -963,16 +1253,47 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       const baseDir = createTempDir('identity-mismatch-base-');
       const { repoDir } = setupMockUpstreamReleaseRepo({ prefix: 'identity-mismatch-upstream-' });
       let preservedDir = null;
+      let heldOriginalDir = null;
+      let originalStat = null;
+      let heldEntry = null;
 
       const res = await checkReleaseCompatibility({
         _testUpstream: { url: repoDir, branch: 'release' },
         disposableBaseDir: baseDir,
         _onBeforeCleanup: (tmpDir) => {
           preservedDir = tmpDir;
-          // Recreate tmpDir with a new inode
-          fs.rmSync(tmpDir, { recursive: true, force: true });
-          fs.mkdirSync(tmpDir);
-          fs.writeFileSync(path.join(tmpDir, 'preserved-evidence.txt'), 'inode changed');
+          originalStat = fs.lstatSync(tmpDir);
+
+          // 1. Concurrent inode reservation: create substitute directory while original tmpDir remains allocated
+          const substituteDir = fs.mkdtempSync(path.join(baseDir, 'identity-sub-'));
+          fs.writeFileSync(path.join(substituteDir, 'preserved-evidence.txt'), 'inode changed');
+          const substituteStat = fs.lstatSync(substituteDir);
+
+          // 2. Move original directory aside so its inode remains allocated during check
+          heldOriginalDir = `${tmpDir}.held-original`;
+          fs.renameSync(tmpDir, heldOriginalDir);
+
+          // Record held directory identity for tracking, but do not retroactively register unknown child contents
+          heldEntry = {
+            path: heldOriginalDir,
+            dev: originalStat.dev,
+            ino: originalStat.ino,
+            uid: originalStat.uid,
+            testContext: currentTestContext,
+            testName: currentTestContext?.name || 'identity-mismatch',
+            trackedArtifacts: new Map(),
+          };
+
+          // 3. Move substitute directory into target path
+          fs.renameSync(substituteDir, tmpDir);
+
+          // 4. Verify distinct (dev, ino) identity before fail-closed assertions
+          const currentStat = fs.lstatSync(tmpDir);
+          assert.ok(
+            originalStat.dev !== currentStat.dev || originalStat.ino !== currentStat.ino,
+            'Substitute directory must produce a different (dev, ino) identity from original directory'
+          );
+          assert.equal(currentStat.ino, substituteStat.ino);
         },
       });
 
@@ -983,6 +1304,16 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
       assert.match(res.reason, /Cleanup safeguard failure: .*identity mismatch/i);
       assert.equal(fs.existsSync(preservedDir), true, 'Artifact must be preserved when identity changes');
       assert.equal(fs.existsSync(path.join(preservedDir, 'preserved-evidence.txt')), true);
+
+      // Retain held original directory because child provenance cannot be proven test-owned at a trusted creation point
+      if (heldOriginalDir && fs.existsSync(heldOriginalDir)) {
+        if (heldEntry) {
+          const cleaned = failClosedCleanupDir(heldEntry);
+          assert.equal(cleaned, false, 'Held directory with unverified children must not be cleaned up');
+        }
+        console.error(`[evidence-preservation] Retaining held original directory (unverified child provenance): ${heldOriginalDir}`);
+        assert.equal(fs.existsSync(heldOriginalDir), true, 'Held original directory must remain preserved');
+      }
     });
 
     test('cleanup safeguard: symlink substitution before cleanup aborts removal, preserves symlink, and fails closed with unknown (exit 4)', async () => {
@@ -1254,6 +1585,7 @@ describe('SillyTavern patch installer preflight & manager (D01-SP-1)', async () 
         // Create independent clone of local SillyTavern (no worktree shared metadata)
         execFileSync('git', ['clone', '--no-hardlinks', '-q', validatedRepoPath, tempCloneDir]);
         execFileSync('git', ['checkout', '-q', manifest.releaseCommit], { cwd: tempCloneDir });
+        registerFixtureArtifactTree(tempCloneDir);
 
         const runtimePatchPath = path.resolve(
           REPO_ROOT,

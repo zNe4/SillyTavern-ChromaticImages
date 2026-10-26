@@ -1,4 +1,4 @@
-import { describe, test, after } from 'node:test';
+import { describe, test, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -18,21 +18,237 @@ const __dirname = path.dirname(__filename);
 const PROBE_SCRIPT_PATH = path.resolve(__dirname, '../scripts/check-termux-swap-capabilities.mjs');
 
 const tempDirsToClean = [];
-after(() => {
-  for (const d of tempDirsToClean) {
+let currentTestContext = null;
+const failedTestContexts = new Set();
+let anyTestFailedInSuite = false;
+
+beforeEach((t) => {
+  currentTestContext = t;
+});
+
+afterEach((t) => {
+  if (t.error || t.passed === false) {
+    failedTestContexts.add(t);
+    anyTestFailedInSuite = true;
+  }
+  currentTestContext = null;
+});
+
+function failClosedCleanupDir(entry) {
+  const {
+    path: dirPath,
+    dev: expectedDev,
+    ino: expectedIno,
+    uid: expectedUid,
+    testContext,
+    testName,
+    trackedArtifacts,
+  } = entry;
+
+  const testFailed = testContext
+    ? (failedTestContexts.has(testContext) || Boolean(testContext.error))
+    : anyTestFailedInSuite;
+
+  if (testFailed) {
+    if (fs.existsSync(dirPath)) {
+      console.error(`[evidence-preservation] Retaining artifact from failed test "${testName}": ${dirPath}`);
+    }
+    return false;
+  }
+
+  if (
+    typeof expectedDev !== 'number' ||
+    typeof expectedIno !== 'number' ||
+    typeof expectedUid !== 'number'
+  ) {
+    if (fs.existsSync(dirPath)) {
+      console.error(
+        `[evidence-preservation] Refusing cleanup: incomplete recorded identity/ownership for artifact "${dirPath}" (dev: ${expectedDev}, ino: ${expectedIno}, uid: ${expectedUid})`
+      );
+    }
+    return false;
+  }
+
+  let stat;
+  try {
+    stat = fs.lstatSync(dirPath);
+  } catch (err) {
+    if (err?.code === 'ENOENT') {
+      return true;
+    }
+    console.error(`[evidence-preservation] Unable to stat artifact "${dirPath}": ${err.message}`);
+    return false;
+  }
+
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    console.error(`[evidence-preservation] Refusing cleanup: artifact "${dirPath}" is a symbolic link or not a directory`);
+    return false;
+  }
+
+  if (stat.dev !== expectedDev || stat.ino !== expectedIno) {
+    console.error(
+      `[evidence-preservation] Refusing cleanup: artifact "${dirPath}" identity mismatch (dev: ${stat.dev} vs ${expectedDev}, ino: ${stat.ino} vs ${expectedIno})`
+    );
+    return false;
+  }
+
+  if (stat.uid !== expectedUid) {
+    console.error(
+      `[evidence-preservation] Refusing cleanup: artifact "${dirPath}" ownership mismatch (uid: ${stat.uid} vs ${expectedUid})`
+    );
+    return false;
+  }
+
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    console.error(
+      `[evidence-preservation] Refusing cleanup: artifact "${dirPath}" process uid mismatch (uid: ${stat.uid} vs ${process.getuid()})`
+    );
+    return false;
+  }
+
+  const itemsToClean = [];
+  function scanTree(currentDir) {
+    let names;
     try {
-      if (fs.existsSync(d)) {
-        fs.rmSync(d, { recursive: true, force: true });
+      names = fs.readdirSync(currentDir);
+    } catch (readErr) {
+      return { reason: `cannot readdir (${readErr.message})`, path: currentDir };
+    }
+
+    for (const name of names) {
+      const itemPath = path.join(currentDir, name);
+      let itemStat;
+      try {
+        itemStat = fs.lstatSync(itemPath);
+      } catch (statErr) {
+        return { reason: `cannot lstat (${statErr.message})`, path: itemPath };
       }
-    } catch {
-      // ignore cleanup errors on test exit
+
+      const tracked = trackedArtifacts?.get(itemPath);
+      if (!tracked) {
+        return { reason: 'unrecognized or untracked artifact', path: itemPath };
+      }
+
+      if (itemStat.dev !== tracked.dev || itemStat.ino !== tracked.ino) {
+        return { reason: `identity mismatch (dev: ${itemStat.dev} vs ${tracked.dev}, ino: ${itemStat.ino} vs ${tracked.ino})`, path: itemPath };
+      }
+      if (typeof tracked.uid === 'number' && itemStat.uid !== tracked.uid) {
+        return { reason: `ownership mismatch (uid: ${itemStat.uid} vs ${tracked.uid})`, path: itemPath };
+      }
+      if (typeof process.getuid === 'function' && itemStat.uid !== process.getuid()) {
+        return { reason: `process uid mismatch (uid: ${itemStat.uid} vs ${process.getuid()})`, path: itemPath };
+      }
+      if (itemStat.isSymbolicLink() !== Boolean(tracked.isSymbolicLink)) {
+        return { reason: 'symbolic link type mismatch', path: itemPath };
+      }
+
+      if (itemStat.isDirectory()) {
+        const nestedErr = scanTree(itemPath);
+        if (nestedErr) return nestedErr;
+      }
+
+      itemsToClean.push({
+        path: itemPath,
+        isDirectory: itemStat.isDirectory(),
+        isSymbolicLink: itemStat.isSymbolicLink(),
+        expectedDev: tracked.dev,
+        expectedIno: tracked.ino,
+      });
+    }
+    return null;
+  }
+
+  const problem = scanTree(dirPath);
+  if (problem) {
+    console.error(
+      `[evidence-preservation] Refusing cleanup: unexpected or unverified artifact (${problem.reason}) at "${problem.path}"`
+    );
+    return false;
+  }
+
+  // Fail-closed leaf-to-root deletion:
+  for (const item of itemsToClean) {
+    if (item.isDirectory) continue;
+    let currentItemStat;
+    try {
+      currentItemStat = fs.lstatSync(item.path);
+    } catch (err) {
+      if (err?.code === 'ENOENT') continue;
+      console.error(`[evidence-preservation] Unable to stat item before deletion "${item.path}": ${err.message}`);
+      return false;
+    }
+    if (currentItemStat.dev !== item.expectedDev || currentItemStat.ino !== item.expectedIno) {
+      console.error(`[evidence-preservation] Identity changed immediately before unlinking "${item.path}"`);
+      return false;
+    }
+    fs.unlinkSync(item.path);
+  }
+
+  for (const item of itemsToClean) {
+    if (!item.isDirectory) continue;
+    let currentDirStat;
+    try {
+      currentDirStat = fs.lstatSync(item.path);
+    } catch (err) {
+      if (err?.code === 'ENOENT') continue;
+      console.error(`[evidence-preservation] Unable to stat dir before deletion "${item.path}": ${err.message}`);
+      return false;
+    }
+    if (currentDirStat.dev !== item.expectedDev || currentDirStat.ino !== item.expectedIno) {
+      console.error(`[evidence-preservation] Identity changed immediately before rmdir "${item.path}"`);
+      return false;
+    }
+    fs.rmdirSync(item.path);
+  }
+
+  let finalStat;
+  try {
+    finalStat = fs.lstatSync(dirPath);
+  } catch (err) {
+    if (err?.code === 'ENOENT') return true;
+    console.error(`[evidence-preservation] Unable to stat root dir before final rmdir "${dirPath}": ${err.message}`);
+    return false;
+  }
+  if (finalStat.dev !== expectedDev || finalStat.ino !== expectedIno) {
+    console.error(`[evidence-preservation] Identity changed immediately before final rmdir "${dirPath}"`);
+    return false;
+  }
+  fs.rmdirSync(dirPath);
+  return true;
+}
+
+after(() => {
+  for (const entry of tempDirsToClean) {
+    try {
+      failClosedCleanupDir(entry);
+    } catch (cleanupErr) {
+      console.error(`[evidence-preservation] Controlled cleanup error for "${entry.path}": ${cleanupErr.message}`);
     }
   }
 });
 
 function createTempFixtureDir(prefix = 'ci-termux-test-') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  tempDirsToClean.push(dir);
+  let dev = null;
+  let ino = null;
+  let uid = null;
+  try {
+    const stat = fs.lstatSync(dir);
+    dev = stat.dev;
+    ino = stat.ino;
+    uid = typeof stat.uid === 'number' ? stat.uid : null;
+  } catch {
+    // If initial stat fails, record nulls
+  }
+  tempDirsToClean.push({
+    path: dir,
+    dev,
+    ino,
+    uid,
+    testContext: currentTestContext,
+    testName: currentTestContext?.name || '(unknown test)',
+    trackedArtifacts: new Map(),
+  });
   return dir;
 }
 
@@ -328,10 +544,24 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F3 Hardening)', () => {
         if (stage === 'after-probe-dir-create') {
           capturedProbeDir = ctx.probeDir;
         } else if (stage === 'before-cleanup') {
-          // Replace target.txt with a newly created file having a different inode
           const targetPath = path.join(capturedProbeDir, 'target.txt');
-          fs.unlinkSync(targetPath);
-          fs.writeFileSync(targetPath, 'substituted-content\n');
+          const originalTargetStat = fs.lstatSync(targetPath);
+
+          // Create a separate substitute file while original target still exists
+          const substitutePath = path.join(capturedProbeDir, 'substitute-target.tmp');
+          fs.writeFileSync(substitutePath, 'substituted-content\n');
+          const substituteStat = fs.lstatSync(substitutePath);
+
+          // Atomically replace target pathname
+          fs.renameSync(substitutePath, targetPath);
+
+          // Verify distinct inode identities
+          const currentTargetStat = fs.lstatSync(targetPath);
+          assert.ok(
+            originalTargetStat.dev !== currentTargetStat.dev || originalTargetStat.ino !== currentTargetStat.ino,
+            'Substituted target must possess a distinct inode identity from original target'
+          );
+          assert.equal(currentTargetStat.ino, substituteStat.ino);
         }
       },
     });
@@ -343,6 +573,7 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F3 Hardening)', () => {
 
     const targetPath = path.join(capturedProbeDir, 'target.txt');
     assert.ok(fs.existsSync(targetPath), 'Substituted target must be preserved');
+    assert.equal(fs.readFileSync(targetPath, 'utf8'), 'substituted-content\n');
   });
 
   test('11. F2-A: Unrecognized foreign file in probe directory causes cleanup refusal and artifact preservation', async () => {
@@ -778,17 +1009,27 @@ describe('Termux Swap Capability Probe (D01-P3B-2D-2-A / F3 Hardening)', () => {
       baseDir: fixtureDir,
       faultHook: (stage, ctx) => {
         if (stage === 'before-rename') {
-          fs.unlinkSync(ctx.procCandidatePath);
-          fs.writeFileSync(ctx.procCandidatePath, 'modified-candidate\n');
+          const origCandStat = fs.lstatSync(ctx.procCandidatePath);
+
+          // Preallocate a distinct substitute file while original candidate still exists
+          const substituteCandidatePath = path.join(fixtureDir, 'substitute-candidate.tmp');
+          fs.writeFileSync(substituteCandidatePath, 'modified-candidate\n');
+          const substituteStat = fs.lstatSync(substituteCandidatePath);
+
+          assert.ok(
+            substituteStat.dev !== origCandStat.dev || substituteStat.ino !== origCandStat.ino,
+            'Substitute candidate must possess a distinct inode identity'
+          );
+
+          // Atomically replace candidate pathname with the preallocated substitute
+          fs.renameSync(substituteCandidatePath, ctx.procCandidatePath);
         }
       },
     });
 
     assert.equal(res.ok, false);
-    assert.ok(
-      res.failedStage === 'pre-rename-inode-mismatch' || res.failedStage === 'inode-continuity-broken',
-      `Expected pre-rename or continuity failure, got: ${res.failedStage}`
-    );
+    assert.equal(res.failedStage, 'inode-continuity-broken');
+    assert.match(res.error, /Target inode after rename .* does not match pre-rename candidate inode/);
   });
 
   test('31. No modification of pre-existing files outside probe directory', async () => {
