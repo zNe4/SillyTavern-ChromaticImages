@@ -111,6 +111,346 @@ function setupDisposableRepo(prefix = 'disposable-st-repo-') {
   return repoDir;
 }
 
+let substituteCounter = 0;
+
+function substituteFileWithDistinctInode(targetPath, content, options = {}) {
+  const {
+    mode,
+    lstatFn = fs.lstatSync,
+    repoRoot,
+    _beforeRename,
+  } = options;
+
+  assert.ok(
+    typeof repoRoot === 'string' && repoRoot.length > 0,
+    'substituteFileWithDistinctInode requires explicit disposable repoRoot'
+  );
+
+  const resolvedRepo = path.resolve(repoRoot);
+  const resolvedTarget = path.resolve(targetPath);
+  const rel = path.relative(resolvedRepo, resolvedTarget);
+  assert.ok(
+    !rel.startsWith('..') && !path.isAbsolute(rel) && rel !== '',
+    `targetPath "${targetPath}" must reside strictly within disposable repoRoot "${repoRoot}"`
+  );
+
+  const repoStat = lstatFn(resolvedRepo);
+  assert.ok(
+    repoStat.isDirectory() && !repoStat.isSymbolicLink(),
+    `repoRoot "${repoRoot}" must be an existing non-symlink directory`
+  );
+
+  const expectedRepoDev = repoStat.dev;
+  const expectedRepoIno = repoStat.ino;
+  const expectedRepoUid = typeof repoStat.uid === 'number' ? repoStat.uid : null;
+
+  const origStat = lstatFn(resolvedTarget);
+  assert.ok(
+    origStat.isFile() && !origStat.isSymbolicLink(),
+    `Target must be an existing regular non-symlink file: ${targetPath}`
+  );
+
+  const expectedTargetDev = origStat.dev;
+  const expectedTargetIno = origStat.ino;
+  const expectedTargetUid = typeof origStat.uid === 'number' ? origStat.uid : null;
+
+  // Verify and record destination ancestor directory chain within repoRoot
+  const ancestorChain = [];
+  let currDir = path.dirname(resolvedTarget);
+  while (currDir !== resolvedRepo) {
+    const parent = path.dirname(currDir);
+    assert.ok(
+      parent !== currDir,
+      `Reached filesystem root before encountering repoRoot "${resolvedRepo}"`
+    );
+    let aStat;
+    try {
+      aStat = lstatFn(currDir);
+    } catch (err) {
+      assert.fail(`Unable to stat destination ancestor directory "${currDir}": ${err.message}`);
+    }
+    assert.ok(
+      aStat.isDirectory() && !aStat.isSymbolicLink(),
+      `Destination ancestor directory "${currDir}" must be a genuine non-symlink directory`
+    );
+    assert.equal(
+      aStat.dev,
+      repoStat.dev,
+      `Destination ancestor directory "${currDir}" must reside on the same filesystem as repoRoot`
+    );
+    ancestorChain.push({
+      dir: currDir,
+      dev: aStat.dev,
+      ino: aStat.ino,
+      uid: typeof aStat.uid === 'number' ? aStat.uid : null,
+    });
+    currDir = parent;
+  }
+
+  const targetMode = mode !== undefined ? mode : (origStat.mode & 0o777);
+
+  const subDir = fs.mkdtempSync(path.join(resolvedRepo, '.ci-sub-tmp-'));
+  const dirStat = lstatFn(subDir);
+  assert.ok(
+    dirStat.isDirectory() && !dirStat.isSymbolicLink(),
+    `substitute directory "${subDir}" must be a non-symlink directory`
+  );
+  assert.equal(
+    dirStat.dev,
+    repoStat.dev,
+    `substitute directory "${subDir}" must reside on the same filesystem as repoRoot`
+  );
+
+  const expectedDirDev = dirStat.dev;
+  const expectedDirIno = dirStat.ino;
+  const expectedDirUid = typeof dirStat.uid === 'number' ? dirStat.uid : null;
+
+  substituteCounter++;
+  const uniqueName = `substitute-${process.pid}-${Date.now()}-${substituteCounter}.tmp`;
+  const substitutePath = path.join(subDir, uniqueName);
+
+  let expectedSubDev = null;
+  let expectedSubIno = null;
+  let expectedSubUid = null;
+  let fileRenamed = false;
+
+  try {
+    fs.writeFileSync(substitutePath, content, { flag: 'wx', mode: targetMode });
+    const subStat = lstatFn(substitutePath);
+    assert.ok(
+      subStat.isFile() && !subStat.isSymbolicLink(),
+      `substitute "${substitutePath}" must be a regular non-symlink file`
+    );
+    assert.equal(
+      subStat.dev,
+      expectedDirDev,
+      `substitute "${substitutePath}" must reside on the same filesystem as substitute directory`
+    );
+
+    expectedSubDev = subStat.dev;
+    expectedSubIno = subStat.ino;
+    expectedSubUid = typeof subStat.uid === 'number' ? subStat.uid : null;
+
+    assert.ok(
+      origStat.dev !== subStat.dev || origStat.ino !== subStat.ino,
+      `Substitute file must possess distinct identity before replacement (original ino: ${origStat.ino}, substitute ino: ${subStat.ino})`
+    );
+
+    if (typeof _beforeRename === 'function') {
+      _beforeRename({
+        substitutePath,
+        subDir,
+        targetPath: resolvedTarget,
+        expectedSubIno,
+        expectedDirIno,
+        expectedTargetIno,
+        subStat,
+        dirStat,
+      });
+    }
+
+    // 0. Re-verify repoRoot identity
+    let curRepoStat;
+    try {
+      curRepoStat = lstatFn(resolvedRepo);
+    } catch (err) {
+      assert.fail(`repoRoot "${resolvedRepo}" missing or unstatable before rename: ${err.message}`);
+    }
+    assert.ok(
+      curRepoStat.isDirectory() && !curRepoStat.isSymbolicLink(),
+      `repoRoot "${resolvedRepo}" was removed, replaced by a non-directory, or replaced by a symbolic link before rename`
+    );
+    assert.equal(
+      curRepoStat.dev,
+      expectedRepoDev,
+      `repoRoot "${resolvedRepo}" device mismatch before rename`
+    );
+    assert.equal(
+      curRepoStat.ino,
+      expectedRepoIno,
+      `repoRoot "${resolvedRepo}" inode identity changed unexpectedly before rename`
+    );
+    if (typeof expectedRepoUid === 'number') {
+      assert.equal(
+        curRepoStat.uid,
+        expectedRepoUid,
+        `repoRoot "${resolvedRepo}" ownership changed unexpectedly before rename`
+      );
+    }
+
+    // 1. Re-verify destination ancestor directory chain
+    for (const ancestor of ancestorChain) {
+      let curAStat;
+      try {
+        curAStat = lstatFn(ancestor.dir);
+      } catch (err) {
+        assert.fail(`Destination ancestor directory "${ancestor.dir}" missing before rename: ${err.message}`);
+      }
+      assert.ok(
+        curAStat.isDirectory() && !curAStat.isSymbolicLink(),
+        `Destination ancestor directory "${ancestor.dir}" modified or replaced by symlink before rename`
+      );
+      assert.equal(curAStat.dev, ancestor.dev, `Destination ancestor directory "${ancestor.dir}" device changed before rename`);
+      assert.equal(curAStat.ino, ancestor.ino, `Destination ancestor directory "${ancestor.dir}" inode changed before rename`);
+      if (typeof ancestor.uid === 'number') {
+        assert.equal(curAStat.uid, ancestor.uid, `Destination ancestor directory "${ancestor.dir}" ownership changed before rename`);
+      }
+    }
+
+    // 2. Re-verify destination target file identity
+    let curTargetStat;
+    try {
+      curTargetStat = lstatFn(resolvedTarget);
+    } catch (err) {
+      assert.fail(`Destination target "${resolvedTarget}" missing before rename: ${err.message}`);
+    }
+    assert.ok(
+      curTargetStat.isFile() && !curTargetStat.isSymbolicLink(),
+      `Destination target "${resolvedTarget}" is missing, not a regular file, or was replaced by a symbolic link before rename`
+    );
+    assert.equal(
+      curTargetStat.dev,
+      expectedTargetDev,
+      `Destination target "${resolvedTarget}" device mismatch before rename`
+    );
+    assert.equal(
+      curTargetStat.ino,
+      expectedTargetIno,
+      `Destination target "${resolvedTarget}" inode identity changed unexpectedly before rename`
+    );
+    if (typeof expectedTargetUid === 'number') {
+      assert.equal(
+        curTargetStat.uid,
+        expectedTargetUid,
+        `Destination target "${resolvedTarget}" ownership changed unexpectedly before rename`
+      );
+    }
+
+    // 3. Re-verify substitute directory and substitute file identities
+    const preRenameDirStat = lstatFn(subDir);
+    assert.ok(
+      preRenameDirStat.dev === expectedDirDev && preRenameDirStat.ino === expectedDirIno,
+      `substitute directory identity changed before rename (dev: ${preRenameDirStat.dev} vs ${expectedDirDev}, ino: ${preRenameDirStat.ino} vs ${expectedDirIno})`
+    );
+
+    const preRenameSubStat = lstatFn(substitutePath);
+    assert.ok(
+      preRenameSubStat.dev === expectedSubDev && preRenameSubStat.ino === expectedSubIno,
+      `substitute file identity changed before rename (dev: ${preRenameSubStat.dev} vs ${expectedSubDev}, ino: ${preRenameSubStat.ino} vs ${expectedSubIno})`
+    );
+
+    fs.renameSync(substitutePath, resolvedTarget);
+    fileRenamed = true;
+
+    const replacedStat = lstatFn(resolvedTarget);
+    assert.equal(
+      replacedStat.dev,
+      subStat.dev,
+      'Replaced pathname device must match substitute device'
+    );
+    assert.equal(
+      replacedStat.ino,
+      subStat.ino,
+      'Replaced pathname inode must match substitute inode'
+    );
+    assert.ok(
+      replacedStat.dev !== origStat.dev || replacedStat.ino !== origStat.ino,
+      'Replaced pathname identity must differ from original identity'
+    );
+
+    return { origStat, subStat, replacedStat, subDir };
+  } finally {
+    let repoValidForCleanup = false;
+    let cleanupRepoStat = null;
+    try {
+      cleanupRepoStat = lstatFn(resolvedRepo);
+      if (
+        cleanupRepoStat &&
+        cleanupRepoStat.isDirectory() &&
+        !cleanupRepoStat.isSymbolicLink() &&
+        cleanupRepoStat.dev === expectedRepoDev &&
+        cleanupRepoStat.ino === expectedRepoIno &&
+        (typeof expectedRepoUid !== 'number' || cleanupRepoStat.uid === expectedRepoUid)
+      ) {
+        repoValidForCleanup = true;
+      } else {
+        console.error(`[evidence-preservation] Refusing cleanup: repoRoot "${resolvedRepo}" identity/ownership mismatch, not a directory, or replaced by symlink; preserving evidence`);
+      }
+    } catch (repoErr) {
+      console.error(`[evidence-preservation] Refusing cleanup: unable to stat repoRoot "${resolvedRepo}": ${repoErr.message}`);
+    }
+
+    if (repoValidForCleanup) {
+      if (!fileRenamed && expectedSubIno !== null) {
+        let currentFileStat = null;
+        try {
+          currentFileStat = lstatFn(substitutePath);
+        } catch (err) {
+          if (err?.code !== 'ENOENT') {
+            console.error(`[evidence-preservation] Unable to stat substitute file before cleanup "${substitutePath}": ${err.message}`);
+          }
+        }
+        if (currentFileStat) {
+          if (
+            !currentFileStat.isFile() ||
+            currentFileStat.isSymbolicLink() ||
+            currentFileStat.dev !== expectedSubDev ||
+            currentFileStat.ino !== expectedSubIno ||
+            (typeof expectedSubUid === 'number' && currentFileStat.uid !== expectedSubUid)
+          ) {
+            console.error(`[evidence-preservation] Refusing cleanup: substitute file "${substitutePath}" identity/ownership mismatch or not a regular file; preserving evidence`);
+          } else {
+            try {
+              fs.unlinkSync(substitutePath);
+            } catch (unlinkErr) {
+              console.error(`[evidence-preservation] Failed to unlink verified substitute file "${substitutePath}": ${unlinkErr.message}`);
+            }
+          }
+        }
+      }
+
+      if (expectedDirIno !== null) {
+        let currentDirStat = null;
+        try {
+          currentDirStat = lstatFn(subDir);
+        } catch (err) {
+          if (err?.code !== 'ENOENT') {
+            console.error(`[evidence-preservation] Unable to stat substitute directory before cleanup "${subDir}": ${err.message}`);
+          }
+        }
+        if (currentDirStat) {
+          if (
+            !currentDirStat.isDirectory() ||
+            currentDirStat.isSymbolicLink() ||
+            currentDirStat.dev !== expectedDirDev ||
+            currentDirStat.ino !== expectedDirIno ||
+            (typeof expectedDirUid === 'number' && currentDirStat.uid !== expectedDirUid)
+          ) {
+            console.error(`[evidence-preservation] Refusing cleanup: substitute directory "${subDir}" identity/ownership mismatch or not a directory; preserving evidence`);
+          } else {
+            let entries = [];
+            try {
+              entries = fs.readdirSync(subDir);
+            } catch (readErr) {
+              console.error(`[evidence-preservation] Refusing cleanup: unable to readdir substitute directory "${subDir}": ${readErr.message}`);
+              entries = ['<unreadable>'];
+            }
+            if (entries.length > 0) {
+              console.error(`[evidence-preservation] Refusing cleanup: substitute directory "${subDir}" contains unexpected entries (${entries.join(', ')}); preserving evidence`);
+            } else {
+              try {
+                fs.rmdirSync(subDir);
+              } catch (rmdirErr) {
+                console.error(`[evidence-preservation] Failed to rmdir verified substitute directory "${subDir}": ${rmdirErr.message}`);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 const manifest = JSON.parse(fs.readFileSync(BUNDLED_MANIFEST_PATH, 'utf8'));
 const stockSha = manifest.patches.runtime.original.sha256.toLowerCase();
 const stockBlob = manifest.patches.runtime.original.gitBlobSha.toLowerCase();
@@ -980,8 +1320,7 @@ describe('P3B-2B: Durability & Deterministic Fault Injection', () => {
     const faultHook = (stage) => {
       if (stage === 'before-fingerprint-verification') {
         // Concurrently replace live target with different file
-        fs.unlinkSync(liveTarget);
-        fs.writeFileSync(liveTarget, 'concurrently replaced live target\n');
+        substituteFileWithDistinctInode(liveTarget, 'concurrently replaced live target\n', { repoRoot: repo });
       }
     };
 
@@ -1432,8 +1771,7 @@ describe('P3B-2B-F1: Finding A — Late Backup-Path Substitutions at before-jour
     const backupFile = path.join(repo, '.ci-patch/backup', txId, 'stable-diffusion.js');
     const faultHook = (stage) => {
       if (stage === 'before-journal-advancement') {
-        fs.unlinkSync(backupFile);
-        fs.writeFileSync(backupFile, 'foreign-substituted-content', { mode: 0o600 });
+        substituteFileWithDistinctInode(backupFile, 'foreign-substituted-content', { mode: 0o600, repoRoot: repo });
       }
     };
 
@@ -1471,8 +1809,7 @@ describe('P3B-2B-F1: Finding A — Late Backup-Path Substitutions at before-jour
     const faultHook = (stage) => {
       if (stage === 'before-journal-advancement') {
         // Same content, but replaced (new inode)
-        fs.unlinkSync(backupFile);
-        fs.writeFileSync(backupFile, authenticStock, { mode: 0o600 });
+        substituteFileWithDistinctInode(backupFile, authenticStock, { mode: 0o600, repoRoot: repo });
       }
     };
 
@@ -1549,8 +1886,7 @@ describe('P3B-2B-F1: Finding B — Late Live Source Changes at before-journal-ad
 
     const faultHook = (stage) => {
       if (stage === 'before-journal-advancement') {
-        fs.unlinkSync(liveTarget);
-        fs.writeFileSync(liveTarget, authenticStock);
+        substituteFileWithDistinctInode(liveTarget, authenticStock, { repoRoot: repo });
       }
     };
 
@@ -1861,8 +2197,7 @@ describe('P3B-2B-F1: Finding B — Late Staging Changes at before-journal-advanc
     const stagedFile = path.join(repo, '.ci-patch/staging', txId, 'stable-diffusion.js');
     const faultHook = (stage) => {
       if (stage === 'before-journal-advancement') {
-        fs.unlinkSync(stagedFile);
-        fs.writeFileSync(stagedFile, 'tampered-staged-content', { mode: 0o600 });
+        substituteFileWithDistinctInode(stagedFile, 'tampered-staged-content', { mode: 0o600, repoRoot: repo });
       }
     };
 
@@ -1937,8 +2272,7 @@ describe('P3B-2B-F1: Finding B — Late Staging Changes at before-journal-advanc
     const faultHook = (stage) => {
       if (stage === 'before-journal-advancement') {
         const originalBytes = fs.readFileSync(stagedFile);
-        fs.unlinkSync(stagedFile);
-        fs.writeFileSync(stagedFile, originalBytes, { mode: 0o600 });
+        substituteFileWithDistinctInode(stagedFile, originalBytes, { mode: 0o600, repoRoot: repo });
       }
     };
 
