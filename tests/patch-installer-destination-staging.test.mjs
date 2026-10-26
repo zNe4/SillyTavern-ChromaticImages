@@ -1173,45 +1173,363 @@ describe('D01-P3B-2C-F1: Adversarial Candidate Verification (Inode & Mode Altera
     return;
   }
 
+  let substituteCandidateCounter = 0;
+
+  function substituteCandidateWithDistinctInode(candidatePath, content, options = {}) {
+    const {
+      mode,
+      lstatFn = fs.lstatSync,
+      repoRoot,
+      _beforeRename,
+    } = options;
+
+    assert.ok(
+      typeof repoRoot === 'string' && repoRoot.length > 0,
+      'substituteCandidateWithDistinctInode requires explicit disposable repoRoot'
+    );
+
+    const resolvedRepo = path.resolve(repoRoot);
+    const resolvedTarget = path.resolve(candidatePath);
+    const rel = path.relative(resolvedRepo, resolvedTarget);
+    assert.ok(
+      !rel.startsWith('..') && !path.isAbsolute(rel) && rel !== '',
+      `candidatePath "${candidatePath}" must reside strictly within disposable repoRoot "${repoRoot}"`
+    );
+
+    // Reauthenticate repository root at entry
+    const repoStat = lstatFn(resolvedRepo);
+    assert.ok(
+      repoStat.isDirectory() && !repoStat.isSymbolicLink(),
+      `repoRoot "${repoRoot}" must be an existing non-symlink directory`
+    );
+    const expectedRepoDev = repoStat.dev;
+    const expectedRepoIno = repoStat.ino;
+    const expectedRepoUid = typeof repoStat.uid === 'number' ? repoStat.uid : null;
+
+    // Record candidate ancestor directory chain within repoRoot
+    const ancestorChain = [];
+    let currDir = path.dirname(resolvedTarget);
+    while (currDir !== resolvedRepo) {
+      const parent = path.dirname(currDir);
+      assert.ok(
+        parent !== currDir,
+        `Reached filesystem root before encountering repoRoot "${resolvedRepo}"`
+      );
+      let aStat;
+      try {
+        aStat = lstatFn(currDir);
+      } catch (err) {
+        assert.fail(`Unable to stat destination ancestor directory "${currDir}": ${err.message}`);
+      }
+      assert.ok(
+        aStat.isDirectory() && !aStat.isSymbolicLink(),
+        `Destination ancestor directory "${currDir}" must be a genuine non-symlink directory`
+      );
+      assert.equal(
+        aStat.dev,
+        repoStat.dev,
+        `Destination ancestor directory "${currDir}" must reside on the same filesystem as repoRoot`
+      );
+      ancestorChain.push({
+        dir: currDir,
+        dev: aStat.dev,
+        ino: aStat.ino,
+        uid: typeof aStat.uid === 'number' ? aStat.uid : null,
+      });
+      currDir = parent;
+    }
+
+    // 1. Record original candidate identity (dev, ino, uid, regular-file type) at entry
+    const origStat = lstatFn(resolvedTarget);
+    assert.ok(
+      origStat.isFile() && !origStat.isSymbolicLink(),
+      `Destination candidate must be an existing regular non-symlink file: ${candidatePath}`
+    );
+    const expectedTargetDev = origStat.dev;
+    const expectedTargetIno = origStat.ino;
+    const expectedTargetUid = typeof origStat.uid === 'number' ? origStat.uid : null;
+    const targetMode = mode !== undefined ? mode : (origStat.mode & 0o777);
+
+    // 2. Create separate, exclusively allocated regular substitute file in same filesystem while original exists
+    const candidateDir = path.dirname(resolvedTarget);
+    substituteCandidateCounter++;
+    const uniqueName = `.ci-candidate-substitute-${process.pid}-${Date.now()}-${substituteCandidateCounter}.tmp`;
+    const substitutePath = path.join(candidateDir, uniqueName);
+
+    let expectedSubDev = null;
+    let expectedSubIno = null;
+    let expectedSubUid = null;
+    let fileRenamed = false;
+    let subFd = null;
+
+    try {
+      // Descriptor-based exclusive creation, write, and deterministic permission setting independent of umask
+      subFd = fs.openSync(
+        substitutePath,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+        0o600
+      );
+      fs.writeFileSync(subFd, content);
+      fs.fchmodSync(subFd, targetMode);
+      const fdStat = fs.fstatSync(subFd);
+      fs.closeSync(subFd);
+      subFd = null;
+
+      const subStat = lstatFn(substitutePath);
+      assert.ok(
+        subStat.isFile() && !subStat.isSymbolicLink(),
+        `substitute "${substitutePath}" must be a regular non-symlink file`
+      );
+      assert.equal(
+        subStat.dev,
+        expectedRepoDev,
+        `substitute "${substitutePath}" must reside on the same filesystem as repoRoot`
+      );
+      assert.equal(subStat.ino, fdStat.ino, 'Substitute inode must match descriptor inode');
+
+      expectedSubDev = subStat.dev;
+      expectedSubIno = subStat.ino;
+      expectedSubUid = typeof subStat.uid === 'number' ? subStat.uid : null;
+
+      // 3. Verify original and substitute have different (dev, ino) values
+      assert.ok(
+        origStat.dev !== subStat.dev || origStat.ino !== subStat.ino,
+        `Substitute file must possess distinct identity before replacement (original ino: ${origStat.ino}, substitute ino: ${subStat.ino})`
+      );
+
+      // 4. Preserve identical candidate bytes and mode
+      assert.equal(subStat.mode & 0o777, targetMode, 'Substitute mode must match target mode');
+
+      if (typeof _beforeRename === 'function') {
+        _beforeRename({
+          substitutePath,
+          targetPath: resolvedTarget,
+          expectedSubIno,
+          expectedTargetIno,
+          subStat,
+          origStat,
+          candidateDir,
+          repoRoot: resolvedRepo,
+        });
+      }
+
+      // Immediately before renameSync():
+      // A. Re-verify repoRoot identity and non-symlink status
+      let curRepoStat;
+      try {
+        curRepoStat = lstatFn(resolvedRepo);
+      } catch (err) {
+        assert.fail(`repoRoot "${resolvedRepo}" missing before rename: ${err.message}`);
+      }
+      assert.ok(
+        curRepoStat.isDirectory() && !curRepoStat.isSymbolicLink(),
+        `repoRoot "${resolvedRepo}" was removed, replaced by non-directory, or replaced by symlink before rename`
+      );
+      assert.equal(curRepoStat.dev, expectedRepoDev, `repoRoot "${resolvedRepo}" device mismatch before rename`);
+      assert.equal(curRepoStat.ino, expectedRepoIno, `repoRoot "${resolvedRepo}" inode identity changed before rename`);
+      if (typeof expectedRepoUid === 'number') {
+        assert.equal(curRepoStat.uid, expectedRepoUid, `repoRoot "${resolvedRepo}" ownership changed before rename`);
+      }
+
+      // B. Re-verify candidate ancestor directory chain (including candidate parent)
+      for (const ancestor of ancestorChain) {
+        let curAStat;
+        try {
+          curAStat = lstatFn(ancestor.dir);
+        } catch (err) {
+          assert.fail(`Destination ancestor directory "${ancestor.dir}" missing before rename: ${err.message}`);
+        }
+        assert.ok(
+          curAStat.isDirectory() && !curAStat.isSymbolicLink(),
+          `Destination ancestor directory "${ancestor.dir}" modified, not a directory, or replaced by symlink before rename`
+        );
+        assert.equal(curAStat.dev, ancestor.dev, `Destination ancestor directory "${ancestor.dir}" device changed before rename`);
+        assert.equal(curAStat.ino, ancestor.ino, `Destination ancestor directory "${ancestor.dir}" inode changed before rename`);
+        if (typeof ancestor.uid === 'number') {
+          assert.equal(curAStat.uid, ancestor.uid, `Destination ancestor directory "${ancestor.dir}" ownership changed before rename`);
+        }
+      }
+
+      // C. Re-verify destination target (candidatePath) identity immediately before renameSync()
+      let curTargetStat;
+      try {
+        curTargetStat = lstatFn(resolvedTarget);
+      } catch (err) {
+        assert.fail(`Destination candidate "${resolvedTarget}" missing before rename: ${err.message}`);
+      }
+      assert.ok(
+        curTargetStat.isFile() && !curTargetStat.isSymbolicLink(),
+        `Destination candidate "${resolvedTarget}" is missing, not a regular file, or replaced by symlink before rename`
+      );
+      assert.equal(curTargetStat.dev, expectedTargetDev, `Destination candidate "${resolvedTarget}" device mismatch before rename`);
+      assert.equal(curTargetStat.ino, expectedTargetIno, `Destination candidate "${resolvedTarget}" inode mismatch before rename`);
+      if (typeof expectedTargetUid === 'number') {
+        assert.equal(curTargetStat.uid, expectedTargetUid, `Destination candidate "${resolvedTarget}" ownership changed before rename`);
+      }
+
+      // D. Re-verify substitute file identity
+      const preRenameSubStat = lstatFn(substitutePath);
+      assert.ok(
+        preRenameSubStat.isFile() && !preRenameSubStat.isSymbolicLink(),
+        `substitute file "${substitutePath}" is missing, not a regular file, or replaced by symlink before rename`
+      );
+      assert.equal(preRenameSubStat.dev, expectedSubDev, `substitute file "${substitutePath}" device changed before rename`);
+      assert.equal(preRenameSubStat.ino, expectedSubIno, `substitute file "${substitutePath}" inode changed before rename`);
+      if (typeof expectedSubUid === 'number') {
+        assert.equal(preRenameSubStat.uid, expectedSubUid, `substitute file "${substitutePath}" ownership changed before rename`);
+      }
+
+      // 5. Atomically rename substitute over candidate pathname
+      fs.renameSync(substitutePath, resolvedTarget);
+      fileRenamed = true;
+
+      // 6. Confirm destination now has substitute's recorded identity, differing from original
+      const replacedStat = lstatFn(resolvedTarget);
+      assert.ok(replacedStat.isFile() && !replacedStat.isSymbolicLink(), 'Replaced pathname must be regular non-symlink file');
+      assert.equal(replacedStat.dev, subStat.dev, 'Replaced pathname device must match substitute device');
+      assert.equal(replacedStat.ino, subStat.ino, 'Replaced pathname inode must match substitute inode');
+      assert.notEqual(replacedStat.ino, origStat.ino, 'Replaced pathname inode must differ from original inode');
+
+      return { origStat, subStat, replacedStat };
+    } finally {
+      if (subFd !== null) {
+        try {
+          fs.closeSync(subFd);
+        } catch {
+          // ignore close error during error handling
+        }
+        subFd = null;
+      }
+
+      // 5. Conservative cleanup: verify substitute identity and safe parent ancestry before unlinking
+      let repoValidForCleanup = false;
+      let cleanupRepoStat = null;
+      try {
+        cleanupRepoStat = lstatFn(resolvedRepo);
+        if (
+          cleanupRepoStat &&
+          cleanupRepoStat.isDirectory() &&
+          !cleanupRepoStat.isSymbolicLink() &&
+          cleanupRepoStat.dev === expectedRepoDev &&
+          cleanupRepoStat.ino === expectedRepoIno &&
+          (typeof expectedRepoUid !== 'number' || cleanupRepoStat.uid === expectedRepoUid)
+        ) {
+          let allAncestorsOk = true;
+          for (const ancestor of ancestorChain) {
+            let aStat;
+            try {
+              aStat = lstatFn(ancestor.dir);
+            } catch {
+              allAncestorsOk = false;
+              break;
+            }
+            if (
+              !aStat.isDirectory() ||
+              aStat.isSymbolicLink() ||
+              aStat.dev !== ancestor.dev ||
+              aStat.ino !== ancestor.ino ||
+              (typeof ancestor.uid === 'number' && aStat.uid !== ancestor.uid)
+            ) {
+              allAncestorsOk = false;
+              break;
+            }
+          }
+          if (allAncestorsOk) {
+            repoValidForCleanup = true;
+          } else {
+            console.error(`[evidence-preservation] Refusing cleanup: ancestor directory identity/ownership mismatch or replaced by symlink; preserving evidence`);
+          }
+        } else {
+          console.error(`[evidence-preservation] Refusing cleanup: repoRoot "${resolvedRepo}" identity/ownership mismatch, not a directory, or replaced by symlink; preserving evidence`);
+        }
+      } catch (repoErr) {
+        console.error(`[evidence-preservation] Refusing cleanup: unable to stat repoRoot "${resolvedRepo}": ${repoErr.message}`);
+      }
+
+      if (repoValidForCleanup) {
+        if (!fileRenamed && expectedSubIno !== null) {
+          let currentFileStat = null;
+          try {
+            currentFileStat = lstatFn(substitutePath);
+          } catch (err) {
+            if (err?.code !== 'ENOENT') {
+              console.error(`[evidence-preservation] Unable to stat substitute file before cleanup "${substitutePath}": ${err.message}`);
+            }
+          }
+          if (currentFileStat) {
+            if (
+              !currentFileStat.isFile() ||
+              currentFileStat.isSymbolicLink() ||
+              currentFileStat.dev !== expectedSubDev ||
+              currentFileStat.ino !== expectedSubIno ||
+              (typeof expectedSubUid === 'number' && currentFileStat.uid !== expectedSubUid)
+            ) {
+              console.error(`[evidence-preservation] Refusing cleanup: substitute file "${substitutePath}" identity/ownership mismatch or not a regular file; preserving evidence`);
+            } else {
+              try {
+                fs.unlinkSync(substitutePath);
+              } catch (unlinkErr) {
+                console.error(`[evidence-preservation] Failed to unlink verified substitute file "${substitutePath}": ${unlinkErr.message}`);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   // 7.1 Candidate inode replacement
   test('refuses advancement when candidate is replaced with distinct inode regular file with identical bytes and mode', async () => {
-    const repo = setupDisposableRepo('f1-candidate-inode-repl-');
-    const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
+    // Explicit verification under restrictive umask 0077 demonstrating deterministic 0644 mode and distinct inodes
+    const origUmask = process.umask(0o077);
+    try {
+      const repo = setupDisposableRepo('f1-candidate-inode-repl-');
+      const { txId, lease } = setupAuthenticBackupCreatedTx({ repo });
 
-    const candidatePath = path.join(repo, `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`);
-    let initialCandidateIno = null;
+      const candidatePath = path.join(repo, `src/endpoints/.stable-diffusion.js.ci-staged-${txId}.tmp`);
+      let subResult = null;
+      let recordedOrigStat = null;
+      let recordedSubStat = null;
 
-    const res = await stageDestinationCandidate({
-      repoRoot: repo,
-      txId,
-      op: 'apply',
-      lease,
-      faultHook: (stage) => {
-        if (stage === 'before-journal-advancement') {
-          const preStat = fs.statSync(candidatePath);
-          initialCandidateIno = preStat.ino;
-          const candidateBytes = fs.readFileSync(candidatePath);
+      const res = await stageDestinationCandidate({
+        repoRoot: repo,
+        txId,
+        op: 'apply',
+        lease,
+        faultHook: (stage) => {
+          if (stage === 'before-journal-advancement') {
+            const candidateBytes = fs.readFileSync(candidatePath);
+            recordedOrigStat = fs.lstatSync(candidatePath);
+            assert.equal(recordedOrigStat.mode & 0o777, 0o644, 'Original candidate mode must be 0644 under umask 0077');
 
-          // Replace candidate file: unlink and recreate new regular file with identical content & mode
-          fs.unlinkSync(candidatePath);
-          fs.writeFileSync(candidatePath, candidateBytes);
-          fs.chmodSync(candidatePath, 0o644);
+            subResult = substituteCandidateWithDistinctInode(candidatePath, candidateBytes, {
+              repoRoot: repo,
+              mode: 0o644,
+            });
 
-          const postStat = fs.statSync(candidatePath);
-          // Confirm inode actually changed
-          assert.notEqual(postStat.ino, initialCandidateIno);
-        }
-      },
-    });
+            recordedSubStat = subResult.subStat;
+            assert.equal(recordedSubStat.mode & 0o777, 0o644, 'Substitute file mode must be 0644 under umask 0077');
+            assert.notEqual(recordedSubStat.ino, recordedOrigStat.ino, 'Original candidate and substitute must have distinct inodes');
+          }
+        },
+      });
 
-    assert.equal(res.ok, false);
-    assert.equal(res.code, 'candidate-identity-replaced');
-    assert.equal(res.stage, 'final-candidate-reauth');
+      // 7. Preserve assertions: candidate-identity-replaced, final-candidate-reauth, BACKUP_CREATED, preserved candidate
+      assert.equal(res.ok, false);
+      assert.equal(res.code, 'candidate-identity-replaced');
+      assert.equal(res.stage, 'final-candidate-reauth');
 
-    // Journal remains BACKUP_CREATED
-    assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
-    // Candidate artifact is preserved on disk (NOT automatically deleted)
-    assert.equal(fs.existsSync(candidatePath), true);
+      // Journal remains BACKUP_CREATED
+      assert.equal(inspectJournal(repo).journal.phase, 'BACKUP_CREATED');
+      // Candidate artifact is preserved on disk (NOT automatically deleted)
+      assert.equal(fs.existsSync(candidatePath), true);
+      const finalStat = fs.lstatSync(candidatePath);
+      assert.equal(finalStat.ino, subResult.subStat.ino, 'Preserved candidate must be the substituted file');
+      assert.equal(finalStat.mode & 0o777, 0o644, 'Preserved candidate mode must be 0644 under umask 0077');
+      assert.notEqual(finalStat.ino, recordedOrigStat.ino, 'Preserved candidate inode must differ from original candidate');
+    } finally {
+      process.umask(origUmask);
+    }
   });
 
   // 7.2 Candidate mode modification
